@@ -17,8 +17,10 @@ different targets in separate static and DLL providers. Centralizing clock
 IDs cannot disambiguate an already ambiguous pthread ID.
 
 This component uses one DLL for the pthread namespace and clock registry.
-Both consumers explicitly link its import library. Actual linker inputs reject static
-winpthread inputs, PE tables identify the imported APIs, and runtime tests
+Both consumers select the supplier's `dllimport` declarations and explicitly
+link its import library. The pthread function addresses used to check provider
+identity come from the resolved runtime import table. Actual linker
+inputs reject static winpthread inputs, PE tables identify the APIs, and tests
 require both images to resolve the same functions and caller identity.
 It does not make arbitrary prebuilt static providers share a namespace.
 Adoption must exclude that topology from supported host components or provide
@@ -39,6 +41,17 @@ publishes ownership before resume; external threads retain their self handle.
 The private duplicate API holds the same lock as final close, unregister and
 record reuse. Success returns an owned query/synchronize handle and a
 nonreused generation; failures preserve both output arguments.
+
+The thread's TLS slot retains its own record until the supplier's final DLL
+thread-detach callback clears that slot. Publishing `ended` before native
+termination does not release this ownership. A concurrent `pthread_detach`
+marks the record detached without blocking or pooling a record with pending
+TLS use. The final callback reclaims detached records; a later detach may
+reclaim a record after that callback. POSIX-created joinable records remain
+for join, whose native wait includes final thread callbacks. Implicit native
+attachments auto-retire on both ordinary Win32 return and `pthread_exit`,
+including their default joinable state; no pthread join is required. The
+supplier reclaims synchronization handles without repeating completed key cleanup.
 
 Public `pthread_getcpuclockid` and time32/time64 readers live in the provider,
 including literal exported symbols. A 256-slot table deduplicates generations
@@ -88,6 +101,17 @@ builds are labeled and cannot qualify CI.
   time32/time64, resolution and null/error output behavior.
 - Explicit pthread, CreateThread, native pthread_exit(259), and std::thread
   targets; exit status 259 is not mistaken for a live object.
+- A controlled later-loaded DLL thread-detach callback holds a target after
+  its wrapper publishes `ended` and before supplier TLS cleanup. Detach must
+  return while that target is gated; a pre-created, initially unattached
+  native observer then allocates a record. Checks require distinct records,
+  unchanged identity and CPU readings, once-only key cleanup, and eventual
+  retirement. The gate creates no threads/modules while holding the loader
+  lock; it exists only in the test DLL, not in the supplier implementation.
+- 64 repetitions of each native return/`pthread_exit` and ordinary/detached
+  combination: 256 measured exits after four warm-up exits. Every individual
+  cycle must return to the exact handle baseline, run its key destructor once,
+  and remove its registry entry. This check has no per-cycle growth allowance.
 - Owned private capability survival after retirement and failure outputs.
 - 256 live clocks and a real 257th target, cached success at capacity,
   exit reaping and 64 generations without saved-clock aliasing.

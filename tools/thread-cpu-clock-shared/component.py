@@ -136,7 +136,8 @@ def build(args):
         shutil.copy2(dll, fixture / dll.name)
         shutil.copy2(source / REL / "COPYING", fixture / "COPYING.winpthreads.txt")
         fixture_sources = ROOT / "tests/thread-cpu-clock-shared"
-        common = ["-O2", "-Wall", "-Wextra", "-Werror", "-D_WIN32_WINNT=0x0A00", "-I" + str(install / "include")]
+        common = ["-O2", "-Wall", "-Wextra", "-Werror", "-D_WIN32_WINNT=0x0A00",
+                  "-DWINPTHREADS_USE_DLLIMPORT=1", "-I" + str(install / "include")]
         peer_command = [cc, "-std=c11", *common, "-shared", fixture_sources / "peer.c", import_library,
                         "-Wl,--verbose", "-Wl,-Map," + str(role / "peer.map"),
                         "-o", fixture / "clock-peer.dll"]
@@ -167,7 +168,7 @@ def build(args):
             binary[image.name] = {"sha256": digest(image), "imports": names, "machine": ABI[abi]}
         exports = subprocess.check_output([str(readobj), "--coff-exports", str(fixture / dll.name)], text=True)
         (role / "supplier-exports.txt").write_text(exports)
-        for symbol in ["pthread_getcpuclockid", "gesher_winpthread_dup_cpu_handle_v1", "clock_gettime", "clock_gettime32",
+        for symbol in ["pthread_getcpuclockid", "gesher_winpthread_dup_cpu_handle_v1", "__pth_gpointer_locked", "clock_gettime", "clock_gettime32",
                        "clock_gettime64", "clock_getres", "clock_getres32", "clock_getres64"]:
             require(re.search(r"^  Name: " + symbol + r"$", exports, re.MULTILINE), "missing literal export: " + symbol)
         require("gesher_clock_anchor" not in exports and "gesher_pthread_owner" not in exports,

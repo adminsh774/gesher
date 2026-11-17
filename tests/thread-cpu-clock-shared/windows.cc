@@ -40,6 +40,9 @@ DWORD Handles() {
 }
 
 const clock_peer_api* peer;
+using lookup_record_fn = void* (*)(pthread_t);
+lookup_record_fn lookup_record;
+pthread_key_t cleanup_key;
 struct Actor {
   HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -48,11 +51,21 @@ struct Actor {
   std::atomic<bool> busy{false};
   bool pthread_exit = false;
   bool test_cancel = false;
+  bool check_cleanup = false;
+  std::atomic<int> cleanup_calls{0};
+  clock_exit_gate* exit_gate = nullptr;
 };
+void Cleanup(void* raw) {
+  if (raw) ++static_cast<Actor*>(raw)->cleanup_calls;
+}
 void* Run(void* raw) {
   auto& actor = *static_cast<Actor*>(raw);
   actor.id = pthread_self();
   Require(peer->self() == actor.id, "same thread has one identity in both images");
+  if (actor.check_cleanup)
+    Require(pthread_setspecific(cleanup_key, &actor) == 0, "install actual thread key destructor");
+  if (actor.exit_gate)
+    Require(peer->arm_exit_gate(actor.exit_gate) == 0, "arm later-loaded peer final-exit callback");
   Require(DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
                           &actor.oracle, THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
                           FALSE, 0), "target publishes separately owned native oracle");
@@ -115,6 +128,96 @@ void StopJoin(Actor& actor, pthread_t thread, bool peer_join = false) {
   Require((peer_join ? peer->join(thread, &result) : pthread_join(thread, &result)) == 0 &&
           result == reinterpret_cast<void*>(uintptr_t{7}), "cross-image join observes actual result");
   Retire(actor);
+}
+
+struct UnattachedObserver {
+  Actor actor;
+  HANDLE started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE attach = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+};
+DWORD WINAPI AttachObserver(void* raw) {
+  auto& observer = *static_cast<UnattachedObserver*>(raw);
+  Require(SetEvent(observer.started), "pre-created observer has entered user code");
+  Require(WaitForSingleObject(observer.attach, 15000) == WAIT_OBJECT_0, "observer attachment deadline");
+  Run(&observer.actor);
+  return 259;
+}
+
+void EndedBeforeNativeExit() {
+  // Run immediately after the one warm-up pthread. Its record is consumed by
+  // the target, so an early detach retirement supplies the observer's reuse.
+  // The observer already runs before gating DLL_THREAD_DETACH: creating a new
+  // kernel thread while this controlled callback holds the loader lock would
+  // deadlock its initial DLL notifications and would not test this race.
+  UnattachedObserver observer; observer.actor.check_cleanup = true;
+  HANDLE observer_thread = CreateThread(nullptr, 0, AttachObserver, &observer, 0, nullptr);
+  Require(observer_thread && WaitForSingleObject(observer.started, 15000) == WAIT_OBJECT_0,
+          "unattached observer preexists final-exit gate");
+  clock_exit_gate gate{CreateEventW(nullptr, TRUE, FALSE, nullptr),
+                       CreateEventW(nullptr, TRUE, FALSE, nullptr), 0};
+  Require(gate.reached && gate.release, "pre-created exit gate events");
+  Actor target; target.check_cleanup = true; target.exit_gate = &gate;
+  pthread_t thread;
+  Require(pthread_create(&thread, nullptr, Run, &target) == 0, "create late-detach target");
+  clockid_t saved = Acquire(target);
+  void* original_record = lookup_record(target.id);
+  Require(original_record != nullptr, "target owns a registered record");
+  Require(SetEvent(target.release) && WaitForSingleObject(gate.reached, 15000) == WAIT_OBJECT_0,
+          "target wrapper ended before supplier final TLS callback");
+  Require(WaitForSingleObject(target.oracle, 0) == WAIT_TIMEOUT && target.cleanup_calls == 1,
+          "key cleanup finished while native thread is still in DLL teardown");
+  Require(pthread_detach(thread) == 0, "nonblocking detach after wrapper ended publication");
+  Require(SetEvent(observer.attach), "force another live record allocation after late detach");
+  clockid_t observer_clock = Acquire(observer.actor);
+  void* observer_record = lookup_record(observer.actor.id);
+  Require(lookup_record(target.id) == original_record && observer_record != nullptr &&
+          observer_record != original_record, "pending TLS record cannot be pooled or reused");
+  clockid_t again = 0;
+  Require(pthread_getcpuclockid(target.id, &again) == 0 && again == saved,
+          "late-detached but not-yet-terminated target keeps its identity");
+  Require(SetEvent(gate.release), "release controlled final TLS boundary");
+  Retire(target);
+  Require(gate.error == 0 && target.cleanup_calls == 1 && lookup_record(target.id) == nullptr,
+          "final TLS callback retires detached record exactly once");
+  Dead(saved);
+  Brackets(observer.actor, observer_clock);
+  Require(lookup_record(observer.actor.id) == observer_record,
+          "old thread teardown leaves replacement identity and record intact");
+  Require(SetEvent(observer.actor.release) && WaitForSingleObject(observer_thread, 15000) == WAIT_OBJECT_0,
+          "observer actually exits after gated target");
+  Retire(observer.actor); Close(observer_thread); Dead(observer_clock);
+  Require(observer.actor.cleanup_calls == 1 && lookup_record(observer.actor.id) == nullptr,
+          "observer key cleanup and record retirement remain intact");
+  Close(observer.started); Close(observer.attach); Close(gate.reached); Close(gate.release);
+  Pass("deterministic ended-before-native-exit detach preserves pending TLS and prevents record reuse");
+}
+
+void ExternalExitStress() {
+  auto cycle = [](int mode) {
+    Actor actor; actor.pthread_exit = (mode & 1) != 0; actor.check_cleanup = true;
+    HANDLE thread = CreateThread(nullptr, 0, NativeRun, &actor, 0, nullptr);
+    Require(thread != nullptr, "create repeated external target");
+    clockid_t clock = Acquire(actor);
+    if (mode & 2) Require(pthread_detach(actor.id) == 0, "detach live external attachment");
+    Require(SetEvent(actor.release) && WaitForSingleObject(thread, 15000) == WAIT_OBJECT_0,
+            "repeated external target actually exits");
+    DWORD code = 0;
+    Require(GetExitCodeThread(thread, &code) && code == 259, "repeated native exit259");
+    Require(actor.cleanup_calls == 1 && lookup_record(actor.id) == nullptr,
+            "native return/pthread_exit auto-retire record and key destructor exactly once");
+    Retire(actor); Close(thread); Dead(clock);
+  };
+  for (int mode = 0; mode < 4; ++mode) cycle(mode);
+  DWORD baseline = Handles();
+  for (int mode = 0; mode < 4; ++mode) {
+    for (int i = 0; i < 64; ++i) {
+      cycle(mode);
+      Require(Handles() == baseline, "external exit cycle leaks no handles after warm-up");
+    }
+    std::printf("MEASURE external_exit_mode=%d iterations=64 handles_baseline=%lu handles_final=%lu retired_records=64\n",
+        mode, static_cast<unsigned long>(baseline), static_cast<unsigned long>(Handles()));
+  }
+  Pass("256 external native-return/pthread_exit cycles, joinable and detached, exact handle balance and record retirement");
 }
 
 void Basic(HMODULE provider) {
@@ -314,16 +417,21 @@ int main() {
   std::wstring expected(host_path); expected.resize(expected.find_last_of(L"\\/") + 1); expected += L"libwinpthread-1.dll";
   Require(_wcsicmp(expected.c_str(), provider_path) == 0, "loaded supplier is the verified adjacent DLL");
   std::printf("PROVIDER one shared adjacent libwinpthread-1.dll\n");
+  lookup_record = reinterpret_cast<lookup_record_fn>(GetProcAddress(provider, "__pth_gpointer_locked"));
+  Require(lookup_record != nullptr, "read-only supplier registry lookup for lifetime regression");
   Require(pthread_self() == peer->self(), "caller cross-image identity");
+  Require(pthread_key_create(&cleanup_key, Cleanup) == 0, "create lifecycle cleanup key");
   // Warm genuine provider TLS/cleanup locks before measuring persistent handles.
-  Actor warm; pthread_t warm_id;
+  Actor warm; warm.check_cleanup = true; pthread_t warm_id;
   Require(pthread_create(&warm_id, nullptr, Run, &warm) == 0, "warm target");
   Ready(warm); StopJoin(warm, warm_id);
   DWORD baseline = Handles();
-  Basic(provider); NativeAndStd(); CapacityAndReuse(); RacesAndCancellation();
+  EndedBeforeNativeExit();
+  Basic(provider); NativeAndStd(); ExternalExitStress(); CapacityAndReuse(); RacesAndCancellation();
   DWORD final = Handles();
   std::printf("MEASURE handles_baseline=%lu handles_final=%lu\n", static_cast<unsigned long>(baseline), static_cast<unsigned long>(final));
   Require(final <= baseline + 4, "real clock/supplier handles reclaimed within original baseline bound");
+  Require(pthread_key_delete(cleanup_key) == 0, "delete lifecycle cleanup key");
   clockid_t self;
   Require(pthread_getcpuclockid(pthread_self(), &self) == 0 && FreeLibrary(module), "unload peer after all its targets exit");
   timespec value{};

@@ -16,10 +16,10 @@
     "mingw-w64-libraries/winpthreads/src/sem.c": "471f545d01bd1ea55fcab4429db92152c81d5f77c274dee87c8e4b43d2450e32",
     "mingw-w64-libraries/winpthreads/src/rwlock.h": "6d0a3bd1467599e2b447b3e32d36c4329a6b8e39faf0b13de74a08e6fba4ef81"
   },
-  "patch_sha256": "4d63c24003592ccc2f216829e1a49cbd87ca611ef942cb90024e4d5693deb8c4",
+  "patch_sha256": "1a58701fb53ba16a7b69ba573cb71b5c69ec19e5c9916e6f499d6bfae6f896d1",
   "output_source_sha256": {
-    "mingw-w64-libraries/winpthreads/src/thread.c": "c705280f22fc28f6819ca55147b8a6afdb574f9d7e0725d4c2e4e9f1829fb34c",
-    "mingw-w64-libraries/winpthreads/src/thread.h": "13a33e4390ec834fa4c00ab1ce4b5b7c34e48baecd82debcba6ae5dd5b642646",
+    "mingw-w64-libraries/winpthreads/src/thread.c": "66caa5b99ffc9ec137f2a58e158ae43df9f52dd4cc0eb87e870477e3c1a8103e",
+    "mingw-w64-libraries/winpthreads/src/thread.h": "3032d29d7a49c5cad5d86c843516df63246d3b5c613e26868975791c5f96fc22",
     "mingw-w64-libraries/winpthreads/include/pthread.h": "009b3b84ef23f04df2cd28f41ed10473cdd3a97bc7125d06e9dc348419d69fbf",
     "mingw-w64-libraries/winpthreads/src/clock.c": "02da3faa86b0afd8433bd5a4f26d8fea81bc0ec463a7b670297e0a378d2f12d9"
   },
