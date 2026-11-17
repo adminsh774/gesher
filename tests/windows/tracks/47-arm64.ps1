@@ -90,7 +90,8 @@ Check 'arm64: an arm64-v8a libc/pthread .so runs its checks through the shim' {
 # of the translated compiled kernel against the same code built natively.
 Check 'arm64: guest ABI (TLS, stack protector, setjmp, stat, epoll, syscall, atomics, va_list)' {
   A64Run "$a64/arm64_elf_test.exe" @((NoDrive "$a64/arm64_abi_test.so"), (NoDrive "$a64"))
-} @('arm64_abi_test: all passed', 'arm64_elf_test all passed', 'INFO  arm64 perf: compiled C kernel')
+} @('arm64_abi_test: all passed', 'arm64_elf_test all passed', 'INFO  arm64 perf: compiled C kernel',
+    'Bionic setjmp contracts: all passed')
 
 # Step 3/4 (guest JNI): dalvikvm runs gesher.Arm64Jni, whose System.load of an
 # arm64-v8a .so goes through ART's host libnativeloader path to the ELF loader,

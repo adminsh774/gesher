@@ -23,11 +23,14 @@
 // The loader asks guest_symbol(name) before binding a guest import to the shim.
 
 #include "translator.h"
+#include "guest_setjmp.h"
 #include <gesher/symbol_table.h>
 
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <memory>
 #include <new>
@@ -541,39 +544,35 @@ void* GESHER_SYSV GuestDlsym(void* handle, const char* name) {
 }
 
 // --- setjmp / longjmp (guest code) -------------------------------------------------
-// The jmp_buf (bionic's arm64 jmp_buf is long[32]) holds x19..x30 at 0..95,
-// sp at 96 and d8..d15 at 104..167. The signal mask is not saved (sigsetjmp's
-// savemask is ignored).
-constexpr uint32_t StpX(int rt, int rt2, int rn, int off) {
-  return 0xA9000000u | ((static_cast<uint32_t>(off / 8) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt;
-}
-constexpr uint32_t LdpX(int rt, int rt2, int rn, int off) { return StpX(rt, rt2, rn, off) | 0x00400000u; }
-constexpr uint32_t StpD(int rt, int rt2, int rn, int off) {
-  return 0x6D000000u | ((static_cast<uint32_t>(off / 8) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt;
-}
-constexpr uint32_t LdpD(int rt, int rt2, int rn, int off) { return StpD(rt, rt2, rn, off) | 0x00400000u; }
-constexpr uint32_t StrX(int rt, int rn, int off) { return 0xF9000000u | ((off / 8) << 10) | (rn << 5) | rt; }
-constexpr uint32_t LdrX(int rt, int rn, int off) { return 0xF9400000u | ((off / 8) << 10) | (rn << 5) | rt; }
+// Use the same Bionic provider as sigprocmask and signal delivery. A private
+// translator mask would diverge from ordinary guest calls.
+using JumpMaskFunction = int(GESHER_SYSV*)(int, const uint64_t*, uint64_t*);
+JumpMaskFunction g_jump_sigprocmask = nullptr;
+using JumpAbortFunction = void(GESHER_SYSV*)();
+JumpAbortFunction g_jump_abort = nullptr;
 
-const uint32_t kSetjmp[] = {
-    0x910003F0u,            // mov x16, sp
-    StpX(19, 20, 0, 0),  StpX(21, 22, 0, 16), StpX(23, 24, 0, 32),
-    StpX(25, 26, 0, 48), StpX(27, 28, 0, 64), StpX(29, 30, 0, 80),
-    StrX(16, 0, 96),
-    StpD(8, 9, 0, 104),  StpD(10, 11, 0, 120), StpD(12, 13, 0, 136), StpD(14, 15, 0, 152),
-    0xD2800000u,            // mov x0, #0
-    0xD65F03C0u,            // ret
-};
-const uint32_t kLongjmp[] = {
-    LdpX(19, 20, 0, 0),  LdpX(21, 22, 0, 16), LdpX(23, 24, 0, 32),
-    LdpX(25, 26, 0, 48), LdpX(27, 28, 0, 64), LdpX(29, 30, 0, 80),
-    LdrX(16, 0, 96),
-    0x9100021Fu,            // mov sp, x16
-    LdpD(8, 9, 0, 104),  LdpD(10, 11, 0, 120), LdpD(12, 13, 0, 136), LdpD(14, 15, 0, 152),
-    0xF100003Fu,            // cmp x1, #0
-    0x9A9F1420u,            // csinc x0, x1, xzr, ne   (longjmp(env, 0) returns 1)
-    0xD65F03C0u,            // ret
-};
+[[noreturn]] void JumpAbort() {
+  // Preserve the shared Bionic abort path, including a guest SIGABRT handler.
+  if (g_jump_abort != nullptr) g_jump_abort();
+  std::abort();  // Incomplete standalone host, or a broken returning provider.
+}
+
+[[noreturn]] void GESHER_SYSV JumpInvalidFlag(uint64_t flag) {
+  std::fprintf(stderr, "gesher arm64: unexpected sigflag value: %llu\n",
+               static_cast<unsigned long long>(flag));
+  JumpAbort();
+}
+
+int GESHER_SYSV JumpSigprocmask(int how, const uint64_t* set, uint64_t* old) {
+  // The normal runtime always supplies this core libc entry. Standalone DLL
+  // fixtures may omit it; a mask-saving jump must not report success in an
+  // incomplete host. _setjmp/sigsetjmp(..., 0) do not need the provider.
+  if (g_jump_sigprocmask == nullptr || g_jump_sigprocmask(how, set, old) != 0) {
+    std::fputs("gesher arm64: setjmp signal-mask provider unavailable or failed\n", stderr);
+    JumpAbort();
+  }
+  return 0;
+}
 
 // --- the floating-point environment ------------------------------------------------
 // Rounding uses the actual per-thread FPCR, including direct guest MSR.
@@ -776,10 +775,18 @@ void InitGuestLibc() {
   // trampoline or the common host shim's different x86 environment layout.
   g_overrides["__fe_dfl_env"] = const_cast<ArmFenv*>(&kArmDefaultEnv);
 
-  void* sj = EmitGuestCode(kSetjmp, sizeof(kSetjmp) / 4);
-  void* lj = EmitGuestCode(kLongjmp, sizeof(kLongjmp) / 4);
-  for (const char* n : {"setjmp", "_setjmp", "sigsetjmp"}) g_overrides[n] = sj;
-  for (const char* n : {"longjmp", "_longjmp", "siglongjmp"}) g_overrides[n] = lj;
+  g_jump_sigprocmask = reinterpret_cast<JumpMaskFunction>(Host("sigprocmask"));
+  g_jump_abort = reinterpret_cast<JumpAbortFunction>(Host("abort"));
+  uint64_t mask = reinterpret_cast<uint64_t>(BindHost(reinterpret_cast<void*>(&JumpSigprocmask), -1));
+  uint64_t invalid_flag = reinterpret_cast<uint64_t>(BindHost(reinterpret_cast<void*>(&JumpInvalidFlag), -1));
+  auto emit = [](const std::vector<uint32_t>& code) {
+    return EmitGuestCode(code.data(), code.size());
+  };
+  g_overrides["setjmp"] = emit(jump::Save(mask, jump::SaveMask::Always, invalid_flag));
+  g_overrides["_setjmp"] = emit(jump::Save(mask, jump::SaveMask::Never, invalid_flag));
+  g_overrides["sigsetjmp"] = emit(jump::Save(mask, jump::SaveMask::Argument, invalid_flag));
+  void* restore = emit(jump::Restore(mask));
+  for (const char* name : {"longjmp", "_longjmp", "siglongjmp"}) g_overrides[name] = restore;
 }
 
 }  // namespace gesher_arm64
