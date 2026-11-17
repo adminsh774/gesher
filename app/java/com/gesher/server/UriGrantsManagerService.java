@@ -31,12 +31,27 @@ final class UriGrantsManagerService extends IUriGrantsManager.Default {
     }
     @Override public void takePersistableUriPermission(Uri uri, int modes, String packageName, int userId) {
         user(userId);
-        if (packageName == null) { if (!mCallers.isSystem()) mCallers.callerPackage(); }
-        else target(packageName);
+        if (packageName == null) {
+            packageName = mCallers.isSystem() ? null : mCallers.callerPackage();
+        } else {
+            target(packageName);
+        }
+        if (packageName != null && mGrants.takePersistable(packageName, uri, modes)) {
+            return;
+        }
         throw new UnsupportedOperationException("Persistable URI grants are not implemented");
     }
     @Override public void releasePersistableUriPermission(Uri uri, int modes, String packageName, int userId) {
-        takePersistableUriPermission(uri, modes, packageName, userId);
+        user(userId);
+        if (packageName == null) {
+            packageName = mCallers.isSystem() ? null : mCallers.callerPackage();
+        } else {
+            target(packageName);
+        }
+        if (packageName != null && mGrants.releasePersistable(packageName, uri, modes)) {
+            return;
+        }
+        throw new UnsupportedOperationException("Persistable URI grants are not implemented");
     }
     @Override public void grantUriPermissionFromOwner(IBinder owner, int fromUid, String targetPackage,
             Uri uri, int modes, int sourceUserId, int targetUserId) {
@@ -45,8 +60,7 @@ final class UriGrantsManagerService extends IUriGrantsManager.Default {
     }
     @Override public ParceledListSlice getGrantedUriPermissions(String packageName, int userId) {
         host(); user(userId);
-        // Android's administration API lists persisted grants; none are implemented.
-        return new ParceledListSlice(Collections.emptyList());
+        return new ParceledListSlice(mGrants.list(packageName, false, true));
     }
     @Override public void clearGrantedUriPermissions(String packageName, int userId) {
         host(); user(userId);

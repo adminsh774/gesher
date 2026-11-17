@@ -54,6 +54,7 @@ final class ContentProviders {
     private final PackageManagerService mPm;
     private final ActivityTaskManagerService mAtm;
     private final SettingsProvider mSettings;
+    private final DocumentsStorageProvider mDocumentsStorage;
     private final CallerIdentity mCallers;
     private final UriGrants mUriGrants;
 
@@ -102,6 +103,7 @@ final class ContentProviders {
         mCallers = new CallerIdentity(pm, atm);
         mUriGrants = new UriGrants(pm, atm);
         mSettings = new SettingsProvider(pm, atm);
+        mDocumentsStorage = new DocumentsStorageProvider(pm, atm);
     }
 
     UriGrants uriGrants() { return mUriGrants; }
@@ -114,6 +116,15 @@ final class ContentProviders {
 
     /** Ambiguous declarations never select an attacker simply because it installed first. */
     static ProviderInfo declaredProvider(PackageManagerService pm, String authority) {
+        if (DocumentsStorageProvider.AUTHORITY.equals(authority)) {
+            ProviderInfo info = new ProviderInfo();
+            info.packageName = "android";
+            info.name = DocumentsStorageProvider.class.getName();
+            info.authority = DocumentsStorageProvider.AUTHORITY;
+            info.exported = true;
+            info.grantUriPermissions = true;
+            return info;
+        }
         ProviderInfo found = null;
         for (ApkPackage pkg : pm.packages()) {
             if (pm.isRemovalPending(pkg.packageName)) continue;
@@ -201,6 +212,13 @@ final class ContentProviders {
         String actualPackage = callerPackage(caller, callingPackage);
         if (SettingsProvider.AUTHORITY.equals(name)) {
             return mSettings.holder();
+        }
+        if (DocumentsStorageProvider.AUTHORITY.equals(name)) {
+            ProviderInfo declared = declaredProvider(mPm, name);
+            if (declared != null) {
+                enforceAccess(actualPackage, declared);
+            }
+            return mDocumentsStorage.holder();
         }
         ProviderInfo declared = null;
         long deadline = 0;

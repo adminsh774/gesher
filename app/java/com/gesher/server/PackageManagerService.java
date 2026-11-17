@@ -428,6 +428,15 @@ public final class PackageManagerService extends IPackageManager.Default {
             if (isRemovalPending(p.packageName)) continue;
             result.addAll(p.queryIntentContentProviders(intent, resolvedType, flags));
         }
+        if (intent.getAction() != null && (intent.getAction().equals("android.content.action.DOCUMENTS_PROVIDER")
+                || intent.getAction().equals(android.provider.DocumentsContract.PROVIDER_INTERFACE))) {
+            ProviderInfo docProvider = ContentProviders.declaredProvider(this, DocumentsStorageProvider.AUTHORITY);
+            if (docProvider != null) {
+                ResolveInfo info = new ResolveInfo();
+                info.providerInfo = docProvider;
+                result.add(info);
+            }
+        }
         return new ParceledListSlice<>(result);
     }
 
@@ -447,6 +456,9 @@ public final class PackageManagerService extends IPackageManager.Default {
 
     @Override
     public ProviderInfo resolveContentProvider(String name, long flags, int userId) {
+        if (DocumentsStorageProvider.AUTHORITY.equals(name)) {
+            return ContentProviders.declaredProvider(this, name);
+        }
         return provider(name, flags);
     }
 

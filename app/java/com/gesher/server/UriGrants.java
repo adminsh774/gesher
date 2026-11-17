@@ -27,9 +27,12 @@ final class UriGrants {
         final Uri uri;
         final boolean prefix;
         int modes;
-        Grant(ApkPackage owner, ApkPackage target, Uri uri, int modes, boolean prefix) {
+        boolean persistable;
+        boolean persisted;
+        long persistTime;
+        Grant(ApkPackage owner, ApkPackage target, Uri uri, int modes, boolean prefix, boolean persistable) {
             this.owner = owner; this.target = target; this.uri = uri;
-            this.modes = modes; this.prefix = prefix;
+            this.modes = modes; this.prefix = prefix; this.persistable = persistable;
         }
     }
 
@@ -92,13 +95,14 @@ final class UriGrants {
     }
 
     private boolean current(ApkPackage pkg) {
-        return pkg != null && mPm.get(pkg.packageName) == pkg
+        if (pkg == null) return true;
+        return mPm.get(pkg.packageName) == pkg
                 && !mPm.isRemovalPending(pkg.packageName);
     }
 
     private boolean holdsGrant(ApkPackage target, Uri uri, int modes, boolean requirePrefix) {
         synchronized (this) {
-            if (!current(target)) return false;
+            if (target == null || !current(target)) return false;
             for (Grant grant : mGrants) {
                 if (grant.target == target && current(grant.owner)
                         && (!requirePrefix || grant.prefix)
@@ -203,10 +207,10 @@ final class UriGrants {
     }
 
     synchronized boolean hasAny(ApkPackage target, ProviderInfo info) {
-        if (!current(target)) return false;
+        if (!current(target) || target == null) return false;
         for (Grant grant : mGrants) {
             if (grant.target == target && current(grant.owner)
-                    && info.packageName.equals(grant.owner.packageName)
+                    && (grant.owner == null || info.packageName.equals(grant.owner.packageName))
                     && ContentProviders.hasAuthority(info, grant.uri.getAuthority())
                     && grant.modes != 0) return true;
         }
@@ -216,32 +220,73 @@ final class UriGrants {
     synchronized List<android.content.UriPermission> list(String packageName, boolean incoming,
             boolean persistedOnly) {
         List<android.content.UriPermission> result = new ArrayList<>();
-        if (persistedOnly) return result;
         for (Grant grant : mGrants) {
-            if (!current(grant.owner) || !current(grant.target)) continue;
-            if (packageName.equals(incoming ? grant.target.packageName : grant.owner.packageName)) {
+            if (grant.target == null || !current(grant.target)) continue;
+            if (grant.owner != null && !current(grant.owner)) continue;
+            if (persistedOnly && !grant.persisted) continue;
+            String matchPkg = incoming ? grant.target.packageName
+                    : (grant.owner != null ? grant.owner.packageName : "android");
+            if (packageName.equals(matchPkg)) {
                 result.add(new android.content.UriPermission(grant.uri, grant.modes,
-                        android.content.UriPermission.INVALID_TIME));
+                        grant.persisted ? grant.persistTime : android.content.UriPermission.INVALID_TIME));
             }
         }
         return result;
     }
 
     synchronized void clear(String packageName) {
-        mGrants.removeIf(grant -> packageName.equals(grant.owner.packageName)
-                || packageName.equals(grant.target.packageName));
+        mGrants.removeIf(grant -> (grant.owner != null && packageName.equals(grant.owner.packageName))
+                || (grant.target != null && packageName.equals(grant.target.packageName)));
+    }
+
+    synchronized boolean hasPersistableGrant(String packageName, Uri uri, int modes) {
+        int access = modes & ACCESS;
+        for (Grant grant : mGrants) {
+            if (grant.target != null && packageName.equals(grant.target.packageName)
+                    && grant.persistable && matches(grant.uri, grant.prefix, uri)
+                    && (grant.modes & access) == access) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    synchronized boolean takePersistable(String packageName, Uri uri, int modes) {
+        int access = modes & ACCESS;
+        for (Grant grant : mGrants) {
+            if (grant.target != null && packageName.equals(grant.target.packageName)
+                    && grant.persistable && matches(grant.uri, grant.prefix, uri)
+                    && (grant.modes & access) == access) {
+                grant.persisted = true;
+                grant.persistTime = System.currentTimeMillis();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    synchronized boolean releasePersistable(String packageName, Uri uri, int modes) {
+        for (Grant grant : mGrants) {
+            if (grant.target != null && packageName.equals(grant.target.packageName)
+                    && matches(grant.uri, grant.prefix, uri)) {
+                grant.persisted = false;
+                return true;
+            }
+        }
+        return false;
     }
 
     void grant(String targetPackage, Uri original, int modes, int userId) {
         Uri uri = checkedUri(original, userId);
-        if ((modes & Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) != 0) {
-            throw new UnsupportedOperationException("Persistable URI grants are not implemented");
-        }
+        boolean persistable = (modes & Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) != 0;
         int access = modes & ACCESS;
-        if (access == 0 || (modes & ~(ACCESS | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)) != 0) {
+        if (access == 0 || (modes & ~(ACCESS | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)) != 0) {
             throw new IllegalArgumentException("Invalid URI grant flags");
         }
         boolean system = mCallers.isSystem();
+        if (!system && persistable) {
+            throw new UnsupportedOperationException("Persistable URI grants cannot be delegated by applications");
+        }
         String senderName = system ? null : mCallers.callerPackage();
         if (targetPackage == null) throw new IllegalArgumentException("Missing URI grant target");
         boolean prefix = (modes & Intent.FLAG_GRANT_PREFIX_URI_PERMISSION) != 0;
@@ -260,13 +305,13 @@ final class UriGrants {
             ApkPackage owner = mPm.get(info.packageName);
             ApkPackage target = mPm.get(targetPackage);
             if (target == null) return;
-            if (!current(owner) || !current(target)) {
+            if ((owner != null && !current(owner)) || !current(target)) {
                 throw new SecurityException("Unknown or retiring URI grant participant");
             }
             // No capability is needed or created when the target already has
             // direct access. Android does this before checking grant patterns,
             // but advanced grants and dynamic providers must still be checked.
-            if (!prefix && !info.forceUriPermissions
+            if (!prefix && !info.forceUriPermissions && owner != null
                     && hasDirectAccess(target, info, uri, access)) return;
             boolean grantable = info.grantUriPermissions;
             if (info.uriPermissionPatterns != null && info.uriPermissionPatterns.length != 0) {
@@ -276,7 +321,7 @@ final class UriGrants {
                 }
             }
             if (!grantable) throw new SecurityException("Provider does not allow URI grants");
-            boolean direct = system || hasDirectAccess(sender, info, uri, access);
+            boolean direct = system || (owner != null && hasDirectAccess(sender, info, uri, access));
             synchronized (this) {
                 // An exact grant cannot be promoted into a subtree grant. Keep
                 // the held-grant check and publication atomic with revocation.
@@ -289,10 +334,11 @@ final class UriGrants {
                     if (grant.owner == owner && grant.target == target
                             && grant.prefix == prefix && grant.uri.equals(uri)) {
                         grant.modes |= access;
+                        if (persistable) grant.persistable = true;
                         return;
                     }
                 }
-                mGrants.add(new Grant(owner, target, uri, access, prefix));
+                mGrants.add(new Grant(owner, target, uri, access, prefix, persistable));
             }
         }
     }
@@ -307,14 +353,14 @@ final class UriGrants {
             if (info == null) return;
             ApkPackage owner = mPm.get(info.packageName);
             ApkPackage caller = system ? null : mPm.get(callerName);
-            boolean all = system || hasDirectAccess(caller, info, uri, access);
+            boolean all = system || (owner != null && hasDirectAccess(caller, info, uri, access));
             synchronized (this) {
                 for (Grant grant : mGrants) {
                     // Since Android L, recipients without general provider access
                     // may relinquish their own ownerless grants, never another
                     // recipient's. All grants in this backend are explicit.
-                    if ((all || grant.target == caller)
-                            && (targetPackage == null || targetPackage.equals(grant.target.packageName))
+                    if ((all || (caller != null && grant.target == caller))
+                            && (targetPackage == null || (grant.target != null && targetPackage.equals(grant.target.packageName)))
                             && grant.owner == owner && matches(uri, true, grant.uri)) {
                         grant.modes &= ~access;
                     }

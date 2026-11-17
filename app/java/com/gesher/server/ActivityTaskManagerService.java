@@ -127,6 +127,41 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
     /** A fixed ms-settings: page for an Android Settings screen (SettingsIntents). */
     static volatile java.util.function.Predicate<String> sOpenSettingsPage = WindowsHost::openUrl;
 
+    /** Native Windows picker hooks; tests replace them for automated execution. */
+    static volatile java.util.function.Function<String, String> sPickFolder = WindowsHost::pickFolder;
+    static volatile java.util.function.Function<String, String> sPickFile = WindowsHost::pickFile;
+
+    static Intent buildDocumentPickerResult(String action, String picked) {
+        if (picked == null || picked.isEmpty()) return null;
+        boolean isTree = Intent.ACTION_OPEN_DOCUMENT_TREE.equals(action);
+        String guestPath = Zygote.fromWindowsPath(picked);
+        Intent resultData = new Intent();
+        Uri uri;
+        int grantFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION;
+        if (isTree) {
+            grantFlags |= Intent.FLAG_GRANT_PREFIX_URI_PERMISSION;
+            uri = android.provider.DocumentsContract.buildTreeDocumentUri(DocumentsStorageProvider.AUTHORITY, guestPath);
+        } else {
+            if (Intent.ACTION_CREATE_DOCUMENT.equals(action)) {
+                java.io.File f = new java.io.File(guestPath);
+                try {
+                    if (!f.exists()) {
+                        java.io.File parent = f.getParentFile();
+                        if (parent != null) parent.mkdirs();
+                        f.createNewFile();
+                    }
+                } catch (Exception ignored) {}
+            }
+            uri = android.provider.DocumentsContract.buildDocumentUri(DocumentsStorageProvider.AUTHORITY, guestPath);
+        }
+        resultData.setData(uri);
+        resultData.addFlags(grantFlags);
+        resultData.setClipData(android.content.ClipData.newRawUri("document", uri));
+        return resultData;
+    }
+
     /** STARTED: made visible again without being resumed (StartActivityItem). */
     enum State { INITIALIZING, LAUNCHING, RESUMING, RESUMED, PAUSING, PAUSED, STARTED, STOPPING,
             STOPPED, DESTROYING, DESTROYED }
@@ -1062,6 +1097,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                     }
                 } else if (Intent.ACTION_OPEN_DOCUMENT_TREE.equals(action)
                         || Intent.ACTION_OPEN_DOCUMENT.equals(action)
+                        || Intent.ACTION_CREATE_DOCUMENT.equals(action)
                         || Intent.ACTION_GET_CONTENT.equals(action)) {
                     SystemServer.log("startActivity: handling document/tree picker intent: " + action);
                     ActivityRecord source = resultToToken != null ? forToken(resultToToken) : null;
@@ -1071,21 +1107,21 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                     // would stop, as the app's own startActivityForResult returns at once
                     // on Android). The result comes when the dialog closes.
                     Thread picker = new Thread(() -> {
-                        String picked = isTree ? WindowsHost.pickFolder("Select Folder")
-                                : WindowsHost.pickFile("Select File");
+                        String picked = isTree ? sPickFolder.apply("Select Folder")
+                                : sPickFile.apply("Select File");
                         SystemServer.log("startActivity: " + action + " picked "
                                 + (picked != null && !picked.isEmpty() ? picked : "nothing"));
                         if (source == null || requestCode < 0) return;
-                        Intent resultData = null;
-                        int resultCode = android.app.Activity.RESULT_CANCELED;
-                        if (picked != null && !picked.isEmpty()) {
-                            resultCode = android.app.Activity.RESULT_OK;
-                            resultData = new Intent();
-                            Uri uri = Uri.fromFile(new java.io.File(Zygote.fromWindowsPath(picked)));
-                            resultData.setData(uri);
-                            resultData.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
-                                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                            resultData.setClipData(android.content.ClipData.newUri(null, "document", uri));
+                        Intent resultData = buildDocumentPickerResult(action, picked);
+                        int resultCode = resultData != null ? android.app.Activity.RESULT_OK
+                                : android.app.Activity.RESULT_CANCELED;
+                        if (resultData != null && source.info != null && source.info.packageName != null) {
+                            try {
+                                mAm.uriGrants().grant(source.info.packageName, resultData.getData(),
+                                        resultData.getFlags(), 0);
+                            } catch (Exception e) {
+                                SystemServer.log("Failed to grant SAF URI permission: " + e);
+                            }
                         }
                         deliverResult(source, resultWho, requestCode, resultCode, resultData);
                     }, "document-picker");
