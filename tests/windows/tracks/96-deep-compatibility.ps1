@@ -7,6 +7,13 @@ Check 'framework: Wi-Fi data APIs and real native Parcelable round trips' {
   $deepWifiOut
 } @('WifiDataContractTest all passed:', 'parcel=true')
 
+$deepWifiConfigurationOut = FixesRun ($dvmFixes + 'gesher.services.WifiConfigurationContractTest') 90
+$deepWifiConfigurationCode = $LASTEXITCODE
+Check 'framework: Wi-Fi configuration, enterprise certificates and native Parcelable contracts' {
+  $global:LASTEXITCODE = $deepWifiConfigurationCode
+  $deepWifiConfigurationOut
+} @('WifiConfigurationContractTest all passed:', 'parcel=true')
+
 $deepNetworkOut = FixesRun ($dvmFixes + 'gesher.services.NetworkSnapshotContractTest') 90
 $deepNetworkCode = $LASTEXITCODE
 Check 'framework: network route, address, snapshot and proxy contracts with native Parcel' {
