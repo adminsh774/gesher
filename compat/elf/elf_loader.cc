@@ -996,8 +996,16 @@ bool ApplyRela(Library* lib, const Elf64_Rela& r, std::string* error) {
       break;
     }
     case R_X86_64_DTPOFF64: {
-      const Elf64_Sym* sym = &lib->symtab[sym_index];
-      *where = (sym_index ? sym->st_value : 0) + r.r_addend;
+      // DTPMOD64 and DTPOFF64 must describe the same defining object's TLS.
+      // An importing symbol has st_value zero even when its definition has
+      // a nonzero offset in the dependency's private initialization image.
+      uint64_t sym_value = 0;
+      if (sym_index != 0) {
+        ResolvedSymbol rs;
+        if (!resolve(&rs)) return false;
+        sym_value = rs.sym ? rs.sym->st_value : 0;
+      }
+      *where = sym_value + r.r_addend;
       break;
     }
     case R_X86_64_TPOFF64: {

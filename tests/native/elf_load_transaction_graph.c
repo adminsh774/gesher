@@ -81,7 +81,9 @@ int tx_concurrent_fail_root(void) {
 // resolver uses only local code/data, so it needs no unrelocated external GOT.
 static int ifunc_calls;
 static int ifunc_value(void) { return TX_ROLE; }
-static int (*select_ifunc(void))(void) { ++ifunc_calls; return ifunc_value; }
+// The IFUNC alias names its resolver as metadata rather than a C call.
+// NDK Clang needs the explicit retention marker under -Wunused-function.
+static __attribute__((used)) int (*select_ifunc(void))(void) { ++ifunc_calls; return ifunc_value; }
 int tx_selected(void) __attribute__((ifunc("select_ifunc")));
 static int (*selected_pointer)(void) = tx_selected;
 int tx_ifunc_result(void) { return selected_pointer() + 100 * ifunc_calls; }
@@ -92,7 +94,7 @@ int tx_child_tls_read(void) { return tx_child_tls; }
 extern __thread int tx_child_tls;
 static int observed_tls;
 static int tls_implementation(void) { return observed_tls; }
-static int (*select_tls_ifunc(void))(void) {
+static __attribute__((used)) int (*select_tls_ifunc(void))(void) {
   observed_tls = tx_child_tls;
   tx_child_tls = 93;
   return tls_implementation;
