@@ -193,7 +193,7 @@ public final class DocumentsStorageProvider extends ContentProvider {
                         row.add(ROOT_ID_PRIMARY);
                         break;
                     case Root.COLUMN_FLAGS:
-                        row.add(Root.FLAG_SUPPORTS_CREATE | Root.FLAG_LOCAL_ONLY | Root.FLAG_SUPPORTS_SEARCH | Root.FLAG_SUPPORTS_IS_CHILD);
+                        row.add(Root.FLAG_SUPPORTS_CREATE | Root.FLAG_LOCAL_ONLY);
                         break;
                     case Root.COLUMN_ICON:
                         row.add(0);
@@ -205,10 +205,10 @@ public final class DocumentsStorageProvider extends ContentProvider {
                         row.add("/");
                         break;
                     case Root.COLUMN_AVAILABLE_BYTES:
-                        row.add(1024L * 1024L * 1024L);
+                        row.add(null); // The virtual root has no single backing-volume capacity.
                         break;
                     case Root.COLUMN_CAPACITY_BYTES:
-                        row.add(1024L * 1024L * 1024L * 10L);
+                        row.add(null);
                         break;
                     case Root.COLUMN_MIME_TYPES:
                         row.add("*/*");
@@ -299,7 +299,7 @@ public final class DocumentsStorageProvider extends ContentProvider {
         File file = getFileForDocId(docId);
         int modeBits = ParcelFileDescriptor.parseMode(mode);
         if (!file.exists()) {
-            if ((modeBits & (ParcelFileDescriptor.MODE_CREATE | ParcelFileDescriptor.MODE_WRITE_ONLY | ParcelFileDescriptor.MODE_READ_WRITE)) != 0) {
+            if ((modeBits & ParcelFileDescriptor.MODE_CREATE) != 0) {
                 File parent = file.getParentFile();
                 if (parent != null) parent.mkdirs();
                 try {

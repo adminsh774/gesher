@@ -197,6 +197,18 @@ public final class SafDocumentsContractTest {
 
         DocumentsStorageProvider provider = new DocumentsStorageProvider(null, null);
 
+        // Reading a deleted/missing document must fail without inventing file contents.
+        File missingFile = new File(tmpDir, "missing_read_only.txt");
+        Uri missingUri = DocumentsContract.buildDocumentUri(auth, missingFile.getAbsolutePath());
+        boolean missingReadFailed = false;
+        try (android.os.ParcelFileDescriptor unexpected = provider.openFile(missingUri, "r")) {
+            // A successful read would violate the missing-document contract.
+        } catch (java.io.FileNotFoundException expected) {
+            missingReadFailed = true;
+        }
+        check(missingReadFailed, "Read-only open of a missing document must fail");
+        check(!missingFile.exists(), "Read-only open must not create a missing document");
+
         // Query Document URI
         Uri sampleDocUri = DocumentsContract.buildDocumentUri(auth, sampleFile.getAbsolutePath());
         Cursor docCursor = provider.query(sampleDocUri, null, null, null, null);
