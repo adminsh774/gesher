@@ -55,6 +55,7 @@ final class ContentProviders {
     private final PackageManagerService mPm;
     private final ActivityTaskManagerService mAtm;
     private final SettingsProvider mSettings;
+    private final UserDictionaryProvider mUserDictionary;
     private final CallerIdentity mCallers;
     private final UriGrants mUriGrants;
 
@@ -134,6 +135,7 @@ final class ContentProviders {
         mCallers = new CallerIdentity(pm, atm);
         mUriGrants = new UriGrants(pm, atm);
         mSettings = new SettingsProvider(pm, atm);
+        mUserDictionary = new UserDictionaryProvider(pm, atm);
     }
 
     UriGrants uriGrants() { return mUriGrants; }
@@ -252,6 +254,9 @@ final class ContentProviders {
         String actualPackage = callerPackage(caller, callingPackage);
         if (SettingsProvider.AUTHORITY.equals(name)) {
             return mSettings.holder();
+        }
+        if (UserDictionaryProvider.AUTHORITY.equals(name)) {
+            return mUserDictionary.holder();
         }
         final ProviderInfo declared;
         final ApkPackage declaredCode;
