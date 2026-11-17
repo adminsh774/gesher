@@ -1,319 +1,229 @@
 /* Copyright (C) 2026 The Gesher Authors; SPDX-License-Identifier: Apache-2.0 */
 package gesher.services;
 
+import android.Manifest;
+import android.app.AppOpsManager;
 import android.content.ClipData;
-import android.content.ClipDescription;
-import android.content.IClipboard;
-import android.content.IOnPrimaryClipChangedListener;
+import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Binder;
-import android.os.IBinder;
-import android.os.Process;
-import android.os.RemoteException;
+import com.gesher.server.ApkPackage;
+import java.io.File;
+import java.lang.reflect.InvocationTargetException;
+import java.util.LinkedHashMap;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import static gesher.services.ClipboardFixture.*;
+import static android.app.AppOpsManager.*;
 
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Method;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-
-/**
- * Android 10+ (API 29+) clipboard security contract verification:
- * - Calling UID must have input focus, be the default IME, or be a system/privileged UID to read.
- * - Background/unfocused applications receive null or false on clipboard read queries.
- * - Focused apps can write and read clipboard data.
- * - Default IME or system UID can access clipboard even without window focus.
- * - PrimaryClipChangedListener only dispatches notifications to callers with focus (or IME/system).
- * - Package mismatch / null package when not system throws SecurityException.
- */
+/** Android 16 clipboard contracts against production authentication and permission/AppOps policy. */
 public final class ClipboardSecurityContractTest {
-    private static final String APP_PKG = "com.gesher.fixture.app";
-    private static final int APP_UID = 10100;
-    private static final int APP_PID = 5001;
-
-    private static final String BG_PKG = "com.gesher.fixture.bg";
-    private static final int BG_UID = 10200;
-    private static final int BG_PID = 5002;
-
-    private static final String IME_PKG = "com.gesher.fixture.ime";
-    private static final int IME_UID = 10300;
-    private static final int IME_PID = 5003;
-
-    private static final String SYSTEM_PKG = "android";
-    private static final int SYSTEM_UID = Process.SYSTEM_UID;
-    private static final int SYSTEM_PID = 1000;
-
-    public static int checks;
-
-    private static void check(boolean condition, String message) {
-        if (!condition) {
-            throw new AssertionError(message);
+    private static int checks;
+    private static void check(boolean value, String why) { if (!value) throw new AssertionError(why); checks++; }
+    private static void rejects(Class<? extends Throwable> expected, Checked action) throws Exception {
+        try { action.run(); }
+        catch (Throwable failure) {
+            if (failure instanceof InvocationTargetException wrapped) failure = wrapped.getCause();
+            if (expected.isInstance(failure)) { checks++; return; }
+            throw new AssertionError("Expected " + expected + ", got " + failure, failure);
         }
-        checks++;
+        throw new AssertionError("Expected " + expected.getSimpleName());
     }
-
-    private static IClipboard newService() throws Exception {
-        Class<?> clazz = Class.forName("com.gesher.server.ClipboardService");
-        Constructor<?> constructor = clazz.getDeclaredConstructor();
-        constructor.setAccessible(true);
-        return (IClipboard) constructor.newInstance();
+    private static void read(ClipboardFixture h, ApkPackage code, boolean allowed, String why) throws Exception {
+        h.as(code, () -> {
+            check((h.api.getPrimaryClip(code.packageName, "clipboard", 0, 0) != null) == allowed, why + ": get");
+            check((h.api.getPrimaryClipDescription(code.packageName, "clipboard", 0, 0) != null) == allowed, why + ": description");
+            check(h.api.hasPrimaryClip(code.packageName, "clipboard", 0, 0) == allowed, why + ": has");
+            check(h.api.hasClipboardText(code.packageName, "clipboard", 0, 0) == allowed, why + ": text");
+        });
     }
-
-    private static void setFocusedUid(int uid) throws Exception {
-        Class<?> clazz = Class.forName("com.gesher.server.ClipboardService");
-        Method method = clazz.getMethod("setFocusedUid", int.class);
-        method.invoke(null, uid);
+    private static long noted(ClipboardFixture h, ApkPackage code) {
+        List<AppOpsManager.PackageOps> packages = h.ops.getOpsForPackage(code.uid(), code.packageName, new int[]{OP_READ_CLIPBOARD});
+        long result = -1;
+        if (packages != null) for (var pkg : packages) for (var op : pkg.getOps()) result = Math.max(result, op.getLastAccessTime(OP_FLAGS_ALL));
+        return result;
     }
-
-    private static void setDefaultIme(int uid, String pkg) throws Exception {
-        Class<?> clazz = Class.forName("com.gesher.server.ClipboardService");
-        Method method = clazz.getMethod("setDefaultIme", int.class, String.class);
-        method.invoke(null, uid, pkg);
-    }
-
-    private static void resetOverrides() throws Exception {
-        Class<?> clazz = Class.forName("com.gesher.server.ClipboardService");
-        Method method = clazz.getMethod("resetOverrides");
-        method.invoke(null);
-    }
-
-    private static final class TestListener implements IOnPrimaryClipChangedListener {
-        private final IBinder mBinder = new Binder();
-        final AtomicInteger calls = new AtomicInteger();
-        volatile CountDownLatch latch;
-
-        @Override
-        public IBinder asBinder() {
-            return mBinder;
+    private static void focusAndIdentity(ClipboardFixture h) throws Exception {
+        check(h.pm.permissions().checkPermission(OWNER, Manifest.permission.READ_CLIPBOARD_IN_BACKGROUND)
+                == PackageManager.PERMISSION_DENIED, "Requested signature permission is not a grant");
+        h.write("initial"); read(h, h.owner, true, "Actual foreground generation");
+        read(h, h.peer, false, "Other registered application");
+        h.resumed(true);
+        h.nativeState.foreground = null; read(h, h.owner, false, "A still-resumed Android task has lost Windows activation");
+        h.resumed(false);
+        h.nativeState.foreground = new long[]{PID, 0}; read(h, h.owner, false, "Unknown native generation");
+        h.nativeState.foreground = new long[]{PID, CREATED + 1}; read(h, h.owner, false, "PID generation changed");
+        h.nativeState.foreground = new long[]{PID + 77, CREATED}; read(h, h.owner, false, "Unregistered Windows process");
+        h.nativeState.foreground = new long[]{PID + 1, CREATED + 1}; read(h, h.peer, true, "Focus follows the other Windows process");
+        h.nativeState.foreground = new long[]{PID, CREATED};
+        Object process = h.processes.get(0);
+        set(process, "exiting", true); read(h, h.owner, false, "Exiting process"); set(process, "exiting", false);
+        for (String state : List.of("dead", "pidSuperseded")) {
+            set(process, state, true);
+            check(!(Boolean)call(h.atm, "ownsForegroundProcess", new Class<?>[]{int.class, long[].class}, UID,
+                    new long[]{PID, CREATED}), "Retired process cannot own focus: " + state);
+            h.asOwner(() -> rejects(SecurityException.class, () -> h.api.getPrimaryClip(OWNER, null, 0, 0)));
+            set(process, state, false);
         }
-
-        @Override
-        public void dispatchPrimaryClipChanged() {
-            calls.incrementAndGet();
-            CountDownLatch l = latch;
-            if (l != null) {
-                l.countDown();
-            }
-        }
-    }
-
-    private static void runAs(int uid, int pid, ThrowingRunnable action) throws Exception {
-        long original = Binder.clearCallingIdentity();
+        set(process, "ready", false); read(h, h.owner, false, "Unfinished attachment"); set(process, "ready", true);
+        set(process, "nativeStartTime", 0L); read(h, h.owner, false, "Unknown attachment generation"); set(process, "nativeStartTime", CREATED);
+        set(process, "packageCode", pkg(OWNER, UID, (byte)7));
+        read(h, h.owner, false, "A retired package-code generation cannot own focus"); set(process, "packageCode", h.owner);
+        h.asOwner(() -> {
+            rejects(SecurityException.class, () -> h.api.getPrimaryClip(PEER, null, 0, 0));
+            rejects(SecurityException.class, () -> h.api.hasPrimaryClip(null, null, 0, 0));
+            rejects(SecurityException.class, () -> h.api.setPrimaryClip(ClipData.newPlainText("x", "x"), "unknown.package", null, 0, 0));
+            rejects(SecurityException.class, () -> h.api.getPrimaryClipSource(OWNER, null, 0, 0));
+            rejects(SecurityException.class, () -> h.api.setPrimaryClipAsPackage(ClipData.newPlainText("x", "x"), OWNER, null, 0, 0, PEER));
+            rejects(IllegalArgumentException.class, () -> h.api.setPrimaryClip(null, OWNER, null, 0, 0));
+            check(h.api.getPrimaryClip(OWNER, null, 91, 52) != null,
+                    "Single-user/no-VDM AOSP mapping uses the caller/default clipboard");
+        });
+        long identity = Binder.clearCallingIdentity();
         try {
-            Binder.restoreCallingIdentity(((long) uid << 32) | (pid & 0xffffffffL));
-            action.run();
-        } finally {
-            Binder.restoreCallingIdentity(original);
+            Binder.restoreCallingIdentity(((long)UID << 32) | (PID + 99));
+            rejects(SecurityException.class, () -> h.api.getPrimaryClip(OWNER, null, 0, 0));
+        } finally { Binder.restoreCallingIdentity(identity); }
+    }
+    private static void imeAndPermissions(ClipboardFixture h) throws Exception {
+        h.nativeState.foreground = null;
+        h.asOwner(() -> rejects(SecurityException.class, () -> h.ime(OWNER + "/.Keyboard")));
+        read(h, h.owner, false, "Unprivileged app cannot assign itself as the secure default IME");
+        read(h, h.ime, false, "No configured IME");
+        read(h, h.hostPackage, false, "Built-in package name alone gives no IME authority");
+        h.ime(IME + "/.Keyboard"); read(h, h.ime, true, "Actual secure default IME setting");
+        h.ime("malformed"); read(h, h.ime, false, "Malformed configured component");
+        h.ime(PEER + "/.Keyboard"); read(h, h.ime, false, "IME configuration changed");
+        read(h, h.peer, true, "New configured IME"); h.ime(null);
+        check(h.pm.permissions().checkPermission(PRIVILEGED, Manifest.permission.READ_CLIPBOARD_IN_BACKGROUND)
+                == PackageManager.PERMISSION_GRANTED, "Platform signature grants the requested Android permission");
+        read(h, h.privileged, true, "Granted background clipboard permission");
+        h.nativeState.lockState = 1;
+        read(h, h.privileged, false, "Lock also gates privileged getters");
+        h.as(h.privileged, () -> check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null, "Locked source is unavailable"));
+        h.ime(IME + "/.Keyboard"); read(h, h.ime, false, "Lock also gates the default IME");
+        h.nativeState.lockState = -1; read(h, h.privileged, false, "Unknown lock state fails closed");
+        h.nativeState.lockState = 0; h.ime(null);
+    }
+    private static void appOps(ClipboardFixture h) throws Exception {
+        h.nativeState.foreground = new long[]{PID, CREATED};
+        for (int mode : new int[]{MODE_IGNORED, MODE_ERRORED, MODE_DEFAULT}) {
+            h.ops.setMode(OP_READ_CLIPBOARD, UID, OWNER, mode);
+            read(h, h.owner, false, "Non-allowed read AppOps mode " + mode);
         }
+        h.ops.setMode(OP_READ_CLIPBOARD, UID, OWNER, MODE_ALLOWED);
+        h.ops.setUidMode(OP_READ_CLIPBOARD, UID, MODE_IGNORED);
+        read(h, h.owner, false, "UID policy takes precedence");
+        h.ops.setUidMode(OP_READ_CLIPBOARD, UID, MODE_ALLOWED);
+        h.ops.setMode(OP_READ_CLIPBOARD, h.privileged.uid(), PRIVILEGED, MODE_IGNORED);
+        read(h, h.privileged, false, "Permission does not bypass AppOps");
+        h.ops.setMode(OP_READ_CLIPBOARD, h.privileged.uid(), PRIVILEGED, MODE_ALLOWED);
+        h.ime(IME + "/.Keyboard"); h.ops.setMode(OP_READ_CLIPBOARD, h.ime.uid(), IME, MODE_IGNORED);
+        read(h, h.ime, false, "IME does not bypass AppOps");
+        h.ops.setMode(OP_READ_CLIPBOARD, h.ime.uid(), IME, MODE_ALLOWED); h.ime(null);
+        int writes = h.nativeState.writes, clears = h.nativeState.clears;
+        h.ops.setMode(OP_WRITE_CLIPBOARD, UID, OWNER, MODE_IGNORED);
+        h.write("denied write");
+        h.asOwner(() -> h.api.clearPrimaryClip(OWNER, null, 0, 0));
+        check(h.nativeState.writes == writes && h.nativeState.clears == clears, "Denied writes/clear never reach Windows");
+        h.asOwner(() -> check("initial".contentEquals(h.api.getPrimaryClip(OWNER, null, 0, 0).getItemAt(0).getText()), "Denied write preserves data"));
+        h.ops.setMode(OP_WRITE_CLIPBOARD, UID, OWNER, MODE_ALLOWED);
+        h.nativeState.foreground = null; h.write("background write");
+        check("background write".equals(h.nativeState.text), "Unfocused writes remain allowed");
+        long before = noted(h, h.peer);
+        h.ime(PEER + "/.Keyboard");
+        h.as(h.peer, () -> {
+            h.api.hasPrimaryClip(PEER, "clipboard", 0, 0);
+            h.api.hasClipboardText(PEER, "clipboard", 0, 0);
+            h.api.getPrimaryClipDescription(PEER, "clipboard", 0, 0);
+        });
+        check(noted(h, h.peer) == before, "Metadata checks do not note clipboard reads");
+        h.as(h.peer, () -> h.api.getPrimaryClip(PEER, "clipboard", 0, 0));
+        var attributed = h.ops.getOpsForPackage(h.peer.uid(), PEER, new int[]{OP_READ_CLIPBOARD}).get(0).getOps().get(0).getAttributedOpEntries();
+        check(attributed.containsKey("clipboard") && noted(h, h.peer) >= before, "A data read notes the declared attribution"); h.ime(null);
     }
-
-    @FunctionalInterface
-    private interface ThrowingRunnable {
-        void run() throws Exception;
-    }
-
-    private static void requiresClipSourcePermission(ThrowingRunnable action) throws Exception {
-        boolean denied = false;
+    private static void sourceAndStorage(ClipboardFixture h) throws Exception {
+        h.as(h.privileged, () -> {
+            check(OWNER.equals(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0)), "Write source remains the authenticated package");
+            h.api.setPrimaryClipAsPackage(ClipData.newPlainText("source", "chosen source"), PRIVILEGED, null, 0, 0, PEER);
+            check(PEER.equals(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0)), "Authorized setAsPackage keeps its source separate from caller");
+        });
+        h.nativeState.changeAfterWrite = true; h.write("own write"); h.nativeState.changeAfterWrite = false;
+        h.as(h.privileged, () -> {
+            check("external-after-write".contentEquals(h.api.getPrimaryClip(PRIVILEGED, null, 0, 0).getItemAt(0).getText()),
+                    "An external write after native publication is observed");
+            check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null,
+                    "An external sequence never inherits the preceding Android writer's provenance");
+        });
+        h.nativeState.external("external", null);
+        h.as(h.privileged, () -> check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null, "Windows content retires Android source attribution"));
+        h.nativeState.external(null, new byte[]{'B', 'M', 0, 1});
+        File owned = (File)get(h.service, "mOwnedImage");
+        check(owned != null && owned.isFile(), "Native image cache belongs to this clipboard lifetime");
+        h.write("replace image"); check(!owned.exists(), "Replacing an image releases its cache file");
+        File image = File.createTempFile("clipboard-fixture-", ".png");
         try {
-            action.run();
-        } catch (SecurityException expected) {
-            denied = true;
+            java.nio.file.Files.write(image.toPath(), new byte[]{1, 2, 3});
+            h.asOwner(() -> h.api.setPrimaryClip(ClipData.newRawUri("provider",
+                    Uri.parse("content://fixture.provider" + image.getAbsolutePath())), OWNER, null, 0, 0));
+            check(h.nativeState.image == null, "Content-provider URI paths are not read as local files");
+        } finally { image.delete(); }
+        Listener listener = new Listener(); h.add(h.privileged, listener);
+        h.asOwner(() -> h.api.clearPrimaryClip(OWNER, null, 0, 0));
+        int calls = listener.calls.get();
+        check(calls == 1 && h.nativeState.text == null && h.nativeState.image == null, "Clear empties native formats and announces the transition");
+        h.asOwner(() -> h.api.clearPrimaryClip(OWNER, null, 0, 0));
+        check(listener.calls.get() == calls, "Empty-to-empty clear follows AOSP's no-notification behavior");
+        h.as(h.privileged, () -> check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null, "Clear retires source attribution"));
+        h.remove(h.privileged, listener);
+    }
+    @SuppressWarnings("unchecked") private static void callbackPolicyAndRetirement(ClipboardFixture h) throws Exception {
+        Listener owner = new Listener(), peer = new Listener(), privileged = new Listener();
+        h.nativeState.foreground = new long[]{PID, CREATED};
+        h.add(h.owner, owner); h.add(h.peer, peer); h.add(h.privileged, privileged);
+        h.write("callbacks");
+        check(owner.calls.get() == 1 && peer.calls.get() == 0 && privileged.calls.get() == 1,
+                "Saved listener identities, not ambient service authority, determine callbacks");
+        h.nativeState.foreground = null; h.write("lost focus");
+        check(owner.calls.get() == 1 && privileged.calls.get() == 2, "Focus is rechecked at dispatch");
+        h.nativeState.lockState = 1; h.write("locked change");
+        check(privileged.calls.get() == 3, "AOSP does not apply the getter lock gate to change callbacks");
+        h.nativeState.lockState = 0;
+        h.ops.setMode(OP_READ_CLIPBOARD, h.privileged.uid(), PRIVILEGED, MODE_IGNORED);
+        h.write("appops callback denial"); check(privileged.calls.get() == 3, "Callback rechecks effective AppOps");
+        h.ops.setMode(OP_READ_CLIPBOARD, h.privileged.uid(), PRIVILEGED, MODE_ALLOWED);
+        Map<String, ApkPackage> packages = new LinkedHashMap<>((Map<String, ApkPackage>)get(h.pm, "mPackages"));
+        ApkPackage replacement = pkg(PRIVILEGED, h.privileged.uid(), (byte)42, Manifest.permission.READ_CLIPBOARD_IN_BACKGROUND, Manifest.permission.SET_CLIP_SOURCE);
+        packages.put(PRIVILEGED, replacement); set(h.pm, "mPackages", packages);
+        call(h.pm, "packageInstalled", new Class<?>[]{ApkPackage.class, boolean.class, Object.class}, replacement, true, new Object());
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
+        while (h.listeners().getRegisteredCallbackCount() == 3 && System.nanoTime() < deadline) Thread.sleep(5);
+        check(h.listeners().getRegisteredCallbackCount() == 2 && privileged.token.deaths.isEmpty(), "Package replacement releases old-generation callback ownership");
+        h.write("replacement"); check(privileged.calls.get() == 3, "New package generation cannot revive a saved listener");
+        call(h.pm, "beginPackageRemoval", new Class<?>[]{ApkPackage.class}, h.owner);
+        call(h.pm, "revokePackageCapabilities", new Class<?>[]{String.class}, OWNER);
+        check(h.listeners().getRegisteredCallbackCount() == 1 && owner.token.deaths.isEmpty(), "Package removal revokes listener lifetime");
+        call(h.pm, "endPackageRemoval", new Class<?>[]{ApkPackage.class}, h.owner);
+        h.service.close();
+        check(h.listeners().getRegisteredCallbackCount() == 0 && peer.token.deaths.isEmpty()
+                && h.nativeState.listeners.isEmpty(), "Service close releases callback and native subscriptions");
+        check(((Collection<?>)get(h.pm, "mPackageChanges")).size() == 1,
+                "Closed clipboard releases its package-change subscription, leaving AppOps");
+    }
+    public static int run(boolean binder) throws Exception {
+        checks = 0;
+        try (ClipboardFixture h = new ClipboardFixture(binder)) {
+            h.nativeState.sequence = -1; h.nativeState.text = "wrapped sequence";
+            h.asOwner(() -> check("wrapped sequence".contentEquals(h.api.getPrimaryClip(OWNER, null, 0, 0).getItemAt(0).getText()),
+                    "All nonzero unsigned Windows sequence values are valid"));
+            h.nativeState.sequence = 1;
+            focusAndIdentity(h); imeAndPermissions(h); appOps(h); sourceAndStorage(h); callbackPolicyAndRetirement(h);
         }
-        check(denied, "Source attribution requires SET_CLIP_SOURCE independently of focus");
+        return checks;
     }
-
-    /** Test 1: Focused app can write and read primary clip. */
-    private static void testFocusedAppReadWrite(IClipboard service) throws Exception {
-        setFocusedUid(APP_UID);
-
-        runAs(APP_UID, APP_PID, () -> {
-            ClipData clip = ClipData.newPlainText("test_label", "Hello Focused World");
-            service.setPrimaryClip(clip, APP_PKG, null, 0, 0);
-
-            check(service.hasPrimaryClip(APP_PKG, null, 0, 0), "Focused app must see hasPrimaryClip == true");
-            check(service.hasClipboardText(APP_PKG, null, 0, 0), "Focused app must see hasClipboardText == true");
-
-            ClipData readClip = service.getPrimaryClip(APP_PKG, null, 0, 0);
-            check(readClip != null, "Focused app must be able to read primary clip");
-            check(readClip.getItemCount() > 0, "Read clip must have at least one item");
-            check("Hello Focused World".equals(readClip.getItemAt(0).getText().toString()),
-                    "Read clip content must match what was set");
-
-            ClipDescription desc = service.getPrimaryClipDescription(APP_PKG, null, 0, 0);
-            check(desc != null, "Focused app must be able to get clip description");
-
-            requiresClipSourcePermission(() -> service.getPrimaryClipSource(APP_PKG, null, 0, 0));
-            requiresClipSourcePermission(() -> service.setPrimaryClipAsPackage(
-                    clip, APP_PKG, null, 0, 0, BG_PKG));
-        });
-        runAs(SYSTEM_UID, SYSTEM_PID, () -> {
-            String source = service.getPrimaryClipSource(SYSTEM_PKG, null, 0, 0);
-            check(APP_PKG.equals(source), "A privileged source query identifies the actual setter");
-        });
-    }
-
-    /** Test 2: Background / unfocused app cannot read primary clip (null or false). */
-    private static void testBackgroundAppReadDenied(IClipboard service) throws Exception {
-        // Window focus is held by APP_UID, BG_UID is in background without focus
-        setFocusedUid(APP_UID);
-
-        runAs(BG_UID, BG_PID, () -> {
-            check(!service.hasPrimaryClip(BG_PKG, null, 0, 0),
-                    "Unfocused app must see hasPrimaryClip == false");
-            check(!service.hasClipboardText(BG_PKG, null, 0, 0),
-                    "Unfocused app must see hasClipboardText == false");
-            check(service.getPrimaryClip(BG_PKG, null, 0, 0) == null,
-                    "Unfocused app getPrimaryClip must return null");
-            check(service.getPrimaryClipDescription(BG_PKG, null, 0, 0) == null,
-                    "Unfocused app getPrimaryClipDescription must return null");
-            requiresClipSourcePermission(() -> service.getPrimaryClipSource(BG_PKG, null, 0, 0));
-
-            // However, background write is permitted per Android contract
-            ClipData bgClip = ClipData.newPlainText("bg_label", "Written from background");
-            service.setPrimaryClip(bgClip, BG_PKG, null, 0, 0);
-        });
-
-        // Verify the background write actually updated the clipboard by reading from focused app
-        runAs(APP_UID, APP_PID, () -> {
-            ClipData readClip = service.getPrimaryClip(APP_PKG, null, 0, 0);
-            check(readClip != null && "Written from background".equals(readClip.getItemAt(0).getText().toString()),
-                    "Background write must succeed and be visible to focused app");
-        });
-    }
-
-    /** Test 3: System UID can read clipboard even when unfocused. */
-    private static void testSystemUidAccess(IClipboard service) throws Exception {
-        // Set focus to a non-system UID
-        setFocusedUid(APP_UID);
-
-        runAs(SYSTEM_UID, SYSTEM_PID, () -> {
-            check(service.hasPrimaryClip(SYSTEM_PKG, null, 0, 0),
-                    "System UID must have access regardless of window focus");
-            ClipData clip = service.getPrimaryClip(SYSTEM_PKG, null, 0, 0);
-            check(clip != null, "System UID getPrimaryClip must not return null");
-        });
-    }
-
-    /** Test 4: Default IME can read clipboard even without window focus. */
-    private static void testDefaultImeAccess(IClipboard service) throws Exception {
-        // App is focused, not IME
-        setFocusedUid(APP_UID);
-        setDefaultIme(IME_UID, IME_PKG);
-
-        runAs(IME_UID, IME_PID, () -> {
-            check(service.hasPrimaryClip(IME_PKG, null, 0, 0),
-                    "Default IME must see hasPrimaryClip == true even without focus");
-            check(service.hasClipboardText(IME_PKG, null, 0, 0),
-                    "Default IME must see hasClipboardText == true even without focus");
-            ClipData clip = service.getPrimaryClip(IME_PKG, null, 0, 0);
-            check(clip != null, "Default IME must be able to read primary clip without window focus");
-            check(service.getPrimaryClipDescription(IME_PKG, null, 0, 0) != null,
-                    "Default IME must be able to read clip description without window focus");
-        });
-    }
-
-    /** Test 5: OnPrimaryClipChangedListener only dispatches to callers with focus (or IME/system). */
-    private static void testListenerFocusFiltering(IClipboard service) throws Exception {
-        setFocusedUid(APP_UID);
-        setDefaultIme(IME_UID, IME_PKG);
-
-        TestListener appListener = new TestListener();
-        TestListener bgListener = new TestListener();
-        TestListener imeListener = new TestListener();
-        TestListener systemListener = new TestListener();
-
-        // Register each listener with its respective identity
-        runAs(APP_UID, APP_PID, () -> service.addPrimaryClipChangedListener(appListener, APP_PKG, null, 0, 0));
-        runAs(BG_UID, BG_PID, () -> service.addPrimaryClipChangedListener(bgListener, BG_PKG, null, 0, 0));
-        runAs(IME_UID, IME_PID, () -> service.addPrimaryClipChangedListener(imeListener, IME_PKG, null, 0, 0));
-        runAs(SYSTEM_UID, SYSTEM_PID, () -> service.addPrimaryClipChangedListener(systemListener, SYSTEM_PKG, null, 0, 0));
-
-        // Clip change while APP_UID is focused
-        runAs(APP_UID, APP_PID, () -> {
-            service.setPrimaryClip(ClipData.newPlainText("l1", "Change 1"), APP_PKG, null, 0, 0);
-        });
-
-        // App (focused), IME, and System should be notified; BG (unfocused) must NOT be notified
-        check(appListener.calls.get() == 1, "Focused app listener must receive clip change notification");
-        check(imeListener.calls.get() == 1, "Default IME listener must receive clip change notification");
-        check(systemListener.calls.get() == 1, "System listener must receive clip change notification");
-        check(bgListener.calls.get() == 0, "Unfocused background listener must NOT receive notification");
-
-        // Now shift focus to BG_UID and trigger a clip change
-        setFocusedUid(BG_UID);
-        runAs(BG_UID, BG_PID, () -> {
-            service.setPrimaryClip(ClipData.newPlainText("l2", "Change 2"), BG_PKG, null, 0, 0);
-        });
-
-        // Now BG_UID was focused so its calls should increment to 1.
-        // APP_UID is now unfocused so its calls should stay at 1.
-        // IME and System should increment to 2.
-        check(bgListener.calls.get() == 1, "Newly focused listener must receive clip change notification");
-        check(appListener.calls.get() == 1, "Previously focused app listener must NOT receive notification now that it is unfocused");
-        check(imeListener.calls.get() == 2, "Default IME listener must receive notification across focus changes");
-        check(systemListener.calls.get() == 2, "System listener must receive notification across focus changes");
-
-        // Cleanup
-        service.removePrimaryClipChangedListener(appListener, APP_PKG, null, 0, 0);
-        service.removePrimaryClipChangedListener(bgListener, BG_PKG, null, 0, 0);
-        service.removePrimaryClipChangedListener(imeListener, IME_PKG, null, 0, 0);
-        service.removePrimaryClipChangedListener(systemListener, SYSTEM_PKG, null, 0, 0);
-    }
-
-    /** Test 6: Package validation throws SecurityException for null package when not system. */
-    private static void testNullPackageSecurityException(IClipboard service) throws Exception {
-        runAs(APP_UID, APP_PID, () -> {
-            boolean thrown = false;
-            try {
-                service.getPrimaryClip(null, null, 0, 0);
-            } catch (SecurityException expected) {
-                thrown = true;
-            }
-            check(thrown, "Non-system caller with null package must throw SecurityException");
-        });
-    }
-
-    /** An empty clipboard has no source, including after a previously nonempty clip. */
-    private static void testEmptyClipboardHasNoSource(IClipboard service) throws Exception {
-        runAs(SYSTEM_UID, SYSTEM_PID, () -> {
-            service.setPrimaryClip(ClipData.newPlainText("source", "temporary clip"),
-                    SYSTEM_PKG, null, 0, 0);
-            check(SYSTEM_PKG.equals(service.getPrimaryClipSource(SYSTEM_PKG, null, 0, 0)),
-                    "A nonempty clip retains its source");
-            service.clearPrimaryClip(SYSTEM_PKG, null, 0, 0);
-            check(!service.hasPrimaryClip(SYSTEM_PKG, null, 0, 0),
-                    "Clear removes the primary clip");
-            check(service.getPrimaryClipSource(SYSTEM_PKG, null, 0, 0) == null,
-                    "Clearing a clip also clears its source");
-            check(newService().getPrimaryClipSource(SYSTEM_PKG, null, 0, 0) == null,
-                    "A fresh clipboard has no source");
-        });
-    }
-
     public static void main(String[] args) throws Exception {
         System.loadLibrary("android_runtime");
-        // Disable WindowsHost to avoid external Windows clipboard interference
-        Class<?> host = Class.forName("com.gesher.server.WindowsHost");
-        java.lang.reflect.Field available = host.getDeclaredField("sAvailable");
-        available.setAccessible(true);
-        Object prevAvailable = available.get(null);
-        available.set(null, false);
-
-        try {
-            resetOverrides();
-            IClipboard service = newService();
-
-            testFocusedAppReadWrite(service);
-            testBackgroundAppReadDenied(service);
-            testSystemUidAccess(service);
-            testDefaultImeAccess(service);
-            testListenerFocusFiltering(service);
-            testNullPackageSecurityException(service);
-            testEmptyClipboardHasNoSource(service);
-
-            System.out.println("ClipboardSecurityContractTest all passed: " + checks + " checks");
-        } finally {
-            resetOverrides();
-            available.set(null, prevAvailable);
-        }
+        System.out.println("ClipboardSecurityContractTest all passed: " + run(true) + " production policy checks");
     }
 }

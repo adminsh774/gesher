@@ -438,8 +438,51 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         mAm = am;
     }
 
+    /** Snapshot actual process/activity state without nesting a service-controller monitor. */
+    synchronized java.util.Map<Integer, AppOpsService.UidState> appOpsUidStates() {
+        java.util.Map<Integer, AppOpsService.UidState> result = new java.util.HashMap<>();
+        for (ProcessRecord app : mProcesses) {
+            if (app.dead || app.exiting || app.pidSuperseded || !app.ready
+                    || app.packageCode == null || mPm.get(app.packageName) != app.packageCode
+                    || mPm.isRemovalPending(app.packageName)) continue;
+            int state = android.app.AppOpsManager.UID_STATE_CACHED;
+            int capabilities = 0;
+            for (ActivityRecord activity : app.activities) {
+                if (activity.finishing || mHiddenTasks.contains(activity.taskId)) continue;
+                if (activity.state == State.RESUMED || activity.state == State.RESUMING) {
+                    state = android.app.AppOpsManager.UID_STATE_TOP;
+                    capabilities = android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_LOCATION
+                            | android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_CAMERA
+                            | android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_MICROPHONE
+                            | android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL;
+                    break;
+                }
+                if (activity.state == State.STARTED || activity.state == State.PAUSING
+                        || activity.state == State.PAUSED) state = android.app.AppOpsManager.UID_STATE_FOREGROUND;
+            }
+            AppOpsService.UidState previous = result.get(app.packageCode.uid());
+            if (previous != null) {
+                state = Math.min(state, previous.state()); capabilities |= previous.capabilities();
+            }
+            result.put(app.packageCode.uid(), new AppOpsService.UidState(state, capabilities));
+        }
+        return result;
+    }
+
     UriGrants uriGrants() {
         return mAm != null ? mAm.uriGrants() : null;
+    }
+
+    /** Resolves a native foreground observation to a current, authenticated application. */
+    synchronized boolean ownsForegroundProcess(int uid, long[] foreground) {
+        if (foreground == null || foreground.length != 2 || foreground[0] <= 0
+                || foreground[0] > Integer.MAX_VALUE || foreground[1] <= 0) return false;
+        ProcessRecord app = attachedProcessByPid((int) foreground[0]);
+        return app != null && app.ready && !app.dead && !app.exiting && !app.pidSuperseded
+                && app.uid == uid && app.nativeStartTime == foreground[1]
+                && app.packageCode != null && app.packageCode.uid() == uid
+                && mPm.get(app.packageName) == app.packageCode
+                && !mPm.isRemovalPending(app.packageName);
     }
 
     void setAccountManager(AccountManagerService accounts) { mAccounts = accounts; }
@@ -2004,6 +2047,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
      * Guarded by this.
      */
     private void updateIdle() {
+        if (mAm != null) mPm.appOps().requestUidStateRefresh();
         if (hasActivityLocked()) {
             mIdleSince = 0;
         } else if (mIdleSince == 0) {
@@ -2205,6 +2249,97 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         if (stop.isEmpty()) return;
         SystemServer.log("force-stopping " + packageName);
         endProcesses(stop, 5000);
+    }
+
+    /**
+     * Android's permission-revocation killUid: retire the affected process generations,
+     * retaining normal activity/service recovery. A force-stop would incorrectly cancel
+     * unrelated work and prevent that recovery. Never signal a PID reopened by number.
+     */
+    void killUidForPermissionChange(ApkPackage expected,
+            java.util.function.BooleanSupplier stillRevoked) {
+        List<ProcessRecord> processes = new ArrayList<>();
+        synchronized (this) {
+            if (mPm.get(expected.packageName) != expected || mPm.isRemovalPending(expected.packageName)
+                    || !stillRevoked.getAsBoolean()) return;
+            for (ProcessRecord app : mProcesses) {
+                if (app.uid == expected.uid() && !app.dead && !app.exiting && !app.pidSuperseded
+                        && app.pid != android.os.Process.myPid()) processes.add(app);
+            }
+            for (Map.Entry<Long, PendingProcess> entry : new ArrayList<>(mStarting.entrySet())) {
+                PendingProcess pending = entry.getValue();
+                if (pending.owner == null || pending.owner.uid() != expected.uid()) continue;
+                pending.cancelled = true;
+                mStarting.remove(entry.getKey());
+                mExitStatus.unavailable(pending.exitGeneration);
+                if (pending.pid > 0) Zygote.killChild(pending.pid, pending.nativeStartTime);
+                for (PendingWork work : mPendingWork) {
+                    if (work.launchGeneration == pending.exitGeneration) work.launchGeneration = null;
+                }
+                for (ActivityRecord activity : mActivities) {
+                    if (activity.app == null && activity.launchGeneration == pending.exitGeneration) {
+                        activity.launchGeneration = null;
+                    }
+                }
+            }
+            notifyAll();
+        }
+        for (ProcessRecord app : processes) {
+            boolean terminated;
+            synchronized (this) {
+                if (mPm.get(expected.packageName) != expected || mPm.isRemovalPending(expected.packageName)) return;
+                if (!stillRevoked.getAsBoolean()) break;
+                if (!mProcesses.contains(app) || app.dead || app.exiting || app.pidSuperseded
+                        || attachedProcessByPid(app.pid) != app) continue;
+                app.reaped = true;
+                app.recoverAfterPidSupersession = false;
+                app.exiting = true;
+                for (ActivityRecord activity : new ArrayList<>(app.activities)) {
+                    if (activity.state == State.INITIALIZING && !activity.finishing
+                            && activityEnabled(activity)) {
+                        app.activities.remove(activity);
+                        activity.app = null;
+                        activity.launchGeneration = null;
+                    }
+                }
+                terminated = app.spawned && Zygote.killChild(app.pid, app.nativeStartTime);
+            }
+            try { processDied(app); }
+            finally {
+                if (!terminated) {
+                    try { app.thread.scheduleExit(); }
+                    catch (RemoteException ignored) { }
+                }
+            }
+        }
+        // A launch retired before attachment has no processDied callback to restart
+        // its waiters. Preserve those requests and admit a new generation normally.
+        record Restart(ApkPackage owner, String processName) { }
+        Map<String, Restart> restart = new java.util.LinkedHashMap<>();
+        synchronized (this) {
+            if (mPm.get(expected.packageName) != expected || mPm.isRemovalPending(expected.packageName)) return;
+            for (PendingWork work : mPendingWork) {
+                if (work.owner != null && work.owner.uid() == expected.uid() && work.current(mPm)) {
+                    restart.put(processKey(work.packageName, work.processName),
+                            new Restart(work.owner, work.processName));
+                }
+            }
+            for (ActivityRecord activity : mActivities) {
+                if (activity.targetCode != null && activity.targetCode.uid() == expected.uid()
+                        && activity.app == null && activity.state == State.INITIALIZING
+                        && !activity.finishing && activityEnabled(activity)) {
+                    String name = activity.targetCode.packageName;
+                    String process = componentProcess(name, activity.info.processName);
+                    restart.put(processKey(name, process), new Restart(activity.targetCode, process));
+                }
+            }
+        }
+        for (Restart pending : restart.values()) {
+            if (mPm.get(pending.owner.packageName) == pending.owner
+                    && !mPm.isRemovalPending(pending.owner.packageName)) {
+                startProcess(pending.owner.packageName, pending.processName, "permission change");
+            }
+        }
     }
 
     /** Restart existing processes after an enabled-state change, without force-stop state. */
@@ -2439,6 +2574,12 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
      */
     void attachApplication(IApplicationThread thread, int pid, long startSeq) {
         ProcessRecord app = new ProcessRecord(pid, thread);
+        if (startSeq <= 0) {
+            // Legacy self-attached applications still need a native process generation
+            // before they can own input focus. Unknown identity never grants focus.
+            try { app.nativeStartTime = Zygote.startTime(pid); }
+            catch (UnsatisfiedLinkError unavailable) { app.nativeStartTime = 0; }
+        }
         boolean bind = false;
         synchronized (this) {
             PendingProcess started = startSeq > 0 ? mStarting.get(startSeq) : null;
@@ -2461,8 +2602,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                 if (expected == null || started.owner != expected || mPm.isRemovalPending(started.packageName)) {
                     throw new SecurityException("App process belongs to a retired package");
                 }
-                if (GmsSignatureSpoofing.isEnabled()
-                        && (expected == null || expected.uid() != app.uid)) {
+                if (expected.uid() != app.uid) {
                     throw new SecurityException("App Binder UID does not match its package");
                 }
                 mStarting.remove(startSeq);
@@ -3174,6 +3314,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
      * resumed (multi-resume).
      */
     private void updateTopResumed() {
+        if (mAm != null) mPm.appOps().requestUidStateRefresh();
         ActivityRecord lose = null;
         ActivityRecord gain = null;
         int displayRotation;
@@ -3191,15 +3332,6 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                 mTopResumed.topSent = false;
             }
             mTopResumed = want;
-            if (want != null) {
-                int uid = want.app != null ? want.app.uid
-                        : (want.info != null && want.info.applicationInfo != null ? want.info.applicationInfo.uid
-                        : (mPm != null && want.info != null ? mPm.getPackageUid(want.info.packageName, 0, 0) : -1));
-                String pkg = want.info != null ? want.info.packageName : null;
-                WindowManagerService.setFocusedApp(uid, pkg);
-            } else {
-                WindowManagerService.clearFocusedApp();
-            }
             if (want != null && !want.topSent && want.state == State.RESUMED) {
                 want.topSent = true;
                 gain = want;
@@ -3216,41 +3348,6 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             t.addTransactionItem(new TopResumedActivityChangeItem(gain.token, true));
             schedule(gain, t, "TopResumedActivityChangeItem (the top resumed activity)");
         }
-    }
-
-    @Override
-    public void setFocusedTask(int taskId) {
-        synchronized (this) {
-            focusTaskLocked(taskId);
-        }
-        updateTopResumed();
-    }
-
-    @Override
-    public void setFocusedRootTask(int taskId) {
-        setFocusedTask(taskId);
-    }
-
-    public synchronized int getFocusedUid() {
-        if (mTopResumed == null) return -1;
-        if (mTopResumed.app != null) return mTopResumed.app.uid;
-        if (mTopResumed.info != null && mTopResumed.info.applicationInfo != null) {
-            return mTopResumed.info.applicationInfo.uid;
-        }
-        if (mPm != null && mTopResumed.info != null) {
-            try {
-                return mPm.getPackageUid(mTopResumed.info.packageName, 0, 0);
-            } catch (Exception ignored) {}
-        }
-        return -1;
-    }
-
-    public synchronized String getFocusedPackage() {
-        return mTopResumed != null && mTopResumed.info != null ? mTopResumed.info.packageName : null;
-    }
-
-    public boolean isUidFocused(int uid) {
-        return uid >= 0 && uid == getFocusedUid();
     }
 
     /**

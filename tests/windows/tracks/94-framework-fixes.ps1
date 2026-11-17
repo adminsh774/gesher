@@ -310,6 +310,23 @@ Check 'services: URI delegation, provider patterns, exact identities and scoped 
   $uriGrantsOut
 } @('UriGrantContractTest all passed: 138 checks; binder=true')
 
+$appOpsOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'AppOpsContractTest') 90
+$appOpsCode = $LASTEXITCODE
+Check 'services: AppOps defaults, authority, attributed delivery, foreground lifecycle and signed persistence' {
+  $global:LASTEXITCODE = $appOpsCode
+  $appOpsOut
+} @('AppOpsContractTest all passed: 71 checks; binder=true')
+
+$uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'PackageUidIsolationContractTest' +
+  (NoDrive (Join-Path $PSScriptRoot '../../dex-services/fixtures/v2only.apk'))) 90
+$uidIsolationCode = $LASTEXITCODE
+Check 'services: per-package identity, distinct UID allocation, sharedUserId and isolation' {
+  $global:LASTEXITCODE = $uidIsolationCode
+  $uidIsolationOut
+} @('PackageUidIsolationContractTest passed:')
+
 $intentUriGrantsOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'IntentUriGrantContractTest') 90
 $intentUriGrantsCode = $LASTEXITCODE
