@@ -852,10 +852,411 @@ public final class ExactAlarmContractTest {
         } finally { set(h.pm, "mExactAlarmAccessRequests", previous); }
     }
 
+    @FunctionalInterface
+    private interface WindowAction { int edit() throws Exception; }
+
+    /** Controls only executor/window boundaries; admission, lifetime and callbacks stay real. */
+    private static final class SettingsWindow implements AutoCloseable {
+        final TestHarness h;
+        final Object previousAtm, previousPm, requests;
+        final List<Runnable> queued = new ArrayList<>();
+        SettingsWindow(TestHarness h, java.util.concurrent.Executor executor, WindowAction action) throws Exception {
+            this.h = h;
+            Class<?> dialogType = type("ExactAlarmAccessRequests$Dialog");
+            Object dialog = java.lang.reflect.Proxy.newProxyInstance(dialogType.getClassLoader(),
+                    new Class<?>[]{dialogType}, (proxy, method, args) -> action.edit());
+            requests = make(type("ExactAlarmAccessRequests"), new Class<?>[]{type("PackageManagerService"),
+                    java.util.concurrent.Executor.class, dialogType}, h.pm,
+                    executor == null ? (java.util.concurrent.Executor)queued::add : executor, dialog);
+            previousAtm = get(h.atm, "mExactAlarmRequests");
+            previousPm = get(h.pm, "mExactAlarmAccessRequests");
+            set(h.atm, "mExactAlarmRequests", requests); set(h.pm, "mExactAlarmAccessRequests", requests);
+        }
+        int start(Object source, String target) throws Exception {
+            int[] result = {-1};
+            runAs(EXACT_UID, EXACT_PID, () -> result[0] = ((android.app.IActivityTaskManager)h.atm)
+                    .startActivity(h.thread, EXACT_PKG, null,
+                        new Intent("android.settings.REQUEST_SCHEDULE_EXACT_ALARM",
+                            android.net.Uri.fromParts("package", target, null))
+                            .addFlags(source == null ? Intent.FLAG_ACTIVITY_NEW_TASK : 0),
+                        null, source == null ? null : (IBinder)get(source, "token"), "lifetime",
+                        source == null ? -1 : 81, 0, null, null));
+            return result[0];
+        }
+        int pending() throws Exception { return ((Set<?>)get(h.atm, "mExactAlarmSettingsSessions")).size(); }
+        int slots() throws Exception { return ((java.util.concurrent.Semaphore)get(requests, "mSlots")).availablePermits(); }
+        void finish() { queued.remove(0).run(); }
+        @Override public void close() throws Exception {
+            set(h.atm, "mExactAlarmRequests", previousAtm); set(h.pm, "mExactAlarmAccessRequests", previousPm);
+        }
+    }
+
+    private static Object exactProcess(TestHarness h) throws Exception {
+        for (Object process : (List<?>)get(h.atm, "mProcesses")) {
+            if (EXACT_PKG.equals(get(process, "packageName"))) return process;
+        }
+        throw new AssertionError("Missing exact-alarm fixture process");
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Object settingsRecord(TestHarness h, String name, int task, String initialState) throws Exception {
+        Class<?> record = type("ActivityTaskManagerService$ActivityRecord");
+        var info = ((android.content.pm.IPackageManager)h.pm).getActivityInfo(
+                new android.content.ComponentName(name, name + ".FixtureActivity"), 0, 0);
+        Object process = null;
+        for (Object candidate : (List<?>)get(h.atm, "mProcesses")) {
+            if (name.equals(get(candidate, "packageName"))) process = candidate;
+        }
+        Object result = make(record, new Class<?>[]{type("ActivityTaskManagerService"),
+                android.content.pm.ActivityInfo.class, Intent.class, int.class, int.class, String.class,
+                record, String.class, int.class}, h.atm, info, new Intent(), task,
+                name.equals(EXACT_PKG) ? EXACT_PID : UNPRIV_PID, name, null, null, -1);
+        set(result, "app", process);
+        set(result, "state", Enum.valueOf((Class)type("ActivityTaskManagerService$State"), initialState));
+        ((List<Object>)get(process, "activities")).add(result);
+        ((List<Object>)get(h.atm, "mActivities")).add(result);
+        List<Integer> tasks = (List<Integer>)get(h.atm, "mTaskOrder");
+        if (!tasks.contains(task)) tasks.add(task);
+        return result;
+    }
+
+    private static String settingsState(Object record) throws Exception { return get(record, "state").toString(); }
+
+    private static List<String> acknowledgeSettings(TestHarness h) throws Exception {
+        List<String> events = new java.util.concurrent.CopyOnWriteArrayList<>();
+        Class<?> record = type("ActivityTaskManagerService$ActivityRecord");
+        h.thread.onTransaction = transaction -> {
+            try {
+                for (var item : transaction.getTransactionItems()) {
+                    String kind = item.getClass().getSimpleName(); events.add(kind);
+                    Object target = item instanceof android.app.servertransaction.ActivityTransactionItem activity
+                            ? invoke(h.atm, "forToken", new Class<?>[]{IBinder.class}, activity.getActivityToken()) : null;
+                    if (kind.equals("PauseActivityItem")) invoke(h.atm, "activityPaused", new Class<?>[]{record}, target);
+                    if (kind.equals("StopActivityItem")) invoke(h.atm, "activityStopped",
+                            new Class<?>[]{record, Bundle.class}, target, new Bundle());
+                    if (kind.equals("ResumeActivityItem")) invoke(h.atm, "activityResumed", new Class<?>[]{record}, target);
+                }
+            } catch (Exception failure) { throw new AssertionError(failure); }
+        };
+        return events;
+    }
+
+    private static void settingsSessionLifetime(boolean wire) throws Exception {
+        for (String mode : List.of("close", "runtime", "linkage", "worker-error", "reject", "start-error", "ineligible",
+                "queued-caller-death", "open-caller-death")) {
+            try (TestHarness h = new TestHarness(wire)) {
+                set(h.atm, "mIdleSince", 1L);
+                int[] opened = {0};
+                java.util.concurrent.Executor executor = switch (mode) {
+                    case "reject" -> task -> { throw new java.util.concurrent.RejectedExecutionException("fixture rejection"); };
+                    case "start-error" -> task -> { throw new AssertionError("fixture worker start failure"); };
+                    case "queued-caller-death" -> null;
+                    default -> Runnable::run;
+                };
+                try (SettingsWindow window = new SettingsWindow(h, executor, () -> {
+                    opened[0]++;
+                    check((long)get(h.atm, "mIdleSince") == 0 && (long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                            "Real Settings window owns device use without an ActivityRecord: " + mode);
+                    if (mode.equals("runtime")) throw new IllegalStateException("fixture native open failure");
+                    if (mode.equals("linkage")) throw new UnsatisfiedLinkError("fixture native linkage failure");
+                    if (mode.equals("worker-error")) throw new AssertionError("fixture worker failure");
+                    if (mode.equals("open-caller-death")) {
+                        invoke(h.atm, "processDied", new Class<?>[]{type("ActivityTaskManagerService$ProcessRecord")}, exactProcess(h));
+                        check((long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                                "Caller death does not retire the system-owned open Settings window");
+                    }
+                    return -1;
+                })) {
+                    long admittedAfter = android.os.SystemClock.uptimeMillis();
+                    if (mode.equals("reject")) rejects(java.util.concurrent.RejectedExecutionException.class,
+                            "fixture rejection", () -> window.start(null, EXACT_PKG));
+                    else if (mode.equals("start-error") || mode.equals("worker-error")) {
+                        rejects(AssertionError.class, "fixture", () -> window.start(null, EXACT_PKG));
+                    } else check(window.start(null, mode.equals("ineligible") ? "fixture.missing" : EXACT_PKG)
+                            == ActivityManager.START_SUCCESS, "Settings admission result: " + mode);
+                    if (mode.equals("queued-caller-death")) {
+                        check(window.pending() == 1 && opened[0] == 0 && (long)get(h.atm, "mIdleSince") == 0,
+                                "Queued Settings admission clears the old idle interval before any poll");
+                        invoke(h.atm, "processDied", new Class<?>[]{type("ActivityTaskManagerService$ProcessRecord")}, exactProcess(h));
+                        check(window.pending() == 1 && (long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                                "Caller retirement preserves an admitted system Settings request");
+                        window.finish();
+                    }
+                    check(window.pending() == 0 && window.slots() == 16,
+                            "Completion/failure releases exactly one reservation and one admission slot: " + mode);
+                    check((long)get(h.atm, "mIdleSince") >= admittedAfter,
+                            "Final Settings completion starts a fresh idle interval without needing a poll: " + mode);
+                    check(opened[0] == (mode.equals("reject") || mode.equals("start-error") || mode.equals("ineligible") ? 0 : 1),
+                            "Only accepted eligible work reaches the actual window boundary: " + mode);
+                }
+            }
+        }
+        try (TestHarness h = new TestHarness(wire); SettingsWindow window = new SettingsWindow(h, null, () -> -1)) {
+            set(h.atm, "mIdleSince", 1L);
+            for (int i = 0; i < 16; i++) check(window.start(null, EXACT_PKG) == ActivityManager.START_SUCCESS,
+                    "Bounded real Settings coordinator admits available slot");
+            check(window.start(null, EXACT_PKG) == ActivityManager.START_CANCELED && window.pending() == 16
+                    && window.queued.size() == 16 && window.slots() == 0,
+                    "Exhausted Settings admission rejects without allocating a session or worker");
+            for (int left = 15; left >= 0; left--) {
+                window.finish();
+                check(window.pending() == left && window.slots() == 16 - left,
+                        "Each accepted session releases only its own bounded slot");
+                check(((long)get(h.atm, "mIdleSince") == 0) == (left > 0),
+                        "Remaining Settings work retains busy ownership until the last completion");
+            }
+        }
+    }
+
+    private static void settingsTaskCoverage(boolean wire) throws Exception {
+        Class<?> record = type("ActivityTaskManagerService$ActivityRecord");
+        try (TestHarness h = new TestHarness(wire)) {
+            Object lower = settingsRecord(h, EXACT_PKG, 1, "STOPPED");
+            Object top = settingsRecord(h, EXACT_PKG, 1, "RESUMED"); set(top, "translucent", true);
+            Object other = settingsRecord(h, UNPRIV_PKG, 2, "RESUMING");
+            List<String> events = acknowledgeSettings(h);
+            check(((List<?>)invoke(h.atm, "starting", new Class<?>[0])).contains(lower),
+                    "Positive control: stopped activity beneath a translucent top normally needs Start");
+            invoke(h.atm, "makeVisible", new Class<?>[]{record}, lower);
+            invoke(h.atm, "pause", new Class<?>[]{record, boolean.class}, lower, false);
+            check(settingsState(lower).equals("PAUSED"),
+                    "Positive control: translucent task top leaves its started parent visible and paused");
+            events.clear();
+            try (SettingsWindow window = new SettingsWindow(h, null, () -> {
+                check(settingsState(top).equals("STOPPED") && settingsState(lower).equals("STOPPED"),
+                        "Opaque Settings covers both its top and the visible activity beneath it");
+                invoke(h.atm, "activityResumed", new Class<?>[]{record}, other);
+                invoke(h.atm, "makeVisible", new Class<?>[]{record}, lower);
+                check(settingsState(top).equals("STOPPED") && settingsState(lower).equals("STOPPED")
+                        && !events.contains("StartActivityItem"),
+                        "Unrelated resume and a stale make-visible candidate cannot restart a covered activity");
+                return -1;
+            })) {
+                check(window.start(top, EXACT_PKG) == ActivityManager.START_SUCCESS, "Opaque Settings admitted over translucent task top");
+                check(!(boolean)invoke(h.atm, "willBeVisible", new Class<?>[]{record}, top)
+                        && !(boolean)invoke(h.atm, "willBeVisible", new Class<?>[]{record}, lower),
+                        "Visibility queries include the complete Settings-covered task");
+                window.finish();
+                check(settingsState(top).equals("RESUMED") && settingsState(lower).equals("STARTED")
+                        && settingsState(other).equals("RESUMED"),
+                        "Closing Settings resumes its current top, starts its visible parent and preserves multi-resume");
+                check(Collections.frequency(events, "StartActivityItem") == 1,
+                        "Only the newly visible translucent parent receives one Start callback");
+            }
+        }
+        for (boolean detachedSecond : new boolean[]{false, true}) try (TestHarness h = new TestHarness(wire)) {
+            Object source = settingsRecord(h, EXACT_PKG, 1, "RESUMED");
+            List<String> events = acknowledgeSettings(h);
+            try (SettingsWindow window = new SettingsWindow(h, null, () -> -1)) {
+                check(window.start(source, EXACT_PKG) == ActivityManager.START_SUCCESS
+                        && window.start(detachedSecond ? null : source, EXACT_PKG) == ActivityManager.START_SUCCESS,
+                        "Two accepted Settings requests own independent coverage of one task");
+                window.finish();
+                check(settingsState(source).equals("STOPPED") && !events.contains("ResumeActivityItem")
+                        && !(boolean)invoke(h.atm, "willBeVisible", new Class<?>[]{record}, source),
+                        "First completion cannot resume or reveal a task still covered by another Settings session");
+                window.finish();
+                check(settingsState(source).equals("RESUMED") && Collections.frequency(events, "ResumeActivityItem") == 1,
+                        "Last completion restores the task exactly once");
+            }
+        }
+        try (TestHarness h = new TestHarness(wire)) {
+            Object source = settingsRecord(h, EXACT_PKG, 1, "RESUMED");
+            List<String> events = acknowledgeSettings(h);
+            try (SettingsWindow window = new SettingsWindow(h, null, () -> {
+                set(source, "savedState", null);
+                invoke(h.atm, "processDied", new Class<?>[]{type("ActivityTaskManagerService$ProcessRecord")}, exactProcess(h));
+                check(((List<?>)get(h.atm, "mActivities")).isEmpty()
+                        && (long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                        "Retiring the last covered activity cannot release an open system Settings window");
+                return -1;
+            })) {
+                check(window.start(source, EXACT_PKG) == ActivityManager.START_SUCCESS, "Activity-owned result request admitted");
+                window.finish();
+                check(window.pending() == 0 && !events.contains("ActivityResultItem") && !events.contains("ResumeActivityItem")
+                        && (long)invoke(h.atm, "idleSince", new Class<?>[0]) != 0,
+                        "Final completion after caller retirement releases ownership without reviving a stale recipient");
+            }
+        }
+        try (TestHarness h = new TestHarness(wire)) {
+            Object source = settingsRecord(h, EXACT_PKG, 1, "RESUMED");
+            h.thread.onTransaction = transaction -> { }; // Withhold just this client's pause acknowledgment.
+            try (SettingsWindow window = new SettingsWindow(h, Runnable::run, () -> {
+                check(settingsState(source).equals("PAUSING"),
+                        "Settings may open after Android's bounded missing-pause-acknowledgment wait");
+                return -1;
+            })) {
+                check(window.start(source, EXACT_PKG) == ActivityManager.START_SUCCESS
+                        && window.pending() == 0 && settingsState(source).equals("PAUSING"),
+                        "Completion before pause acknowledgment releases its session but defers resume");
+                List<String> events = acknowledgeSettings(h);
+                invoke(h.atm, "activityPaused", new Class<?>[]{record}, source);
+                check(settingsState(source).equals("RESUMED") && Collections.frequency(events, "ResumeActivityItem") == 1,
+                        "Late pause acknowledgment restores an uncovered source exactly once");
+            }
+        }
+    }
+
+    private static void settingsWithChooser(boolean wire) throws Exception {
+        for (String mode : List.of("chooser-first", "settings-first", "headless-settings-first", "headless-chooser-first",
+                "detached-settings", "detached-chooser", "retirement")) {
+            try (TestHarness h = new TestHarness(wire)) {
+                boolean headless = mode.startsWith("headless");
+                Object source = headless ? null : settingsRecord(h, EXACT_PKG, 1, "RESUMED");
+                List<String> events = acknowledgeSettings(h);
+                java.util.concurrent.CountDownLatch shown = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.CountDownLatch close = new java.util.concurrent.CountDownLatch(1);
+                Class<?> dialogType = type("IntentChooser$Dialog");
+                Object previous = get(h.atm, "mIntentChooserDialog");
+                Object chooser = java.lang.reflect.Proxy.newProxyInstance(dialogType.getClassLoader(), new Class<?>[]{dialogType},
+                        (proxy, method, args) -> {
+                            if (method.getName().equals("available")) return true;
+                            shown.countDown();
+                            if (!close.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("Chooser fixture not released");
+                            return -1;
+                        });
+                set(h.atm, "mIntentChooserDialog", chooser);
+                try (SettingsWindow window = new SettingsWindow(h, null, () -> {
+                    check((long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                            "Settings remains busy while overlapping a chooser: " + mode);
+                    return -1;
+                })) {
+                    boolean chooserFirst = mode.equals("chooser-first") || mode.equals("retirement") || mode.equals("detached-settings");
+                    if (!chooserFirst) check(window.start(source, EXACT_PKG) == ActivityManager.START_SUCCESS, "Settings accepted before chooser");
+                    runAs(EXACT_UID, EXACT_PID, () -> {
+                        Intent request = Intent.createChooser(new Intent().setComponent(new android.content.ComponentName(
+                                EXACT_PKG, EXACT_PKG + ".FixtureActivity")), "Lifetime fixture")
+                                .putExtra(Intent.EXTRA_AUTO_LAUNCH_SINGLE_CHOICE, false);
+                        boolean detached = headless || mode.equals("detached-chooser");
+                        if (detached) request.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        check(((android.app.IActivityTaskManager)h.atm).startActivity(h.thread, EXACT_PKG, null,
+                                request, null, detached ? null : (IBinder)get(source, "token"), null, -1,
+                                0, null, null) == ActivityManager.START_SUCCESS, "Actual native chooser admitted: " + mode);
+                    });
+                    check(shown.await(3, java.util.concurrent.TimeUnit.SECONDS), "Actual chooser worker reached its open window: " + mode);
+                    if (chooserFirst) {
+                        check(settingsState(source).equals("PAUSED"), "Positive control: translucent chooser leaves source paused");
+                        check(window.start(mode.equals("detached-settings") ? null : source, EXACT_PKG)
+                                == ActivityManager.START_SUCCESS, "Settings accepted above open chooser");
+                    }
+                    if (!headless) check(settingsState(source).equals("STOPPED"), "Opaque Settings stops the chooser's covered source");
+                    if (mode.equals("retirement")) {
+                        set(source, "savedState", null);
+                        invoke(h.atm, "processDied", new Class<?>[]{type("ActivityTaskManagerService$ProcessRecord")}, exactProcess(h));
+                    }
+                    boolean finishSettings = mode.equals("chooser-first") || mode.equals("headless-settings-first")
+                            || mode.equals("detached-settings") || mode.equals("detached-chooser");
+                    if (finishSettings) {
+                        window.finish();
+                        check((long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                                "Completing Settings retains the real open chooser's busy reservation");
+                        if (!headless) check(settingsState(source).equals("STARTED") && !events.contains("ResumeActivityItem"),
+                                "Closing opaque Settings restores visibility beneath chooser without resuming its source");
+                    }
+                    close.countDown();
+                    long deadline = android.os.SystemClock.uptimeMillis() + 3000;
+                    synchronized (h.atm) {
+                        while (!((Map<?, ?>)get(h.atm, "mIntentChoosers")).isEmpty()
+                                && android.os.SystemClock.uptimeMillis() < deadline) h.atm.wait(25);
+                    }
+                    check(((Map<?, ?>)get(h.atm, "mIntentChoosers")).isEmpty(), "Chooser worker completed and released its reservation");
+                    if (!finishSettings) {
+                        check(window.pending() == 1 && (long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                                "Chooser completion/retirement preserves the independent Settings owner");
+                        if (!headless && !mode.equals("retirement")) check(settingsState(source).equals("STOPPED")
+                                && !events.contains("ResumeActivityItem"), "Chooser completion cannot resume under opaque Settings");
+                        window.finish();
+                    }
+                    if (headless || mode.equals("retirement")) check((long)invoke(h.atm, "idleSince", new Class<?>[0]) != 0,
+                            "Last real window completion starts idle after headless/retired overlapping UI");
+                    else {
+                        // Reservation removal precedes the worker's ordinary resume callback.
+                        long until = android.os.SystemClock.uptimeMillis() + 3000;
+                        while (!settingsState(source).equals("RESUMED") && android.os.SystemClock.uptimeMillis() < until) Thread.sleep(5);
+                        check(settingsState(source).equals("RESUMED") && Collections.frequency(events, "ResumeActivityItem") == 1,
+                                "Source resumes once after both native sessions finish: " + mode);
+                    }
+                } finally { close.countDown(); set(h.atm, "mIntentChooserDialog", previous); }
+            }
+        }
+    }
+
+    private static void accountSettingsLifetime(boolean wire) throws Exception {
+        for (String mode : List.of("cancel", "retire", "runtime", "linkage", "worker-error", "overlap")) {
+            try (TestHarness h = new TestHarness(wire)) {
+                // Empty isolated account state: these checks neither grant visibility
+                // nor run an authenticator or a credential/storage backend.
+                Object accounts = make(type("AccountManagerService"), new Class<?>[]{type("ActivityManagerService"),
+                        type("PackageManagerService"), boolean.class}, h.am, h.pm, false);
+                ((Map<?, ?>)get(accounts, "mAccounts")).clear();
+                Object source = settingsRecord(h, EXACT_PKG, 1, "PAUSED");
+                acknowledgeSettings(h);
+                java.util.concurrent.CountDownLatch shown = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.CountDownLatch close = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.atomic.AtomicReference<Thread> worker = new java.util.concurrent.atomic.AtomicReference<>();
+                java.util.concurrent.atomic.AtomicReference<Throwable> uncaught = new java.util.concurrent.atomic.AtomicReference<>();
+                java.util.concurrent.atomic.AtomicReference<java.util.function.BooleanSupplier> active = new java.util.concurrent.atomic.AtomicReference<>();
+                Class<?> dialogType = type("AccountChooser$Dialog");
+                Object dialog = java.lang.reflect.Proxy.newProxyInstance(dialogType.getClassLoader(), new Class<?>[]{dialogType},
+                        (proxy, method, args) -> {
+                            worker.set(Thread.currentThread());
+                            Thread.currentThread().setUncaughtExceptionHandler((thread, failure) -> uncaught.set(failure));
+                            active.set((java.util.function.BooleanSupplier)args[3]);
+                            check(((String[])args[1]).length == 0 && !(boolean)args[2],
+                                    "Account lifetime fixture exposes no account or authenticator choice");
+                            shown.countDown();
+                            if (!close.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("Account window not released");
+                            if (mode.equals("runtime")) throw new IllegalStateException("fixture account open failure");
+                            if (mode.equals("linkage")) throw new UnsatisfiedLinkError("fixture account native failure");
+                            if (mode.equals("worker-error")) throw new AssertionError("fixture account worker failure");
+                            return -1;
+                        });
+                set(h.atm, "mAccountDialog", dialog);
+                try (SettingsWindow settings = new SettingsWindow(h, null, () -> -1)) {
+                    set(h.atm, "mIdleSince", 1L);
+                    runAs(EXACT_UID, EXACT_PID, () -> check(((android.app.IActivityTaskManager)h.atm).startActivity(h.thread,
+                            EXACT_PKG, null, new Intent().setComponent(new android.content.ComponentName("android",
+                                "android.accounts.ChooseTypeAndAccountActivity")), null, (IBinder)get(source, "token"),
+                            "account-lifetime", 82, 0, null, null) == ActivityManager.START_SUCCESS,
+                            "Real authenticated account chooser route admitted: " + mode));
+                    check(shown.await(3, java.util.concurrent.TimeUnit.SECONDS) && (long)get(h.atm, "mIdleSince") == 0
+                            && ((Map<?, ?>)get(h.atm, "mAccountChoosers")).size() == 1,
+                            "Account admission registers a real native worker and clears the idle interval");
+                    if (mode.equals("overlap")) check(settings.start(source, EXACT_PKG) == ActivityManager.START_SUCCESS,
+                            "Settings and account chooser retain separate admitted sessions");
+                    if (!mode.equals("cancel")) {
+                        set(source, "savedState", null);
+                        invoke(h.atm, "processDied", new Class<?>[]{type("ActivityTaskManagerService$ProcessRecord")}, exactProcess(h));
+                        check(!active.get().getAsBoolean() && ((List<?>)get(h.atm, "mActivities")).isEmpty()
+                                && (long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                                "Retired account source loses authority while the actual native window remains busy");
+                    }
+                    close.countDown(); worker.get().join(3000);
+                    check(!worker.get().isAlive() && ((Map<?, ?>)get(h.atm, "mAccountChoosers")).isEmpty(),
+                            "Account completion/failure retires its real worker and reservation: " + mode);
+                    check((uncaught.get() instanceof AssertionError) == mode.equals("worker-error"),
+                            "Worker Error is released and propagated, not converted into a successful account choice");
+                    if (mode.equals("overlap")) {
+                        check(settings.pending() == 1 && (long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                                "Account window cleanup cannot clear an independent Settings busy owner");
+                        settings.finish();
+                    }
+                    if (mode.equals("cancel")) check(((List<?>)get(source, "pendingResults")).size() == 1,
+                            "Live account source still receives exactly its ordinary canceled result");
+                    else check(((List<?>)get(source, "pendingResults")).isEmpty()
+                            && (long)invoke(h.atm, "idleSince", new Class<?>[0]) != 0,
+                            "Retired account source receives no result and final native completion permits idle");
+                } finally { close.countDown(); }
+            }
+        }
+    }
+
     public static void contracts(boolean wire) throws Exception {
         try (TestHarness h = new TestHarness(wire)) {
             access(h); listeners(h); transitions(h); settingsLifecycle(h); settings(h); settingsInstalledResolution(h);
         }
+        settingsSessionLifetime(wire); settingsTaskCoverage(wire); settingsWithChooser(wire);
+        accountSettingsLifetime(wire);
         System.out.println("ExactAlarmContractTest all passed: " + checks + " checks verified");
     }
 

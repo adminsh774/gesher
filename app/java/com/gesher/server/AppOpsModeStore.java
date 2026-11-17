@@ -44,14 +44,16 @@ final class AppOpsModeStore {
     }
 
     private final AtomicFile mFile;
+    private final PolicyStateWriter<State> mWriter;
     private volatile State mState;
 
     AppOpsModeStore(File file) {
         mFile = file == null ? null : new AtomicFile(file);
         mState = read();
+        mWriter = mFile == null ? null : new PolicyStateWriter<>("AppOps", this::write);
     }
     State state() { return mState; }
-    void reload() { if (mFile != null) mState = read(); }
+    boolean flush() { return mWriter == null || mWriter.flush(); }
 
     private static final Map<ApkPackage, String> SIGNERS = new java.util.WeakHashMap<>();
     static String signer(ApkPackage pkg) {
@@ -88,40 +90,42 @@ final class AppOpsModeStore {
         return new Owner(pkg.uid(), pkg.packageName, signer);
     }
 
-    /** Caller serializes writers; publication follows a successful atomic file commit. */
+    /** Caller serializes policy mutations; ordinary publication never waits for disk I/O. */
     void commit(State next) {
-        if (mFile != null) {
-            FileOutputStream stream = null;
-            try {
-                stream = mFile.startWrite();
-                TypedXmlSerializer xml = Xml.resolveSerializer(stream);
-                xml.startDocument(null, true);
-                xml.startTag(null, "app-ops");
-                xml.attributeInt(null, "version", 2);
-                for (var entry : next.uids.entrySet()) {
-                    xml.startTag(null, "uid-op");
-                    xml.attributeInt(null, "uid", entry.getKey().uid);
-                    xml.attributeInt(null, "op", entry.getKey().op);
-                    xml.attributeInt(null, "mode", entry.getValue().mode);
-                    for (Owner owner : entry.getValue().owners) writeOwner(xml, owner);
-                    xml.endTag(null, "uid-op");
-                }
-                for (var entry : next.packages.entrySet()) {
-                    xml.startTag(null, "package-op");
-                    xml.attributeInt(null, "op", entry.getKey().op);
-                    xml.attributeInt(null, "mode", entry.getValue().mode);
-                    writeOwner(xml, entry.getValue().owner);
-                    xml.endTag(null, "package-op");
-                }
-                xml.endTag(null, "app-ops");
-                xml.endDocument();
-                mFile.finishWrite(stream);
-            } catch (Exception failure) {
-                if (stream != null) mFile.failWrite(stream);
-                throw new IllegalStateException("Cannot commit AppOps modes", failure);
-            }
-        }
         mState = next;
+        if (mWriter != null) mWriter.schedule(next);
+    }
+
+    private void write(State next) throws Exception {
+        FileOutputStream stream = null;
+        try {
+            stream = mFile.startWrite();
+            TypedXmlSerializer xml = Xml.resolveSerializer(stream);
+            xml.startDocument(null, true);
+            xml.startTag(null, "app-ops");
+            xml.attributeInt(null, "version", 2);
+            for (var entry : next.uids.entrySet()) {
+                xml.startTag(null, "uid-op");
+                xml.attributeInt(null, "uid", entry.getKey().uid);
+                xml.attributeInt(null, "op", entry.getKey().op);
+                xml.attributeInt(null, "mode", entry.getValue().mode);
+                for (Owner owner : entry.getValue().owners) writeOwner(xml, owner);
+                xml.endTag(null, "uid-op");
+            }
+            for (var entry : next.packages.entrySet()) {
+                xml.startTag(null, "package-op");
+                xml.attributeInt(null, "op", entry.getKey().op);
+                xml.attributeInt(null, "mode", entry.getValue().mode);
+                writeOwner(xml, entry.getValue().owner);
+                xml.endTag(null, "package-op");
+            }
+            xml.endTag(null, "app-ops");
+            xml.endDocument();
+            mFile.finishWrite(stream);
+        } catch (Exception failure) {
+            if (stream != null) mFile.failWrite(stream);
+            throw failure;
+        }
     }
 
     private static void writeOwner(TypedXmlSerializer xml, Owner owner) throws IOException {

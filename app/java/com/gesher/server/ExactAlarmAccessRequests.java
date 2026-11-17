@@ -161,10 +161,17 @@ final class ExactAlarmAccessRequests {
         }
         packages.sort(Comparator.comparing(pkg -> pkg.packageName));
         if (!mSlots.tryAcquire()) return false;
+        java.util.concurrent.atomic.AtomicBoolean slotReleased = new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable releaseSlot = () -> {
+            if (slotReleased.compareAndSet(false, true)) mSlots.release();
+        };
         try { mExecutor.execute(() -> {
-            long identity = Binder.clearCallingIdentity();
+            long identity = 0;
+            boolean cleared = false;
             int activityResult = android.app.Activity.RESULT_CANCELED;
             try {
+                identity = Binder.clearCallingIdentity();
+                cleared = true;
                 beforeOpen.run();
                 // A specific, ineligible package's Settings detail finishes without a change.
                 if (packageName != null && packages.isEmpty()) return;
@@ -189,11 +196,20 @@ final class ExactAlarmAccessRequests {
             } catch (RuntimeException | LinkageError failure) {
                 SystemServer.log("exact alarm settings: " + failure.getClass().getSimpleName());
             } finally {
-                Binder.restoreCallingIdentity(identity);
-                try { completed.accept(activityResult); }
-                finally { mSlots.release(); }
+                // No completion runs while the native window/JNI call is still open.
+                // Failure to restore identity must not strand the accepted session.
+                try { if (cleared) Binder.restoreCallingIdentity(identity); }
+                finally {
+                    try { completed.accept(activityResult); }
+                    finally { releaseSlot.run(); }
+                }
             }
-        }); } catch (RuntimeException rejected) { mSlots.release(); throw rejected; }
+        }); } catch (RuntimeException | Error rejected) {
+            // An inline executor can propagate a worker failure after its finally
+            // already released the slot; a rejected submission has no worker finally.
+            releaseSlot.run();
+            throw rejected;
+        }
         return true;
     }
 }

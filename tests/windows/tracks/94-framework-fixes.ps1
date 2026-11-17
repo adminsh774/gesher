@@ -109,7 +109,7 @@ $exactAlarmCode = $LASTEXITCODE
 Check 'services: exact alarm scheduling contracts, permissions and revocation' {
   $global:LASTEXITCODE = $exactAlarmCode
   $exactAlarmOut
-} @('ExactAlarmContractTest all passed:')
+} @('ExactAlarmContractTest all passed: 310 checks verified')
 
 $activityRestoreOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'ActivityRestoreContractTest') 90
@@ -316,7 +316,7 @@ $appOpsCode = $LASTEXITCODE
 Check 'services: AppOps defaults, authority, attributed delivery, foreground lifecycle and signed persistence' {
   $global:LASTEXITCODE = $appOpsCode
   $appOpsOut
-} @('AppOpsContractTest all passed: 71 checks; binder=true')
+} @('AppOpsContractTest all passed: 434 checks; binder=true')
 
 $uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'PackageUidIsolationContractTest' +

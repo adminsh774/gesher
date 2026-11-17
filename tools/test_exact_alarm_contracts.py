@@ -40,6 +40,7 @@ def main() -> None:
             'app/java/com/gesher/server/AlarmManagerService.java',
             'app/java/com/gesher/server/ExactAlarmAccess.java',
             'app/java/com/gesher/server/ExactAlarmAccessRequests.java',
+            'app/java/com/gesher/server/AccountChooser.java',
             'app/java/com/gesher/server/PermissionPolicy.java',
             'app/java/com/gesher/server/PermissionCatalog.java',
             'app/java/com/gesher/server/ActivityManagerService.java',

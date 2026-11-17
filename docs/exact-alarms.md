@@ -51,6 +51,46 @@ front. Such a recipient keeps its result pending until its normal resume. A
 does. `NO_USER_ACTION` suppresses the user-leaving hint while retaining lifecycle
 transitions.
 
+Each accepted native Settings request owns a bounded server reservation from
+admission through its coordinator's completion. This includes requests queued
+behind another Settings window and `NEW_TASK` requests without a source activity.
+Admission clears any earlier device-idle interval; only the last activity or
+native UI owner ending starts a new interval. Rejected submissions, backend
+failures and worker errors release their own reservation and admission slot once.
+No synthetic ActivityRecord is created for this accounting.
+
+The request represents the system Settings component, not an activity running in
+the caller's process. Caller death therefore does not dismiss an already accepted
+Settings request or make its open native window idle. Ordinary activity-history
+and result rules still decide whether the caller can later be restored or receive
+a result. This follows the Settings manifest's separate application/component
+ownership and `WindowProcessController.handleAppDied`, which processes activities
+belonging to the process that died. It does not transfer the caller's authority
+to another package; a Settings edit still checks the selected installed generation.
+
+Settings provides opaque coverage of its selected task, including activities
+below a translucent task top. The visibility query, deferred-start collection,
+final make-visible transition, launch/resume gates and late pause acknowledgment
+all observe that coverage. A different task resuming cannot restart an activity
+still covered by Settings. Closing the last covering request restores the current
+task top and starts any lower activities that are visible again. Other desktop
+tasks retain normal multi-resume behavior.
+Native launches without a result token still capture the focused task beneath an
+existing native window. Selecting only a currently resumable activity would lose
+that coverage when another Settings screen or chooser already covers the top.
+
+The integrated intent chooser keeps its existing translucent coverage and caller
+validity rules. If Settings closes while a chooser remains, the underlying stopped
+activity becomes visible without resuming; the chooser's later completion resumes
+it. Either completion order retains the other native operation's busy lifetime.
+The existing account-chooser map also participates in the shared idle predicate.
+Its original source-validity checks remain in force through caller retirement;
+the native call must return before its reservation is released. Its coordinator
+now releases through `finally` on worker errors as well. The account idle omission
+and missing error cleanup were inherited integration issues, separate from the
+two exact-alarm Settings defects; account permissions and selection policy are
+unchanged.
+
 ## Validation boundaries
 
 `tools/test_exact_alarm_contracts.py` runs the production Java policy, AppOps,
@@ -58,6 +98,12 @@ Settings coordinator, resolver, and activity lifecycle against actual framework
 classes. Only parsed package/process identities, host-window choices, native
 allocation/identity facilities, and timer dispatch are isolated fixtures. The
 scheduler suite separately checks pending/delivery listener lifetime regressions.
+Additional bounded controls exercise queued and headless requests, exhausted
+admission, failures, caller retirement, opaque coverage below a translucent top,
+stale visibility work, late pause acknowledgment, overlapping Settings requests,
+and Settings with intent/account choosers. The account controls use empty isolated
+metadata and a controlled host-call boundary; they make no account-data, credential,
+authenticator or real Windows-window execution claim.
 
 Windows track 94 runs the public alarm/AppOps contracts through generated Binder
 transport. The existing native `permission_dialog_test` also exercises the actual
@@ -67,6 +113,13 @@ suspend/wake behavior; the latest commit's Windows CI remains a required gate.
 The grant broadcast's flags are implemented; this change does not claim to add the
 runtime's general background-FGS enforcement or its temporary allowlist policy.
 
+The inherited repeating-alarm interval normalization is also unchanged. A bounded
+registration-only independent probe retains a requested 1 ms positive interval,
+where pinned AOSP defaults to a 60,000 ms minimum. The same normalization exists
+before this PR's exact-alarm work. It is a separate scheduler contract gap; these
+permission and native-lifecycle corrections neither claim to repair nor validate
+rapid timer delivery, load, or suspend/wake behavior.
+
 ## Android source evidence
 
 - [AlarmManagerService](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/apex/jobscheduler/service/java/com/android/server/alarm/AlarmManagerService.java): access checks, direct listeners, grant broadcasts, and revocation.
@@ -74,3 +127,7 @@ runtime's general background-FGS enforcement or its temporary allowlist policy.
 - [Framework permissions](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/core/res/AndroidManifest.xml): permission protection levels.
 - [Settings manifest](https://android.googlesource.com/platform/packages/apps/Settings/+/android-16.0.0_r4/AndroidManifest.xml) and [AlarmsAndRemindersDetails](https://android.googlesource.com/platform/packages/apps/Settings/+/android-16.0.0_r4/src/com/android/settings/applications/appinfo/AlarmsAndRemindersDetails.java): components, filters, UID mode changes, and activity results.
 - [ActivityStarter](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/services/core/java/com/android/server/wm/ActivityStarter.java), [TaskFragment](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/services/core/java/com/android/server/wm/TaskFragment.java), and [ActivityRecord](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/services/core/java/com/android/server/wm/ActivityRecord.java): task selection, pausing the resumed activity, and deferred result delivery.
+- [WindowProcessController](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/services/core/java/com/android/server/wm/WindowProcessController.java): process death handles that process's activity list; a separate Settings component does not belong to its caller's process.
+- [EnsureActivitiesVisibleHelper](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/services/core/java/com/android/server/wm/EnsureActivitiesVisibleHelper.java): compute complete occlusion before making an activity visible or restarting it; invisible activities take the invisible branch.
+- [Settings themes](https://android.googlesource.com/platform/packages/apps/Settings/+/android-16.0.0_r4/res/values/themes.xml): the Settings components inherit the ordinary Settings application theme rather than a translucent chooser/dialog theme.
+- [ChooseTypeAndAccountActivity](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/core/java/android/accounts/ChooseTypeAndAccountActivity.java): authenticate the launching identity and finish with a cancellation or explicit account selection. Native busy accounting does not grant account access.
