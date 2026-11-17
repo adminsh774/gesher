@@ -5,10 +5,11 @@
 // ANativeWindow with no HWND of its own: its frames go to a consumer in the
 // process (hwui draws them where the view is). ANGLE needs a window for a
 // window surface, so such an ANativeWindow gets a hidden helper window of its
-// size; before each eglSwapBuffers the frame is read back (glReadPixels of
-// the default framebuffer) and posted to the ANativeWindow (lock,
-// unlockAndPost), at most 60 frames a second, as a display's vsync paces
-// them on a device. The helper window follows the ANativeWindow's size
+// size; before each eglSwapBuffers the frame is posted to ANativeWindow (lock,
+// unlockAndPost). ANGLE's reverse-row and BGRA readback extensions permit
+// direct readback into compatible destination buffers; other formats use a
+// clipped fallback. The GPU-to-CPU transfer remains synchronous, with frames
+// posted at most 60 times a second, as a display's vsync paces them on a device. The helper window follows the ANativeWindow's size
 // (setFixedSize, a resized view), which ANGLE picks up at the next swap.
 #pragma once
 

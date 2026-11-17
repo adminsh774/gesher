@@ -36,8 +36,23 @@ GraphicsDex 'HardwareRenderer: the CPU pipeline''s frame (child node, text, bitm
 $env:GESHER_HWUI_RENDERER = 'skiagl'
 $env:GESHER_EGL_DEVICE = 'warp'
 GraphicsDex 'HardwareRenderer: SkiaGL over ANGLE (WARP) into the Win32 window, the same frame as the CPU pipeline' `
-  HardwareRendererGlTest @($hwuiFont, $hwuiFrame, 'gl', 'GESHER_HWUI_RENDERER')
+  HardwareRendererGlTest @($hwuiFont, $hwuiFrame, 'gl', 'GESHER_HWUI_RENDERER', 'trim-resize')
 Remove-Item Env:GESHER_EGL_DEVICE
+Remove-Item Env:GESHER_HWUI_RENDERER
+
+# The default stays CPU even for graphical apps until hardware acceptance.
+$env:GESHER_APP_WINDOW = 'window'
+GraphicsDex 'HardwareRenderer: windowed default remains SkiaCpu, same frame as CPU' `
+  HardwareRendererGlTest @($hwuiFont, $hwuiFrame, 'default-cpu')
+
+# Explicit auto must not mistake WARP for a hardware GPU.
+# Compare against the previously saved CPU frame.
+$env:GESHER_HWUI_RENDERER = 'auto'
+$env:GESHER_EGL_DEVICE = 'warp'
+GraphicsDex 'HardwareRenderer: auto chooses SkiaCpu on WARP, same frame as CPU' `
+  HardwareRendererGlTest @($hwuiFont, $hwuiFrame, 'auto-cpu')
+Remove-Item Env:GESHER_EGL_DEVICE
+Remove-Item Env:GESHER_APP_WINDOW
 Remove-Item Env:GESHER_HWUI_RENDERER
 
 # The same chosen by Android's switch, the system property debug.hwui.renderer
@@ -86,4 +101,10 @@ GraphicsDex 'OpenGL ES for Java apps: EGL10 and GLES20 draw a frame (pbuffer, Wi
   GlBindingsTest @()
 GraphicsDex 'ImageReader native surface: EGL pixels, Canvas notification, queue overflow and close lifetime' `
   ImageReaderEglTest @()
+# Independently exercise the old staging path even if ANGLE supports the
+# direct readback extension. All ImageReader pixel/lifetime checks must pass.
+$env:GESHER_EGL_DIRECT_READBACK = '0'
+GraphicsDex 'ImageReader surface: forced staging fallback preserves pixels and lifetime' `
+  ImageReaderEglTest @()
+Remove-Item Env:GESHER_EGL_DIRECT_READBACK
 Remove-Item Env:GESHER_EGL_DEVICE

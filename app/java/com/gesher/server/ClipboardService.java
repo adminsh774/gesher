@@ -142,10 +142,9 @@ public final class ClipboardService extends IClipboard.Default implements Window
     }
 
     private boolean clipboardAccessAllowed(int uid, String callingPackage, int userId) {
+        // The subject can be a stored listener rather than the current Binder caller.
+        // A server-originated Windows event must not lend its authority to that listener.
         if (isSystemUid(uid)) {
-            return true;
-        }
-        if (mCallers != null && mCallers.isSystem()) {
             return true;
         }
         if (isDefaultIme(uid, callingPackage, userId)) {
@@ -325,9 +324,23 @@ public final class ClipboardService extends IClipboard.Default implements Window
 
     // --- IClipboard -------------------------------------------------------------------------
 
+    private void enforceClipSourcePermission() {
+        int uid = Binder.getCallingUid();
+        if (uid == Process.ROOT_UID || uid == Process.SYSTEM_UID) return;
+        if (mPm != null && mPm.permissions().checkProcessPermission(
+                android.Manifest.permission.SET_CLIP_SOURCE, Binder.getCallingPid(), uid)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED) return;
+        throw new SecurityException("Clipboard source attribution requires SET_CLIP_SOURCE");
+    }
+
     @Override
     public void setPrimaryClip(ClipData clip, String callingPackage, String attributionTag,
             int userId, int deviceId) {
+        setPrimaryClipInternal(clip, callingPackage, attributionTag, userId, deviceId, callingPackage);
+    }
+
+    private void setPrimaryClipInternal(ClipData clip, String callingPackage, String attributionTag,
+            int userId, int deviceId, String sourcePackage) {
         int callingUid = Binder.getCallingUid();
         validateCallingPackage(callingPackage, callingUid, userId);
         start();
@@ -346,7 +359,7 @@ public final class ClipboardService extends IClipboard.Default implements Window
         }
         synchronized (this) {
             mClip = clip;
-            mSource = callingPackage;
+            mSource = sourcePackage;
             if (written) mSequence = WindowsHost.clipboardSequence();
         }
         SystemServer.log("clipboard: set by " + callingPackage + " (" + windows[0].length()
@@ -360,7 +373,8 @@ public final class ClipboardService extends IClipboard.Default implements Window
     @Override
     public void setPrimaryClipAsPackage(ClipData clip, String callingPackage,
             String attributionTag, int userId, int deviceId, String sourcePackage) {
-        setPrimaryClip(clip, sourcePackage, attributionTag, userId, deviceId);
+        enforceClipSourcePermission();
+        setPrimaryClipInternal(clip, callingPackage, attributionTag, userId, deviceId, sourcePackage);
     }
 
     @Override
@@ -372,7 +386,7 @@ public final class ClipboardService extends IClipboard.Default implements Window
         boolean written = WindowsHost.available() && WindowsHost.setClipboardRich("", null, null);
         synchronized (this) {
             mClip = null;
-            mSource = callingPackage;
+            mSource = null;
             if (written) mSequence = WindowsHost.clipboardSequence();
         }
         SystemServer.log("clipboard: cleared by " + callingPackage);
@@ -444,13 +458,16 @@ public final class ClipboardService extends IClipboard.Default implements Window
     @Override
     public String getPrimaryClipSource(String callingPackage, String attributionTag,
             int userId, int deviceId) {
+        enforceClipSourcePermission();
         int callingUid = Binder.getCallingUid();
         validateCallingPackage(callingPackage, callingUid, userId);
         if (!clipboardAccessAllowed(callingUid, callingPackage, userId)) {
             return null;
         }
+        start();
+        syncFromWindows(true);
         synchronized (this) {
-            return mSource;
+            return mClip != null ? mSource : null;
         }
     }
 

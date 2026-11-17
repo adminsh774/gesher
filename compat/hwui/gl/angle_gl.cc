@@ -40,11 +40,15 @@
 #include <GLES2/gl2ext.h>
 #include <GLES3/gl3.h>
 
+#include <include/gpu/ganesh/GrDirectContext.h>
 #include <include/gpu/ganesh/gl/GrGLInterface.h>
+#include <include/gpu/ganesh/gl/GrGLDirectContext.h>
 
 #include <gesher/egl_angle.h>
 
 #include "gesher_native_window.h"
+#include "gr_context_options.h"
+#include "hardware_renderer_policy.h"
 
 #include <atomic>
 #include <cstdio>
@@ -53,6 +57,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace {
 
@@ -103,6 +108,9 @@ struct LayeredSurface {
   EGLConfig config = nullptr;
   ANativeWindow* window = nullptr;
   EGLint width = 0, height = 0;
+  // Keep frame scratch instead of reallocating two full images at every swap.
+  std::vector<uint8_t> rgba;
+  std::vector<uint32_t> argb;
 };
 
 std::mutex g_layered_mutex;
@@ -150,20 +158,26 @@ void PresentLayered(LayeredSurface* s) {
   ANGLE(glGetIntegerv)(GL_READ_FRAMEBUFFER_BINDING, &read_fb);
   ANGLE(glGetIntegerv)(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fb);
   ANGLE(glBindFramebuffer)(GL_FRAMEBUFFER, 0);
-  std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
-  ANGLE(glReadPixels)(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+  const size_t pixels = static_cast<size_t>(w) * static_cast<size_t>(h);
+  if (pixels > static_cast<size_t>(-1) / 4) {
+    ANGLE(glBindFramebuffer)(GL_READ_FRAMEBUFFER, read_fb);
+    ANGLE(glBindFramebuffer)(GL_DRAW_FRAMEBUFFER, draw_fb);
+    return;
+  }
+  s->rgba.resize(pixels * 4);
+  ANGLE(glReadPixels)(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, s->rgba.data());
   ANGLE(glBindFramebuffer)(GL_READ_FRAMEBUFFER, read_fb);
   ANGLE(glBindFramebuffer)(GL_DRAW_FRAMEBUFFER, draw_fb);
-  std::vector<uint32_t> argb(static_cast<size_t>(w) * h);
+  s->argb.resize(pixels);
   for (EGLint y = 0; y < h; y++) {
-    const uint8_t* row = rgba.data() + static_cast<size_t>(h - 1 - y) * w * 4;  // bottom-up
-    uint32_t* out = argb.data() + static_cast<size_t>(y) * w;
+    const uint8_t* row = s->rgba.data() + static_cast<size_t>(h - 1 - y) * w * 4;  // bottom-up
+    uint32_t* out = s->argb.data() + static_cast<size_t>(y) * w;
     for (EGLint x = 0; x < w; x++) {
       const uint8_t* p = row + x * 4;
       out[x] = (uint32_t{p[3]} << 24) | (uint32_t{p[0]} << 16) | (uint32_t{p[1]} << 8) | p[2];
     }
   }
-  gesher_window_present_pixels(s->window, argb.data(), w, h);
+  gesher_window_present_pixels(s->window, s->argb.data(), w, h);
 }
 
 }  // namespace
@@ -439,7 +453,10 @@ void EGLAPIENTRY eglBeginFrame(EGLDisplay, EGLSurface) {}
 
 // --- can SkiaGL run? -------------------------------------------------------------------------------
 
-bool gesher_hwui_gl_usable(std::string* detail) {
+// Qualify the *actual* Skia Ganesh context creation used by RenderThread.
+// A valid GrGLInterface alone is insufficient: MakeGL can still fail and
+// RenderThread::requireGlContext treats that failure as fatal.
+bool gesher_hwui_gl_usable(std::string* detail, bool require_hardware) {
   EGLDisplay display = static_cast<EGLDisplay>(gesher_egl_default_display());
   if (display == EGL_NO_DISPLAY) {
     *detail = "no EGL display on ANGLE (libEGL.dll/libGLESv2.dll missing, or no Direct3D 11 device)";
@@ -447,7 +464,7 @@ bool gesher_hwui_gl_usable(std::string* detail) {
   }
   for (const char* name : {"eglCreateContext", "eglMakeCurrent", "eglSwapBuffers",
                            "eglCreatePbufferSurface", "eglSurfaceAttrib", "eglQuerySurface",
-                           "glGetString", "glReadPixels"}) {
+                           "eglGetCurrentSurface", "glGetString", "glReadPixels"}) {
     if (!AngleHas(name)) {
       *detail = std::string("ANGLE lacks ") + name;
       return false;
@@ -458,7 +475,6 @@ bool gesher_hwui_gl_usable(std::string* detail) {
     *detail = "eglInitialize failed";
     return false;
   }
-  // What EglManager::load8BitsConfig asks for (without a swap behavior bit).
   const EGLint attribs[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_RED_SIZE, 8,
                             EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
                             EGL_DEPTH_SIZE, 0, EGL_STENCIL_SIZE, 8, EGL_SURFACE_TYPE,
@@ -469,6 +485,16 @@ bool gesher_hwui_gl_usable(std::string* detail) {
     *detail = "no RGBA8 window config";
     return false;
   }
+
+  // ANGLE is process-global. Never discard a context that was current on the
+  // probing thread before the framework initialized its graphics natives.
+  const EGLDisplay previous_display = eglGetCurrentDisplay();
+  const EGLContext previous_context = eglGetCurrentContext();
+  const EGLSurface previous_draw = previous_context != EGL_NO_CONTEXT
+      ? ANGLE(eglGetCurrentSurface)(EGL_DRAW) : EGL_NO_SURFACE;
+  const EGLSurface previous_read = previous_context != EGL_NO_CONTEXT
+      ? ANGLE(eglGetCurrentSurface)(EGL_READ) : EGL_NO_SURFACE;
+
   const EGLint context_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
   EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attribs);
   if (context == EGL_NO_CONTEXT) {
@@ -481,15 +507,48 @@ bool gesher_hwui_gl_usable(std::string* detail) {
   if (ok) {
     const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
     const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
-    sk_sp<const GrGLInterface> gl_interface = GrGLMakeNativeInterface();
-    ok = renderer != nullptr && version != nullptr && gl_interface != nullptr &&
-         gl_interface->validate();
-    *detail = ok ? std::string(renderer) + ", " + version + ", EGL " + std::to_string(major) +
-                       "." + std::to_string(minor)
-                 : "no OpenGL ES interface for Skia over ANGLE";
-    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (renderer == nullptr || version == nullptr) {
+      *detail = "ANGLE did not report a GL renderer and version";
+      ok = false;
+    } else if (require_hardware && !gesher::hwui::HardwareAngleD3D11(renderer)) {
+      // No need to allocate a Ganesh GPU context on WARP or an unrecognized
+      // renderer when automatic hardware selection will reject it anyway.
+      *detail = std::string("software or unrecognized renderer: ") + renderer;
+      ok = false;
+    } else {
+      sk_sp<const GrGLInterface> gl_interface = GrGLMakeNativeInterface();
+      if (gl_interface == nullptr || !gl_interface->validate()) {
+        *detail = "no OpenGL ES interface for Skia over ANGLE";
+        ok = false;
+      } else {
+        GrContextOptions options;
+        gesher::hwui::InitGaneshContextOptions(options);
+        sk_sp<GrDirectContext> ganesh = GrDirectContexts::MakeGL(std::move(gl_interface), options);
+        if (!ganesh) {
+          *detail = "GrDirectContexts::MakeGL failed over ANGLE";
+          ok = false;
+        } else {
+          // Abandon/release while the temporary EGL context is still current;
+          // doing this after unbinding would leave GL resource cleanup unsafe.
+          ganesh->releaseResourcesAndAbandonContext();
+          ganesh.reset();
+          *detail = std::string(renderer) + ", " + version + ", EGL " +
+                    std::to_string(major) + "." + std::to_string(minor);
+        }
+      }
+    }
   } else {
     *detail = "a pbuffer with an ES context could not be made current";
+  }
+
+  const bool restored = previous_context != EGL_NO_CONTEXT && previous_display != EGL_NO_DISPLAY
+      ? eglMakeCurrent(previous_display, previous_draw, previous_read, previous_context)
+      : eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  if (!restored) {
+    ok = false;
+    *detail = "failed to restore EGL context after ANGLE qualification";
+    // Best effort: at least unbind our temporary context before destruction.
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
   }
   if (pbuffer != EGL_NO_SURFACE) eglDestroySurface(display, pbuffer);
   eglDestroyContext(display, context);

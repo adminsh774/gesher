@@ -111,6 +111,16 @@ public final class ClipboardSecurityContractTest {
         void run() throws Exception;
     }
 
+    private static void requiresClipSourcePermission(ThrowingRunnable action) throws Exception {
+        boolean denied = false;
+        try {
+            action.run();
+        } catch (SecurityException expected) {
+            denied = true;
+        }
+        check(denied, "Source attribution requires SET_CLIP_SOURCE independently of focus");
+    }
+
     /** Test 1: Focused app can write and read primary clip. */
     private static void testFocusedAppReadWrite(IClipboard service) throws Exception {
         setFocusedUid(APP_UID);
@@ -131,8 +141,13 @@ public final class ClipboardSecurityContractTest {
             ClipDescription desc = service.getPrimaryClipDescription(APP_PKG, null, 0, 0);
             check(desc != null, "Focused app must be able to get clip description");
 
-            String source = service.getPrimaryClipSource(APP_PKG, null, 0, 0);
-            check(APP_PKG.equals(source), "Primary clip source must match setter package");
+            requiresClipSourcePermission(() -> service.getPrimaryClipSource(APP_PKG, null, 0, 0));
+            requiresClipSourcePermission(() -> service.setPrimaryClipAsPackage(
+                    clip, APP_PKG, null, 0, 0, BG_PKG));
+        });
+        runAs(SYSTEM_UID, SYSTEM_PID, () -> {
+            String source = service.getPrimaryClipSource(SYSTEM_PKG, null, 0, 0);
+            check(APP_PKG.equals(source), "A privileged source query identifies the actual setter");
         });
     }
 
@@ -150,8 +165,7 @@ public final class ClipboardSecurityContractTest {
                     "Unfocused app getPrimaryClip must return null");
             check(service.getPrimaryClipDescription(BG_PKG, null, 0, 0) == null,
                     "Unfocused app getPrimaryClipDescription must return null");
-            check(service.getPrimaryClipSource(BG_PKG, null, 0, 0) == null,
-                    "Unfocused app getPrimaryClipSource must return null");
+            requiresClipSourcePermission(() -> service.getPrimaryClipSource(BG_PKG, null, 0, 0));
 
             // However, background write is permitted per Android contract
             ClipData bgClip = ClipData.newPlainText("bg_label", "Written from background");
@@ -258,6 +272,23 @@ public final class ClipboardSecurityContractTest {
         });
     }
 
+    /** An empty clipboard has no source, including after a previously nonempty clip. */
+    private static void testEmptyClipboardHasNoSource(IClipboard service) throws Exception {
+        runAs(SYSTEM_UID, SYSTEM_PID, () -> {
+            service.setPrimaryClip(ClipData.newPlainText("source", "temporary clip"),
+                    SYSTEM_PKG, null, 0, 0);
+            check(SYSTEM_PKG.equals(service.getPrimaryClipSource(SYSTEM_PKG, null, 0, 0)),
+                    "A nonempty clip retains its source");
+            service.clearPrimaryClip(SYSTEM_PKG, null, 0, 0);
+            check(!service.hasPrimaryClip(SYSTEM_PKG, null, 0, 0),
+                    "Clear removes the primary clip");
+            check(service.getPrimaryClipSource(SYSTEM_PKG, null, 0, 0) == null,
+                    "Clearing a clip also clears its source");
+            check(newService().getPrimaryClipSource(SYSTEM_PKG, null, 0, 0) == null,
+                    "A fresh clipboard has no source");
+        });
+    }
+
     public static void main(String[] args) throws Exception {
         System.loadLibrary("android_runtime");
         // Disable WindowsHost to avoid external Windows clipboard interference
@@ -277,6 +308,7 @@ public final class ClipboardSecurityContractTest {
             testDefaultImeAccess(service);
             testListenerFocusFiltering(service);
             testNullPackageSecurityException(service);
+            testEmptyClipboardHasNoSource(service);
 
             System.out.println("ClipboardSecurityContractTest all passed: " + checks + " checks");
         } finally {
