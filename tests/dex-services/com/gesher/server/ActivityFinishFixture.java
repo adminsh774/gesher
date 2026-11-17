@@ -422,19 +422,27 @@ public final class ActivityFinishFixture {
                 check(atm.startActivity(h.thread, OWNER, null, web, null, sourceToken,
                                 "browse", 8, 0, null, null) == ActivityManager.START_SUCCESS,
                         "An accepted Windows launch did not report success");
+                check(h.thread.results(source).size() == 1,
+                        "Shell acceptance fabricated an ordinary activity-result completion");
+                check(atm.startActivity(h.thread, OWNER, null,
+                                new Intent(web).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null,
+                                sourceToken, "browseNewTask", 9, 0, null, null) == ActivityManager.START_SUCCESS,
+                        "An accepted NEW_TASK Windows launch did not report success");
                 check(atm.startActivity(h.thread, OWNER, null, mail, null, sourceToken,
                                 null, -1, 0, null, null) == ActivityManager.START_INTENT_NOT_RESOLVED,
                         "A failed Windows launch without a result request reported success");
             });
-            check(attempts.equals(List.of(mail.getDataString(), web.getDataString(), mail.getDataString())),
+            check(attempts.equals(List.of(mail.getDataString(), web.getDataString(),
+                            web.getDataString(), mail.getDataString())),
                     "Windows received incorrect URLs or more than one call per request: " + attempts);
             List<ResultInfo> results = h.thread.results(source);
-            check(results.size() == 2, "Each result request must complete once: " + results);
+            check(results.size() == 2, "Each failed or NEW_TASK result request must cancel once: " + results);
             for (int i = 0; i < results.size(); i++) {
                 ResultInfo result = results.get(i);
                 check(result.mResultCode == Activity.RESULT_CANCELED && result.mData == null
-                                && result.mRequestCode == 7 + i
-                                && List.of("compose", "browse").get(i).equals(result.mResultWho),
+                                && result.mCallerToken == null
+                                && result.mRequestCode == List.of(7, 9).get(i)
+                                && List.of("compose", "browseNewTask").get(i).equals(result.mResultWho),
                         "External URL cancellation lost its routing fields: " + result);
             }
             check(h.records.equals(List.of(source)), "External URLs created an Android activity");
@@ -447,8 +455,9 @@ public final class ActivityFinishFixture {
                 }
                 return true;
             });
-            h.asApp(() -> check(atm.startActivity(h.thread, OWNER, null, web, null, sourceToken,
-                            "afterExit", 9, 0, null, null) == ActivityManager.START_SUCCESS,
+            h.asApp(() -> check(atm.startActivity(h.thread, OWNER, null,
+                            new Intent(web).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null, sourceToken,
+                            "afterExit", 10, 0, null, null) == ActivityManager.START_SUCCESS,
                     "The Windows launch was accepted before the caller exited"));
             check(h.thread.results(source).size() == 2, "Exit during the launch left a stale result");
         } finally {

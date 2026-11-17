@@ -1217,14 +1217,17 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                             boolean opened = sOpenExternalUrl.test(data.toString());
                             SystemServer.log("startActivity: Windows external URL "
                                     + (opened ? "opened" : "unavailable") + " (" + scheme + ")");
-                            // A failed launch cancels the requested result. A Windows handler
-                            // that accepts the URL starts outside this task and cannot reply either.
-                            if (requestCode >= 0 && resultToToken != null && originalProcess != null
+                            // ActivityStarter cancels a failed launch or detaches an explicit
+                            // NEW_TASK result. Shell acceptance alone does not mean an ordinary
+                            // result-producing activity finished; do not fabricate that completion.
+                            boolean cancelResult = !opened
+                                    || (intent.getFlags() & Intent.FLAG_ACTIVITY_NEW_TASK) != 0;
+                            if (cancelResult && requestCode >= 0 && resultToToken != null && originalProcess != null
                                     && callerProcess(originalPid) == originalProcess) {
                                 ActivityRecord source = forToken(resultToToken);
                                 if (source != null && source.app == originalProcess) {
-                                    deliverResult(source, resultWho, requestCode,
-                                            android.app.Activity.RESULT_CANCELED, null);
+                                    deliverResult(source, new ResultInfo(resultWho, requestCode,
+                                            android.app.Activity.RESULT_CANCELED, null, null), null, null);
                                 }
                             }
                             return opened ? ActivityManager.START_SUCCESS
@@ -3350,11 +3353,17 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         }
         IBinder callerToken = new Binder("Server activity result caller");
         ResultInfo info = new ResultInfo(resultWho, requestCode, resultCode, resultData, callerToken);
+        deliverResult(r, info, callerToken, snapshot);
+    }
+
+    /** Launch cancellation has no activity caller token; server UI results retain theirs. */
+    private void deliverResult(ActivityRecord r, ResultInfo info, IBinder callerToken,
+            ActivityCallerState.Snapshot snapshot) {
         boolean resumed;
         synchronized (this) {
             if (!mActivities.contains(r) || r.finishing || r.state == State.DESTROYED
                     || !activityCodeCurrent(r)) return;
-            r.callerState.add(callerToken, snapshot);
+            if (callerToken != null) r.callerState.add(callerToken, snapshot);
             resumed = (r.state == State.RESUMED || r.state == State.LAUNCHING || r.state == State.RESUMING);
             if (!resumed) {
                 r.pendingResults.add(info);
