@@ -152,7 +152,7 @@ RECEIPT_SOURCE_BLOCK=b'''  if ($null -ne $SourceIdentity) {
 # then EVERY earlier preservation assertion below still runs on its result.
 # Coupled OFD/stdio/pipe source files are pinned by the same qualification.
 # No supplier, socket core, fixture predicate, deadline or DAG is exempted.
-OFD_QUALIFICATION_SHA256='aa6b33f2ef5783924243e984c67938374d077399900c79f6203c7edb79463484'
+OFD_QUALIFICATION_SHA256 = 'd491de4aaf0c5170030ce05ca178788756025be3d4c078e7bdcef0e723e7692e'
 def preceding_ofd_sources():
  folder=ROOT/'tools/net-tcp-priority/qualified'
  raw=(folder/'ofd-stream-source.json').read_bytes()

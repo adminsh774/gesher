@@ -19,6 +19,9 @@ struct OpenFileDescription {
   };
   std::atomic<DescriptorKind> kind{DescriptorKind::kFile};
   std::atomic<int> local_flags{0};
+  // Native handles discovered through the CRT are initialized only after the
+  // caller has pinned them and released the descriptor/table transaction.
+  std::atomic<bool> initialized{false};
   std::atomic<Shared*> shared{nullptr};
   HANDLE mapping = nullptr;
   std::mutex mutex;

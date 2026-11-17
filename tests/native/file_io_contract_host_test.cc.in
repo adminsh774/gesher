@@ -3,6 +3,7 @@
 #include <sys/ioctl.h>
 #include <sys/random.h>
 #include <poll.h>
+#include <pthread.h>
 
 static BOOL PeekNamedPipe(HANDLE file, void*, DWORD, DWORD*, DWORD* available, DWORD*) {
   int count = 0;
@@ -14,21 +15,7 @@ static BOOL PeekNamedPipe(HANDLE file, void*, DWORD, DWORD*, DWORD* available, D
   return TRUE;
 }
 
-@NATIVE_FILE_IO@
-
 namespace gesher {
-// The description metadata is an OS boundary in this file-I/O fixture;
-// test_ofd_transfer_contracts.py separately executes the complete registry.
-enum class DescriptorKind { kFile, kZero, kRandom, kUnshareable };
-struct DescriptorSnapshot {
-  HANDLE handle;
-  DescriptorKind kind;
-  ~DescriptorSnapshot() { CloseHandle(handle); }
-};
-using DescriptorSnapshotPtr = std::shared_ptr<DescriptorSnapshot>;
-static int FileDescriptionFlags(const DescriptorSnapshotPtr& value) {
-  return value ? ::fcntl(value->handle->fd, F_GETFL) : (errno = EBADF, -1);
-}
 static DescriptorSnapshotPtr Capture(int fd, DescriptorKind kind = DescriptorKind::kFile) {
   int copy = ::dup(fd);
   if (copy < 0) return {};
@@ -51,7 +38,22 @@ static void WakePollers() { ++poll_wakes; }
 static int TransferPipe(HANDLE handle, void* bytes, unsigned count, bool writing) {
   return static_cast<int>(writing ? ::write(handle->fd, bytes, count) : ::read(handle->fd, bytes, count));
 }
+}
+
+@NATIVE_FILE_IO@
+
+namespace gesher {
 @SNAPSHOT_FILE_IO@
+}
+
+@NATIVE_PIPE_ROUTE@
+
+struct RouteRead { int fd; int result = -2; };
+static void* ReadPipeRoute(void* raw) {
+  auto* call = static_cast<RouteRead*>(raw);
+  char byte;
+  NativePipeIo(call->fd, &byte, 1, false, &call->result);
+  return nullptr;
 }
 
 static int checks, failures;
@@ -152,6 +154,41 @@ int main() {
   Check("pipe dispatch witness", pipe(pipes) == 0);
   int result = 999;
   Check("file adapter leaves pipe I/O to the pipe backend", !NativeFileIo(pipes[0], bytes, 1, false, &result) && result == 999);
+  Check("pipe route leaves regular files to their backend", !NativePipeIo(fd, bytes, 1, false, &result) && result == 999);
+  Check("pipe route validates the captured read access", NativePipeIo(pipes[1], bytes, 0, false, &result) &&
+      result == -1 && errno == EBADF);
+  Check("pipe route validates the captured write access", NativePipeIo(pipes[0], bytes, 0, true, &result) &&
+      result == -1 && errno == EBADF);
+  Check("pipe route zero read returns without waiting", NativePipeIo(pipes[0], nullptr, 0, false, &result) && result == 0);
+  Check("pipe route nonblocking fixture", fcntl(pipes[0], F_SETFL, O_NONBLOCK) == 0);
+  Check("pipe route observes the captured nonblocking mode", NativePipeIo(pipes[0], bytes, 1, false, &result) &&
+      result == -1 && errno == EAGAIN);
+  Check("pipe route blocking mode restored", fcntl(pipes[0], F_SETFL, 0) == 0);
+  std::atomic<bool> reached_status{false};
+  before_status = [&] { reached_status.store(true); };
+  RouteRead route{pipes[0]}; pthread_t route_thread;
+  Check("pipe route cancellation worker starts", pthread_create(&route_thread, nullptr, ReadPipeRoute, &route) == 0);
+  for (int retry = 0; retry != 1000 && !reached_status.load(); ++retry) usleep(1000);
+  Check("pipe route reached status without a publication lock", reached_status.load());
+  Check("pipe route cancellation request", pthread_cancel(route_thread) == 0);
+  void* canceled = nullptr;
+  Check("pipe route cancellation releases its snapshot", pthread_join(route_thread, &canceled) == 0 &&
+      canceled == PTHREAD_CANCELED && live_handles == 0);
+  before_status = {};
+  int old_writer = dup(pipes[1]);
+  before_status = [&] {
+    close(pipes[1]);
+    int replacement = open("/dev/null", O_WRONLY);
+    if (replacement != pipes[1]) { dup2(replacement, pipes[1]); close(replacement); }
+  };
+  Check("pipe route writes through one retained object during fd reuse",
+      NativePipeIo(pipes[1], const_cast<char*>("r"), 1, true, &result) && result == 1);
+  before_status = {};
+  Check("pipe route did not redirect bytes to the replacement", read(pipes[0], bytes, 1) == 1 && bytes[0] == 'r');
+  Check("pipe route closes every transient snapshot", live_handles == 0);
+  Check("pipe route wakes waiting pollers after its real write", gesher::poll_wakes == 1);
+  gesher::poll_wakes = 0;
+  close(pipes[1]); pipes[1] = old_writer;
   auto pipe_reader = gesher::Capture(pipes[0]), pipe_writer = gesher::Capture(pipes[1]);
   Check("raw pipe zero read does not wait for data", gesher::ReadFileDescription(pipe_reader, nullptr, 0) == 0);
   Check("raw nonblocking empty pipe reports EAGAIN", fcntl(pipes[0], F_SETFL, O_NONBLOCK) == 0 &&

@@ -26,6 +26,10 @@ def main():
     if source.count(first) != 1 or source.count(last) != 1:
         raise ValueError("native file-I/O boundaries changed")
     implementation = source[source.index(first):source.index(last)]
+    route_begin, route_end = "void ReleaseCanceledSnapshot(", "// The caller owns an exact native object reference"
+    if source.count(route_begin) != 1 or source.count(route_end) != 1:
+        raise ValueError("native pipe-route boundaries changed")
+    pipe_route = source[source.index(route_begin):source.index(route_end)]
     snapshot_begin, snapshot_end = "int ReadFileDescription(", "\n}  // namespace gesher\n\nextern \"C\" {"
     if source.count(snapshot_begin) != 1 or source.count(snapshot_end) != 1:
         raise ValueError("snapshot file-I/O boundaries changed")
@@ -37,6 +41,7 @@ def main():
     boundary = shared[:shared.index(boundary_end)]
     template = (ROOT / "tests/native/file_io_contract_host_test.cc.in").read_text()
     for marker, value in {"@WINDOWS_IO_BOUNDARY@": boundary, "@NATIVE_FILE_IO@": implementation,
+                          "@NATIVE_PIPE_ROUTE@": pipe_route,
                           "@SNAPSHOT_FILE_IO@": snapshot_io}.items():
         if template.count(marker) != 1:
             raise ValueError("file-I/O fixture marker changed")

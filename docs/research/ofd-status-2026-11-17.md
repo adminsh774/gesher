@@ -95,6 +95,15 @@ message-pipe admission and explicit native differential gates. It is an
 intermediate candidate; the new Windows gates and independent reopening are
 not claimed complete by portable execution.
 
+The later status-ownership repair captures exact handles under publication
+locks and performs native mode discovery/changes after releasing those locks.
+Lazy capture/dup/export retain the real description without querying a blocked
+pipe under the global table mutex. Its independent differential probe proves
+unrelated-descriptor progress and safe close/reuse within a declared Linux
+boundary. Synchronous Windows file-object serialization, independent procfs
+pipe opens and bounded worker retirement remain unresolved native requirements;
+see the repair candidate for the exact evidence and limits.
+
 The existing non-file virtual-resource implementations retain their own status
 logic; the transport explicitly refuses unsupported process export. This work
 does not claim complete Linux socket/eventfd fcntl flag support. Null-path

@@ -108,6 +108,30 @@ int GetFileStatusFlags(int fd) { return fcntl(fd, F_GETFL); }
 int SetFileStatusFlags(int fd, int flags) { return fcntl(fd, F_SETFL, flags); }
 int FailWithLastError() { return errno = last_error == ERROR_NOT_ENOUGH_MEMORY ? ENOMEM : EIO, -1; }
 HANDLE HandleFromFd(int fd) { return fcntl(fd, F_GETFD) >= 0 ? FileHandle(fd) : INVALID_HANDLE_VALUE; }
+// This FILE envelope treats snapshot registry identity as a declared boundary;
+// actual capture/reuse and global-lock behavior use the complete OFD corpus.
+struct DescriptorSnapshot {
+  HANDLE handle = nullptr;
+  uintptr_t description = 0;
+  ~DescriptorSnapshot() { if (handle) CloseHandle(handle); }
+};
+using DescriptorSnapshotPtr = std::shared_ptr<DescriptorSnapshot>;
+DescriptorSnapshotPtr CaptureDescriptor(int fd) try {
+  if (HandleFromFd(fd) == INVALID_HANDLE_VALUE) return errno = EBADF, DescriptorSnapshotPtr{};
+  auto value = std::make_shared<DescriptorSnapshot>();
+  if (!DuplicateHandle(GetCurrentProcess(), FileHandle(fd), GetCurrentProcess(), &value->handle,
+                       0, false, DUPLICATE_SAME_ACCESS)) return {};
+  value->description = static_cast<uintptr_t>(fd) + 1;
+  return value;
+} catch (const std::bad_alloc&) {
+  return errno = ENOMEM, DescriptorSnapshotPtr{};
+}
+int FileDescriptionFlags(const DescriptorSnapshotPtr& snapshot) {
+  return fcntl(HandleFd(snapshot->handle), F_GETFL);
+}
+int SetFileDescriptionFlags(const DescriptorSnapshotPtr& snapshot, int flags) {
+  return fcntl(HandleFd(snapshot->handle), F_SETFL, flags);
+}
 void ForgetOfd(int) {}
 // This envelope tests FILE ownership. The Windows virtual-resource corpus in
 // stdio_virtual_contract.inc exercises the real resource registries.
@@ -204,7 +228,9 @@ static void TestAllocationOwnership() {
   if (fd < 0) return;
   fail_fdopen = true;
   check("native fdopen failure retains descriptor", adapter_fdopen(fd, "r+") == nullptr && errno == EMFILE && fcntl(fd, F_GETFD) >= 0);
-  for (int allocation = 0; allocation != 2; ++allocation) {
+  // The two snapshot allocations now precede the existing State and registry
+  // node allocations. Keep fault coverage of every pre-ownership allocation.
+  for (int allocation = 0; allocation != 4; ++allocation) {
     allocation_failure = allocation;
     FILE* stream = adapter_fdopen(fd, "r+");
     allocation_failure = -1;

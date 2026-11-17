@@ -38,6 +38,7 @@ void OpenFileDescription::SetFlags(int flags) {
   } else {
     local_flags.store(flags, std::memory_order_release);
   }
+  initialized.store(true, std::memory_order_release);
 }
 
 HANDLE OpenFileDescription::Share() {
@@ -80,6 +81,7 @@ bool OpenFileDescription::Adopt(HANDLE inherited) {
   }
   mapping = inherited;
   shared.store(view, std::memory_order_release);
+  initialized.store(true, std::memory_order_release);
   return true;
 }
 
@@ -140,6 +142,19 @@ int NativeFlags(HANDLE file) {
     if ((mode.Mode & FILE_NO_INTERMEDIATE_BUFFERING) != 0) flags |= O_DIRECT;
   }
   return type == FILE_TYPE_PIPE ? PipeStatusFlags(file, flags) : flags;
+}
+
+int InitializeSnapshotFlags(const DescriptorSnapshotPtr& snapshot) {
+  if (!snapshot || !snapshot->description || !snapshot->handle || snapshot->handle == INVALID_HANDLE_VALUE)
+    return errno = EBADF, -1;
+  auto& description = *snapshot->description;
+  if (description.initialized.load(std::memory_order_acquire)) return 0;
+  std::lock_guard<std::mutex> lock(description.mutex);
+  if (description.initialized.load(std::memory_order_acquire)) return 0;
+  const int flags = NativeFlags(snapshot->handle);
+  if (flags < 0) return -1;
+  description.SetFlags(flags);
+  return 0;
 }
 
 int ImportStartup(Table* state) try {
@@ -245,13 +260,13 @@ int InitializeLocal() {
   return table->import_error ? (errno = table->import_error, -1) : 0;
 }
 
-std::shared_ptr<OpenFileDescription> GetOrCreateLocked(int fd, HANDLE file) try {
+std::shared_ptr<OpenFileDescription> GetOrCreateLocked(int fd) try {
   auto& entry = table->entries[fd];
   if (entry) return entry;
-  int flags = NativeFlags(file);
-  if (flags < 0) return {};
+  // Capture/dup must not wait for native I/O while holding the process-wide
+  // transaction. A later snapshot operation discovers the real native flags
+  // under this description's own mutex, with a retained native handle.
   auto description = std::make_shared<OpenFileDescription>();
-  description->SetFlags(flags);
   entry = description;
   return description;
 } catch (const std::bad_alloc&) {
@@ -278,7 +293,7 @@ int DupLocal(int old_fd, int new_fd) {
   HANDLE file = HandleFromFd(old_fd);
   if (file == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
   std::lock_guard<std::mutex> lock(table->mutex);
-  auto source = GetOrCreateLocked(old_fd, file);
+  auto source = GetOrCreateLocked(old_fd);
   if (!source) return -1;
   table->entries[new_fd] = std::move(source);
   return 0;
@@ -299,55 +314,13 @@ bool LookupLocal(int fd, std::shared_ptr<OpenFileDescription>* out) {
 }
 
 int GetFlagsLocal(int fd) {
-  record_locks::DescriptorGuard guard;
-  if (!ValidSlot(fd)) return errno = EBADF, -1;
-  if (InitializeLocal() < 0) return -1;
-  HANDLE file = HandleFromFd(fd);
-  if (file == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
-  std::lock_guard<std::mutex> lock(table->mutex);
-  auto description = GetOrCreateLocked(fd, file);
-  if (!description) return -1;
-  const int flags = description->Flags();
-  return GetFileType(file) == FILE_TYPE_PIPE ? PipeStatusFlags(file, flags) : flags;
+  auto snapshot = CaptureDescriptor(fd);
+  return snapshot ? FileDescriptionFlags(snapshot) : -1;
 }
 
 int SetFlagsLocal(int fd, int arg) {
-  record_locks::DescriptorGuard guard;
-  if (!ValidSlot(fd)) return errno = EBADF, -1;
-  if (InitializeLocal() < 0) return -1;
-  HANDLE file = HandleFromFd(fd);
-  if (file == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
-  std::shared_ptr<OpenFileDescription> description;
-  {
-    std::lock_guard<std::mutex> lock(table->mutex);
-    description = GetOrCreateLocked(fd, file);
-  }
-  if (!description) return -1;
-  std::lock_guard<std::mutex> lock(description->mutex);
-  int old_flags = description->Flags();
-  if ((old_flags & O_PATH) != 0) return errno = EBADF, -1;
-  DWORD type = GetFileType(file);
-  // A raw native handle can already be unbuffered. Preserve that real mode;
-  // this backend cannot change buffering on an existing FILE_OBJECT.
-  if (((arg ^ old_flags) & O_DIRECT) != 0) return errno = EINVAL, -1;
-  if (type == FILE_TYPE_DISK && (old_flags & O_APPEND) != 0 && (arg & O_APPEND) == 0) {
-    uint32_t access = 0;
-    int error = record_locks::HandleAccess(file, &access);
-    if (error) return errno = error, -1;
-    if ((access & FILE_APPEND_DATA) != 0 && (access & FILE_WRITE_DATA) == 0) return errno = EPERM, -1;
-  }
-  // Timestamp suppression and SIGIO delivery have no implementation here.
-  // Failure is preferable to claiming a flag whose effect never occurs.
-  if (((arg ^ old_flags) & O_NOATIME) != 0) return errno = EOPNOTSUPP, -1;
-  if (type == FILE_TYPE_PIPE && ((arg ^ old_flags) & O_ASYNC) != 0) {
-    return errno = EOPNOTSUPP, -1;
-  }
-  int flags = (old_flags & ~kModifiableStatusFlags) | (arg & kModifiableStatusFlags);
-  // A normal Linux file has no fasync callback: this bit stays unchanged.
-  if (type == FILE_TYPE_DISK) flags = (flags & ~O_ASYNC) | (old_flags & O_ASYNC);
-  if (type == FILE_TYPE_PIPE && SetPipeNonBlocking(file, (flags & O_NONBLOCK) != 0) < 0) return -1;
-  description->SetFlags(flags);
-  return 0;
+  auto snapshot = CaptureDescriptor(fd);
+  return snapshot ? SetFileDescriptionFlags(snapshot, arg) : -1;
 }
 
 DescriptorSnapshotPtr Snapshot(HANDLE file, const std::shared_ptr<OpenFileDescription>& description) try {
@@ -378,7 +351,7 @@ DescriptorSnapshotPtr CaptureLocal(int fd) {
   std::shared_ptr<OpenFileDescription> description;
   {
     std::lock_guard<std::mutex> lock(table->mutex);
-    description = GetOrCreateLocked(fd, file);
+    description = GetOrCreateLocked(fd);
   }
   return description ? Snapshot(file, description) : DescriptorSnapshotPtr{};
 }
@@ -402,10 +375,7 @@ DescriptorSnapshotPtr CaptureHandleLocal(HANDLE file) try {
       if (same) { description = table->entries[fd]; break; }
     }
     if (!description) {
-      int flags = NativeFlags(file);
-      if (flags < 0) return {};
       description = std::make_shared<OpenFileDescription>();
-      description->SetFlags(flags);
     }
   }
   return Snapshot(file, description);
@@ -451,7 +421,7 @@ int SetKindLocal(int fd, DescriptorKind kind) {
   HANDLE file = HandleFromFd(fd);
   if (file == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
   std::lock_guard<std::mutex> lock(table->mutex);
-  auto description = GetOrCreateLocked(fd, file);
+  auto description = GetOrCreateLocked(fd);
   if (!description) return -1;
   description->kind = kind;
   return 0;
@@ -464,6 +434,7 @@ DescriptorKind GetKindLocal(int fd) {
 
 HANDLE ShareLocal(const DescriptorSnapshotPtr& snapshot) {
   if (!snapshot || !snapshot->description) { errno = EINVAL; return nullptr; }
+  if (InitializeSnapshotFlags(snapshot) < 0) return nullptr;
   std::lock_guard<std::mutex> lock(snapshot->description->mutex);
   return snapshot->description->Share();
 }
@@ -573,9 +544,37 @@ int AttachFileDescription(const DescriptorSnapshotPtr& snapshot, bool close_on_e
   return owner ? owner->attach(snapshot, close_on_exec) : -1;
 }
 int FileDescriptionFlags(const DescriptorSnapshotPtr& snapshot) {
-  if (!snapshot || !snapshot->description) return errno = EBADF, -1;
+  if (InitializeSnapshotFlags(snapshot) < 0) return -1;
   const int flags = snapshot->description->Flags();
   return GetFileType(snapshot->handle) == FILE_TYPE_PIPE ? PipeStatusFlags(snapshot->handle, flags) : flags;
+}
+int SetFileDescriptionFlags(const DescriptorSnapshotPtr& snapshot, int arg) {
+  if (InitializeSnapshotFlags(snapshot) < 0) return -1;
+  auto& description = *snapshot->description;
+  const HANDLE file = snapshot->handle;
+  std::lock_guard<std::mutex> lock(description.mutex);
+  const int old_flags = description.Flags();
+  if ((old_flags & O_PATH) != 0) return errno = EBADF, -1;
+  const DWORD type = GetFileType(file);
+  // A raw native handle can already be unbuffered. Preserve that real mode;
+  // this backend cannot change buffering on an existing FILE_OBJECT.
+  if (((arg ^ old_flags) & O_DIRECT) != 0) return errno = EINVAL, -1;
+  if (type == FILE_TYPE_DISK && (old_flags & O_APPEND) != 0 && (arg & O_APPEND) == 0) {
+    uint32_t access = 0;
+    int error = record_locks::HandleAccess(file, &access);
+    if (error) return errno = error, -1;
+    if ((access & FILE_APPEND_DATA) != 0 && (access & FILE_WRITE_DATA) == 0) return errno = EPERM, -1;
+  }
+  // Timestamp suppression and SIGIO delivery have no implementation here.
+  // Failure is preferable to claiming a flag whose effect never occurs.
+  if (((arg ^ old_flags) & O_NOATIME) != 0) return errno = EOPNOTSUPP, -1;
+  if (type == FILE_TYPE_PIPE && ((arg ^ old_flags) & O_ASYNC) != 0) return errno = EOPNOTSUPP, -1;
+  int flags = (old_flags & ~kModifiableStatusFlags) | (arg & kModifiableStatusFlags);
+  // A normal Linux file has no fasync callback: this bit stays unchanged.
+  if (type == FILE_TYPE_DISK) flags = (flags & ~O_ASYNC) | (old_flags & O_ASYNC);
+  if (type == FILE_TYPE_PIPE && SetPipeNonBlocking(file, (flags & O_NONBLOCK) != 0) < 0) return -1;
+  description.SetFlags(flags);
+  return 0;
 }
 int ValidateNativeFileDescription(const DescriptorSnapshotPtr& snapshot) {
   int flags = FileDescriptionFlags(snapshot);
@@ -609,12 +608,12 @@ HANDLE ShareFileDescription(const DescriptorSnapshotPtr& snapshot) {
   return owner ? owner->share(snapshot) : nullptr;
 }
 bool IsAppendMode(int fd) {
-  std::shared_ptr<OpenFileDescription> description;
-  return LookupOfd(fd, &description) && (description->Flags() & O_APPEND) != 0;
+  const int flags = GetFileStatusFlags(fd);
+  return flags >= 0 && (flags & O_APPEND) != 0;
 }
 bool IsNonBlockingMode(int fd) {
-  std::shared_ptr<OpenFileDescription> description;
-  return LookupOfd(fd, &description) && (description->Flags() & O_NONBLOCK) != 0;
+  const int flags = GetFileStatusFlags(fd);
+  return flags >= 0 && (flags & O_NONBLOCK) != 0;
 }
 
 namespace {

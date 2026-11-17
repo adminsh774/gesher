@@ -31,7 +31,11 @@ DescriptorSnapshotPtr CaptureFileHandle(HANDLE file);
 // A new descriptor alias with independent descriptor flags. The snapshot
 // retains its reference; the new slot owns an explicit native duplicate.
 int AttachFileDescription(const DescriptorSnapshotPtr& snapshot, bool close_on_exec);
+// Native inspection and mode changes can wait behind synchronous I/O. Call
+// these after releasing descriptor publication/registry locks; the snapshot
+// pins the exact object even when its original fd is closed or replaced.
 int FileDescriptionFlags(const DescriptorSnapshotPtr& snapshot);
+int SetFileDescriptionFlags(const DescriptorSnapshotPtr& snapshot, int flags);
 // Native Windows programs do not import Gesher metadata. Reject descriptions
 // whose current behavior cannot be supplied by the inherited kernel handle.
 int ValidateNativeFileDescription(const DescriptorSnapshotPtr& snapshot);

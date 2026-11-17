@@ -395,9 +395,6 @@ int fcntl(int fd, int cmd, ...) {
     va_end(pointers);
     return gesher::record_locks::DescriptorFcntl(fd, cmd, argument);
   }
-  gesher::record_locks::DescriptorGuard descriptor_guard;
-  HANDLE h = gesher::HandleFromFd(fd);
-  if (h == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
   int arg = 0;
   // Getter commands have no third argument; other supported commands take an int.
   if (cmd == F_SETFD || cmd == F_SETFL || cmd == F_DUPFD ||
@@ -407,66 +404,77 @@ int fcntl(int fd, int cmd, ...) {
     arg = va_arg(args, int);
     va_end(args);
   }
-  gesher::SocketFd state;
-  if (gesher::LookupSocket(fd, &state)) {
-    switch (cmd) {
-      case F_GETFL:
-        return O_RDWR | (state.description->nonblocking.load() ? O_NONBLOCK : 0);
-      case F_SETFL:
-        {
-          gesher::record_locks::DescriptorGuard descriptor_guard;
-          gesher::SocketFd current;
-          if (!gesher::LookupSocket(fd, &current) || current.description != state.description) return errno = EBADF, -1;
-          std::lock_guard<std::mutex> lock(state.description->status_mutex);
-          const bool on = (arg & O_NONBLOCK) != 0;
-          if (on != state.description->nonblocking.load()) {
-            if (!state.description->native_nonblocking_datagram &&
-                gesher::ws::SetNonBlocking(state.socket, on) < 0) return -1;
-            state.description->nonblocking.store(on);
+  gesher::DescriptorSnapshotPtr status_snapshot;
+  {
+    gesher::record_locks::DescriptorGuard descriptor_guard;
+    HANDLE h = gesher::HandleFromFd(fd);
+    if (h == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
+    gesher::SocketFd state;
+    if (gesher::LookupSocket(fd, &state)) {
+      switch (cmd) {
+        case F_GETFL:
+          return O_RDWR | (state.description->nonblocking.load() ? O_NONBLOCK : 0);
+        case F_SETFL:
+          {
+            gesher::record_locks::DescriptorGuard descriptor_guard;
+            gesher::SocketFd current;
+            if (!gesher::LookupSocket(fd, &current) || current.description != state.description) return errno = EBADF, -1;
+            std::lock_guard<std::mutex> lock(state.description->status_mutex);
+            const bool on = (arg & O_NONBLOCK) != 0;
+            if (on != state.description->nonblocking.load()) {
+              if (!state.description->native_nonblocking_datagram &&
+                  gesher::ws::SetNonBlocking(state.socket, on) < 0) return -1;
+              state.description->nonblocking.store(on);
+            }
           }
+          return 0;
+        case F_GETFD:
+          return FD_CLOEXEC;  // sockets are never inherited (winsock.cc)
+        case F_SETFD:
+          return 0;
+        default:
+          break;  // F_DUPFD and the rest below
+      }
+    }
+    if (std::shared_ptr<gesher::EventFd> e = gesher::LookupEventFd(fd)) {
+      if (cmd == F_GETFL) return O_RDWR | (gesher::IsNonBlocking(*e) ? O_NONBLOCK : 0);
+      if (cmd == F_SETFL) {
+        gesher::SetNonBlocking(*e, (arg & O_NONBLOCK) != 0);
+        return 0;
+      }
+    }
+    switch (cmd) {
+      case F_GETFD: {
+        DWORD flags = 0;
+        if (!GetHandleInformation(h, &flags)) return gesher::FailWithLastError();
+        return (flags & HANDLE_FLAG_INHERIT) != 0 ? 0 : FD_CLOEXEC;
+      }
+      case F_SETFD:
+        if (!SetHandleInformation(h, HANDLE_FLAG_INHERIT,
+                                  (arg & FD_CLOEXEC) != 0 ? 0 : HANDLE_FLAG_INHERIT)) {
+          return gesher::FailWithLastError();
         }
         return 0;
-      case F_GETFD:
-        return FD_CLOEXEC;  // sockets are never inherited (winsock.cc)
-      case F_SETFD:
-        return 0;
-      default:
-        break;  // F_DUPFD and the rest below
-    }
-  }
-  if (std::shared_ptr<gesher::EventFd> e = gesher::LookupEventFd(fd)) {
-    if (cmd == F_GETFL) return O_RDWR | (gesher::IsNonBlocking(*e) ? O_NONBLOCK : 0);
-    if (cmd == F_SETFL) {
-      gesher::SetNonBlocking(*e, (arg & O_NONBLOCK) != 0);
-      return 0;
-    }
-  }
-  switch (cmd) {
-    case F_GETFD: {
-      DWORD flags = 0;
-      if (!GetHandleInformation(h, &flags)) return gesher::FailWithLastError();
-      return (flags & HANDLE_FLAG_INHERIT) != 0 ? 0 : FD_CLOEXEC;
-    }
-    case F_SETFD:
-      if (!SetHandleInformation(h, HANDLE_FLAG_INHERIT,
-                                (arg & FD_CLOEXEC) != 0 ? 0 : HANDLE_FLAG_INHERIT)) {
-        return gesher::FailWithLastError();
+      case F_GETFL:
+      case F_SETFL:
+        status_snapshot = gesher::CaptureDescriptor(fd);
+        if (!status_snapshot) return -1;
+        break;
+      case F_DUPFD:
+      case F_DUPFD_CLOEXEC: {
+        return gesher::record_locks::DuplicateAtLeast(fd, static_cast<int>(arg), cmd == F_DUPFD_CLOEXEC);
       }
-      return 0;
-    case F_GETFL:
-      return gesher::GetFileStatusFlags(fd);
-    case F_SETFL:
-      return gesher::SetFileStatusFlags(fd, static_cast<int>(arg));
-    case F_DUPFD:
-    case F_DUPFD_CLOEXEC: {
-      return gesher::record_locks::DuplicateAtLeast(fd, static_cast<int>(arg), cmd == F_DUPFD_CLOEXEC);
+      case F_ADD_SEALS:
+      case F_GET_SEALS:
+        return 0;  // seals are advisory here
+      default:
+        return errno = EINVAL, -1;
     }
-    case F_ADD_SEALS:
-    case F_GET_SEALS:
-      return 0;  // seals are advisory here
-    default:
-      return errno = EINVAL, -1;
   }
+  // The snapshot retains the selected object and description across concurrent
+  // close/dup2. Native mode operations must not hold the publication lock.
+  return cmd == F_GETFL ? gesher::FileDescriptionFlags(status_snapshot)
+                       : gesher::SetFileDescriptionFlags(status_snapshot, arg);
 }
 
 // flock: a lock on one byte far beyond any file's data (LockFileEx locks

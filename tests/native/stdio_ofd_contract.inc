@@ -9,6 +9,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <wchar.h>
+#if defined(__BIONIC__) && __ANDROID_API__ < 28
+#include <dlfcn.h>
+#endif
 
 static int stdio_bytes_equal(int fd, const char* expected) {
   char bytes[128];
@@ -22,7 +25,15 @@ static void* stdio_try_locked(void* argument) {
   if (acquired) funlockfile(stream);
   // The owner thread is only holding the lock, not accessing the buffer. This
   // call must not acquire that stream lock implicitly.
+#if defined(__BIONIC__) && __ANDROID_API__ < 28
+  // fwrite_unlocked was added in API 28. Keep the ELF fixture's API 26 floor
+  // and require the real runtime export; absence fails the same contract.
+  typedef size_t (*write_unlocked_fn)(const void*, size_t, size_t, FILE*);
+  write_unlocked_fn write_unlocked = (write_unlocked_fn)dlsym(RTLD_DEFAULT, "fwrite_unlocked");
+  int wrote = write_unlocked != NULL && write_unlocked("u", 1, 1, stream) == 1;
+#else
   int wrote = fwrite_unlocked("u", 1, 1, stream) == 1;
+#endif
   return (void*)(intptr_t)(acquired || !wrote);
 }
 static void* stdio_flush_all(void* unused) {

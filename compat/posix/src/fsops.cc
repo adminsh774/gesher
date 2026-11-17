@@ -22,6 +22,7 @@
 #include <string>
 
 #include <gesher/reserved_names.h>
+#include <gesher/file_description.h>
 
 #include "internal.h"
 #include "descriptor_resources.h"
@@ -639,13 +640,20 @@ FILE* fdopen(int fd, const char* mode) {
   int requested;
   char crt_mode[4];
   if (!ParseMode(mode, &requested, crt_mode)) return errno = EINVAL, nullptr;
-  gesher::record_locks::DescriptorGuard descriptors;
-  int actual = gesher::GetFileStatusFlags(fd);
+  auto snapshot = gesher::CaptureDescriptor(fd);
+  if (!snapshot) return nullptr;
+  int actual = gesher::FileDescriptionFlags(snapshot);
   if (actual < 0) return nullptr;
   int access = actual & O_ACCMODE;
   if (access != O_RDWR && access != (requested & O_ACCMODE)) return errno = EINVAL, nullptr;
   if ((requested & O_APPEND) != 0 && (actual & O_APPEND) == 0 &&
-      gesher::SetFileStatusFlags(fd, actual | O_APPEND) < 0) return nullptr;
+      gesher::SetFileDescriptionFlags(snapshot, actual | O_APPEND) < 0) return nullptr;
+  gesher::record_locks::DescriptorGuard descriptors;
+  auto current = gesher::CaptureDescriptor(fd);
+  if (!current) return nullptr;
+  // Never attach the FILE to a replacement installed while native status
+  // inspection was in progress. The original object remained pinned above.
+  if (current->description != snapshot->description) return errno = EBADF, nullptr;
   if ((requested & O_CLOEXEC) != 0) {
     int flags = fcntl(fd, F_GETFD);
     if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) return nullptr;

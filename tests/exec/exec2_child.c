@@ -11,6 +11,9 @@
 //   libexec2child.so sigloop          install SIGTERM/SIGUSR1 handlers, print
 //                                     "child-ready", then wait; SIGTERM exits
 //                                     42 if a SIGUSR1 arrived first, else 43
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1  // pwritev in the shared OFD process corpus
+#endif
 #include <dlfcn.h>
 #include <android/log.h>
 #include <signal.h>
