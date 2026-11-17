@@ -305,10 +305,10 @@ Check 'services: URI delegation, provider patterns, exact identities and scoped 
 $appOpsOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'AppOpsContractTest') 90
 $appOpsCode = $LASTEXITCODE
-Check 'services: real AppOps state machine, mode enforcement, callbacks and persistence' {
+Check 'services: AppOps defaults, authority, attributed delivery, foreground lifecycle and signed persistence' {
   $global:LASTEXITCODE = $appOpsCode
   $appOpsOut
-} @('AppOpsContractTest all passed:')
+} @('AppOpsContractTest all passed: 71 checks; binder=true')
 
 $intentUriGrantsOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'IntentUriGrantContractTest') 90

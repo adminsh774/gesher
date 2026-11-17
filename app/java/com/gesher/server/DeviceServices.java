@@ -11,7 +11,6 @@ import android.app.admin.IDevicePolicyManager;
 import android.app.trust.ITrustManager;
 import android.app.usage.IUsageStatsManager;
 import android.content.ComponentName;
-import android.content.pm.IPackageManager;
 import android.content.pm.IShortcutService;
 import android.content.pm.ParceledListSlice;
 import android.content.pm.verify.domain.DomainOwner;
@@ -99,19 +98,6 @@ final class DeviceServices {
         @Override public boolean unregisterThermalHeadroomListener(android.os.IThermalHeadroomListener l) {
             java.util.Objects.requireNonNull(l, "listener");
             return false;
-        }
-    }
-
-    /**
-     * {@code appops}: real AppOps state machine and mode enforcement (Track F, ADR 0038).
-     */
-    static final class AppOpsService extends com.gesher.server.AppOpsService {
-        public AppOpsService() {
-            super();
-        }
-
-        public AppOpsService(IPackageManager pm) {
-            super(pm);
         }
     }
 

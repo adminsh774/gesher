@@ -212,10 +212,6 @@ public final class SystemServer {
         // Host installation can precede the first application bind. Initialize the
         // server's writable region and real package-cache nonce before publishing APIs.
         created.am.invalidatePermissionCaches();
-        // Providers answering other processes ask the permission checker.
-        services.put("permission_checker", StandIn.of(
-                android.permission.IPermissionChecker.class,
-                new Services.PermissionChecker()).asBinder());
         startAppProcessesOnDemand(created.atm, created.pm);
         PersistentDevice device = null;
         if (persistent) {

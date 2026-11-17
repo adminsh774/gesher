@@ -438,6 +438,37 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         mAm = am;
     }
 
+    /** Snapshot actual process/activity state without nesting a service-controller monitor. */
+    synchronized java.util.Map<Integer, AppOpsService.UidState> appOpsUidStates() {
+        java.util.Map<Integer, AppOpsService.UidState> result = new java.util.HashMap<>();
+        for (ProcessRecord app : mProcesses) {
+            if (app.dead || app.exiting || app.pidSuperseded || !app.ready
+                    || app.packageCode == null || mPm.get(app.packageName) != app.packageCode
+                    || mPm.isRemovalPending(app.packageName)) continue;
+            int state = android.app.AppOpsManager.UID_STATE_CACHED;
+            int capabilities = 0;
+            for (ActivityRecord activity : app.activities) {
+                if (activity.finishing || mHiddenTasks.contains(activity.taskId)) continue;
+                if (activity.state == State.RESUMED || activity.state == State.RESUMING) {
+                    state = android.app.AppOpsManager.UID_STATE_TOP;
+                    capabilities = android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_LOCATION
+                            | android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_CAMERA
+                            | android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_MICROPHONE
+                            | android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_AUDIO_CONTROL;
+                    break;
+                }
+                if (activity.state == State.STARTED || activity.state == State.PAUSING
+                        || activity.state == State.PAUSED) state = android.app.AppOpsManager.UID_STATE_FOREGROUND;
+            }
+            AppOpsService.UidState previous = result.get(app.packageCode.uid());
+            if (previous != null) {
+                state = Math.min(state, previous.state()); capabilities |= previous.capabilities();
+            }
+            result.put(app.packageCode.uid(), new AppOpsService.UidState(state, capabilities));
+        }
+        return result;
+    }
+
     UriGrants uriGrants() {
         return mAm != null ? mAm.uriGrants() : null;
     }
@@ -2004,6 +2035,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
      * Guarded by this.
      */
     private void updateIdle() {
+        if (mAm != null) mPm.appOps().requestUidStateRefresh();
         if (hasActivityLocked()) {
             mIdleSince = 0;
         } else if (mIdleSince == 0) {
@@ -3174,6 +3206,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
      * resumed (multi-resume).
      */
     private void updateTopResumed() {
+        if (mAm != null) mPm.appOps().requestUidStateRefresh();
         ActivityRecord lose = null;
         ActivityRecord gain = null;
         int displayRotation;

@@ -97,7 +97,29 @@ public final class PackageManagerService extends IPackageManager.Default {
         for (Consumer<String> action : cleanup) action.accept(name);
     }
 
+    private volatile AppOpsService mAppOps;
+    private final java.util.concurrent.CopyOnWriteArrayList<Consumer<ApkPackage>> mPackageChanges =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
     public PermissionPolicy permissions() { return mPermissions; }
+
+    /** One policy/operation ledger shared by the Binder and all server consumers. */
+    public AppOpsService appOps() {
+        AppOpsService service = mAppOps;
+        if (service != null) return service;
+        synchronized (this) {
+            if (mAppOps == null) mAppOps = new AppOpsService(this, mTransientEnabled ? null
+                    : new java.io.File(Device.dataDir(), "system/appops.xml"));
+            return mAppOps;
+        }
+    }
+
+    /** Runs after durable publication, outside the installer and package monitors. */
+    public AutoCloseable onPackageChange(Consumer<ApkPackage> listener) {
+        mPackageChanges.add(java.util.Objects.requireNonNull(listener));
+        return () -> mPackageChanges.remove(listener);
+    }
+
 
     @Override public String[] getSystemSharedLibraryNames() {
         try {
@@ -193,6 +215,11 @@ public final class PackageManagerService extends IPackageManager.Default {
             // A session also holds the installer monitor around its final consent/code
             // checks. Do not call application Binders until that outer lock is released.
             synchronized (publicationLock) { }
+            if (get(name) != pkg || isRemovalPending(name)) return;
+            for (Consumer<ApkPackage> listener : mPackageChanges) {
+                if (get(name) != pkg || isRemovalPending(name)) return;
+                listener.accept(pkg);
+            }
             Intent added = new Intent(Intent.ACTION_PACKAGE_ADDED, Uri.fromParts("package", name, null))
                     .putExtra(Intent.EXTRA_UID, uid)
                     .putExtra(Intent.EXTRA_REPLACING, replacing);

@@ -31,7 +31,9 @@ public final class PermissionPolicy extends IPermissionManager.Default {
     private final PermissionCatalog mCatalog;
     private final File mFile = new File(Device.dataDir(), "system/runtime-permissions");
     private final Properties mDecisions;
-    private final Map<IBinder, AttributionSourceState> mAttributions = new WeakHashMap<>();
+    private record AttributionOwner(String name, int uid, ApkPackage code) { }
+    private record RegisteredAttribution(AttributionSourceState source, List<AttributionOwner> owners) { }
+    private final Map<IBinder, RegisteredAttribution> mAttributions = new WeakHashMap<>();
     private volatile CallerIdentity mCallers;
 
     PermissionPolicy(PackageManagerService pm) {
@@ -129,6 +131,10 @@ public final class PermissionPolicy extends IPermissionManager.Default {
 
     /** Uninstall must revoke decisions even if a later install reuses a package UID. */
     public void forgetPackage(String packageName) {
+        synchronized (mAttributions) {
+            mAttributions.values().removeIf(saved -> AppOpsAttribution.chain(saved.source).stream()
+                    .anyMatch(source -> packageName.equals(source.packageName)));
+        }
         synchronized (this) {
             Properties before = new Properties();
             before.putAll(mDecisions);
@@ -257,26 +263,57 @@ public final class PermissionPolicy extends IPermissionManager.Default {
     @Override public IBinder registerAttributionSource(AttributionSourceState source) {
         CallerIdentity callers = mCallers;
         if (source == null || callers == null) throw new SecurityException("Unregistered attribution caller");
-        callers.requirePackage(source.packageName);
-        ApkPackage pkg = mPm.get(source.packageName);
-        if (pkg == null || pkg.uid() != source.uid
-                || (source.pid != -1 && source.pid != callers.callerPid())) throw new SecurityException("Forged attribution identity");
+        List<AttributionSourceState> chain = AppOpsAttribution.chain(source);
+        boolean trusted = callers.isSystem() || checkProcessPermission(
+                android.Manifest.permission.UPDATE_APP_OPS_STATS, callers.callerPid(), callers.callerUid())
+                == PackageManager.PERMISSION_GRANTED;
+        if (!trusted) {
+            String name = callers.callerPackage();
+            ApkPackage caller = mPm.get(name);
+            if (caller == null || caller.uid() != source.uid || callers.callerUid() != source.uid
+                    || source.pid != -1 && source.pid != callers.callerPid()) {
+                throw new SecurityException("Attribution source does not belong to the caller");
+            }
+        }
+        List<AttributionOwner> owners = new ArrayList<>();
+        for (AttributionSourceState node : chain) {
+            ApkPackage pkg = node.packageName == null ? null : mPm.get(node.packageName);
+            boolean platform = "android".equals(node.packageName) && node.uid == Process.SYSTEM_UID;
+            if (!platform && (pkg == null || pkg.uid() != node.uid || mPm.isRemovalPending(pkg.packageName))) {
+                throw new SecurityException("Unknown attribution package/UID");
+            }
+            owners.add(new AttributionOwner(node.packageName, node.uid, pkg));
+        }
+        if (chain.size() > 1 && !isRegisteredAttributionSource(chain.get(1))) {
+            throw new SecurityException("Attribution next link is not registered");
+        }
         IBinder token = source.token == null ? new Binder() : source.token;
-        AttributionSourceState saved = new AttributionSourceState();
-        saved.uid = source.uid; saved.pid = callers.callerPid(); saved.packageName = source.packageName;
-        synchronized (mAttributions) { mAttributions.put(token, saved); }
+        AttributionSourceState saved = AppOpsAttribution.copy(source, false);
+        synchronized (mAttributions) { mAttributions.put(token, new RegisteredAttribution(saved, List.copyOf(owners))); }
         return token;
     }
     @Override public boolean isRegisteredAttributionSource(AttributionSourceState source) {
         if (source == null || source.token == null) return false;
         synchronized (mAttributions) {
-            AttributionSourceState saved = mAttributions.get(source.token);
-            return saved != null && saved.uid == source.uid && java.util.Objects.equals(saved.packageName, source.packageName)
-                    && (source.pid == -1 || source.pid == saved.pid);
+            RegisteredAttribution saved = mAttributions.get(source.token);
+            if (saved == null || !attributionOwnersCurrent(saved)) return false;
+            try { return AppOpsAttribution.equalExceptRootToken(saved.source, source); }
+            catch (IllegalArgumentException malformed) { return false; }
         }
     }
+    private boolean attributionOwnersCurrent(RegisteredAttribution saved) {
+        for (AttributionOwner owner : saved.owners) {
+            if (mPm.get(owner.name) != owner.code || mPm.isRemovalPending(owner.name)) return false;
+            if (owner.code != null && owner.code.uid() != owner.uid) return false;
+        }
+        return true;
+    }
     @Override public int getRegisteredAttributionSourceCount(int uid) {
-        synchronized (mAttributions) { return (int)mAttributions.values().stream().filter(s -> s.uid == uid).count(); }
+        if (mCallers == null || !mCallers.isSystem()) throw new SecurityException("Attribution count requires system authority");
+        synchronized (mAttributions) {
+            mAttributions.values().removeIf(saved -> !attributionOwnersCurrent(saved));
+            return (int)mAttributions.values().stream().filter(saved -> saved.source.uid == uid).count();
+        }
     }
 
     int checkAttribution(String permission, AttributionSourceState source, boolean fromDatasource) {
