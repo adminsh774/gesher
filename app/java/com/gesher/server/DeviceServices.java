@@ -11,6 +11,7 @@ import android.app.admin.IDevicePolicyManager;
 import android.app.trust.ITrustManager;
 import android.app.usage.IUsageStatsManager;
 import android.content.ComponentName;
+import android.content.pm.IPackageManager;
 import android.content.pm.IShortcutService;
 import android.content.pm.ParceledListSlice;
 import android.content.pm.verify.domain.DomainOwner;
