@@ -140,12 +140,14 @@ public final class ChooserContractTest {
         volatile BooleanSupplier active;
         volatile int selected = -1;
         volatile boolean available = true;
+        volatile Throwable failure;
         Object dialog() throws Exception {
             Class<?> api = type("IntentChooser$Dialog");
             return Proxy.newProxyInstance(api.getClassLoader(), new Class<?>[]{api}, (p, m, args) -> {
                 if (m.getName().equals("available")) return available;
                 labels = (String[])args[2]; active = (BooleanSupplier)args[4]; shown.countDown();
                 if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("Fixture input was not released");
+                if (failure != null) throw failure;
                 return selected;
             });
         }
@@ -225,6 +227,17 @@ public final class ChooserContractTest {
             return null;
         }
         int pending() throws Exception { synchronized (tasks) { return ((Map<?,?>)get(tasks, "mIntentChoosers")).size(); } }
+        long idleSince() throws Exception { return (Long)invoke(tasks, "idleSince", new Class<?>[0]); }
+        @SuppressWarnings("unchecked") void withoutActivities() throws Exception {
+            synchronized (tasks) {
+                records().clear();
+                for (Object process : (List<?>)get(tasks, "mProcesses")) ((List<?>)get(process, "activities")).clear();
+                ((List<Integer>)get(tasks, "mTaskOrder")).clear();
+                // An existing idle interval must not survive a complete UI operation,
+                // even when the idle monitor never polls while that UI is open.
+                set(tasks, "mIdleSince", 1L);
+            }
+        }
         void settled() throws Exception {
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
             while (pending() != 0 && System.nanoTime() < deadline) Thread.sleep(5);
@@ -611,6 +624,10 @@ public final class ChooserContractTest {
                 h.pm.setComponentEnabledSetting(new ComponentName(FIRST, FIRST + ".Share"),
                         PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.DONT_KILL_APP, 0, OWNER);
             }
+            if (reason.equals("activity") || reason.equals("process")) {
+                check(!h.ui.active.getAsBoolean() && h.idleSince() == 0,
+                        "Retirement made the device idle before the native chooser closed");
+            }
             h.ui.choose(0); h.settled();
             check(h.launched(FIRST + ".Share") == null, "Retired choice launched after " + reason);
             check(((Integer)get(h.root, "chooserCoverCount")) == 0, "Retirement leaked lifecycle coverage: " + reason);
@@ -723,8 +740,75 @@ public final class ChooserContractTest {
         check(raced.launched(FIRST + ".Share") == null && !raced.access(raced.target1, uri, 1),
                 "Caller retirement during final activity publication escaped the capability check");
     }
+    @SuppressWarnings("unchecked")
+    private static void idleOwnership() throws Exception {
+        for (String mode : List.of("cancel", "no-poll", "open-failure", "exception", "linkage", "process", "caller-code", "accept")) {
+            Harness h = new Harness();
+            check(h.idleSince() == 0, "Ordinary activity did not keep the device busy");
+            h.withoutActivities();
+            check(h.idleSince() == 1, "Activity-free fixture was not idle before chooser admission");
+            check(h.start(chooser().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null, -1) == ActivityManager.START_SUCCESS,
+                    "Activity-free chooser was not admitted: " + mode);
+            h.ui.displayed();
+            check(h.records().isEmpty() && h.pending() == 1 && h.ui.active.getAsBoolean(),
+                    "Native chooser fabricated an activity or lost its reservation: " + mode);
+            check((Long)get(h.tasks, "mIdleSince") == 0, "Chooser admission did not restart the idle clock: " + mode);
+            if (!mode.equals("no-poll")) check(h.idleSince() == 0, "Open chooser allowed device idle shutdown: " + mode);
+            if (mode.equals("exception")) h.ui.failure = new IllegalStateException("Fixture native window failed");
+            if (mode.equals("linkage")) h.ui.failure = new UnsatisfiedLinkError("Fixture native backend disappeared");
+            if (mode.equals("process")) invoke(h.tasks, "processDied", new Class<?>[]{h.ownerProcess.getClass()}, h.ownerProcess);
+            if (mode.equals("caller-code")) ((Map<String, ApkPackage>)get(h.pm, "mPackages")).put(OWNER, code(OWNER, UID));
+            if (mode.equals("process") || mode.equals("caller-code")) {
+                check(!h.ui.active.getAsBoolean() && h.idleSince() == 0,
+                        "Retired owner released device use before its native window closed: " + mode);
+            }
+            long closedAfter = SystemClock.uptimeMillis();
+            h.ui.choose(mode.equals("open-failure") ? -3 : mode.equals("accept") ? 1 : -1);
+            h.settled();
+            if (mode.equals("accept")) {
+                Object target = h.launched(SECOND + ".Share");
+                check(target != null && h.idleSince() == 0, "Accepted chooser lost ordinary activity busy ownership");
+                long identity = Binder.clearCallingIdentity();
+                try {
+                    Binder.restoreCallingIdentity(((long)(UID + 2) << 32) | (PID + 2));
+                    h.second.controller.finishActivity(token(target), Activity.RESULT_CANCELED, null, 0);
+                } finally { Binder.restoreCallingIdentity(identity); }
+            }
+            long finishedIdle = (Long)get(h.tasks, "mIdleSince");
+            check(h.records().isEmpty() && h.pending() == 0 && finishedIdle >= closedAfter && finishedIdle > 1,
+                    "Chooser completion leaked busy ownership or retained its old idle interval: " + mode);
+            check(h.idleSince() == finishedIdle && h.owner.results.isEmpty(),
+                    "Completed headless chooser restarted idle again or invented an activity result: " + mode);
+        }
+        Harness unavailable = new Harness(); unavailable.withoutActivities(); unavailable.ui.available = false;
+        check(unavailable.start(chooser().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null, -1)
+                == ActivityManager.START_INTENT_NOT_RESOLVED && unavailable.pending() == 0 && unavailable.idleSince() == 1,
+                "Unavailable chooser acquired or leaked busy ownership");
+
+        Harness concurrent = new Harness(); concurrent.withoutActivities();
+        concurrent.start(chooser().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null, -1); concurrent.ui.displayed();
+        Selection secondUi = new Selection(); set(concurrent.tasks, "mIntentChooserDialog", secondUi.dialog());
+        long identity = Binder.clearCallingIdentity();
+        try {
+            Binder.restoreCallingIdentity(((long)(UID + 1) << 32) | (PID + 1));
+            check(concurrent.api.startActivity(concurrent.first, FIRST, null,
+                    chooser().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null, null, null, -1, 0, null, null)
+                    == ActivityManager.START_SUCCESS, "Second live caller's chooser was not admitted");
+        } finally { Binder.restoreCallingIdentity(identity); }
+        secondUi.displayed(); check(concurrent.pending() == 2, "Concurrent chooser reservations were lost");
+        concurrent.ui.choose(-1);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (concurrent.pending() != 1 && System.nanoTime() < deadline) Thread.sleep(5);
+        check(concurrent.pending() == 1 && secondUi.active.getAsBoolean() && concurrent.idleSince() == 0,
+                "Closing one chooser released another chooser's device use");
+        long closedAfter = SystemClock.uptimeMillis();
+        secondUi.choose(-1); concurrent.settled();
+        check(concurrent.records().isEmpty() && concurrent.idleSince() >= closedAfter,
+                "Last chooser did not start a fresh idle interval");
+    }
     public static int run(boolean binder) throws Exception {
         realBinder = binder; checks = 0;
+        idleOwnership();
         validation(); selectionAndGrants(); cancellation(); initialsAndSingle(); sharedUid(); selectors(); providerTypes();
         retirement(); flagsAndSuspension(); callback();
         return checks;

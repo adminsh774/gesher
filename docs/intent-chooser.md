@@ -42,6 +42,16 @@ and target generations again. Once a target is accepted, its lifecycle and grant
 belong to its normal ActivityRecord. Chooser cleanup removes its reservation and
 releases its pause coverage exactly once.
 
+An accepted chooser reservation also keeps the runtime busy until its worker has
+closed the native window and completed cleanup. This includes `NEW_TASK` requests
+from a process with no ActivityRecord. Caller retirement makes the window's
+lifetime predicate false, but does not make the device idle while that window is
+still closing. Admission clears the old idle interval; final cleanup starts a
+fresh interval when no activity or other chooser remains, even if the idle
+monitor never polled during the operation. A selected activity then owns its
+ordinary busy lifetime. Backend failure and cancellation release the same
+reservation without creating a synthetic activity.
+
 MIME resolution uses a private platform-attributed resolver with the chooser's
 privileged metadata authority. The real `ContentResolver` and provider transport
 perform `getTypeAsync` and its timeout/error handling. This can obtain a protected
@@ -91,6 +101,9 @@ suppressed for cancellation and failed admission. It also checks malformed input
 exclusions, unresolved/capped initials, single-choice preferences, suspended rows,
 task flags, late pause acknowledgment, hidden tasks, code replacement, process and
 activity death, and retirement during final publication.
+Activity-free chooser tests also cover idle shutdown ownership through selection,
+cancellation, native open failure, exceptions, caller retirement and concurrent
+choosers, including a complete operation between idle-monitor polls.
 The same suite covers same-UID private/protected components and unrelated-UID
 denial, selectors in primary/initial/alternate payloads, provider-backed MIME
 resolution, explicit type precedence, unknown/error responses, protected full MIME

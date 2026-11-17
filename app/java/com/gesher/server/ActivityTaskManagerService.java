@@ -642,6 +642,9 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                 covered.resumeAfterChooser = true;
                 if (taskId >= 0) { mHiddenTasks.remove(taskId); focusTaskLocked(taskId); }
             }
+            // A chooser can be the only visible UI (NEW_TASK without an ActivityRecord).
+            // Its real reservation owns device use through the native worker's cleanup.
+            updateIdle();
         }
         try {
             if (choice.newTask && choice.origin != null && requestCode >= 0) {
@@ -751,6 +754,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                             && !mHiddenTasks.contains(covered.taskId);
                 }
             }
+            updateIdle();
             notifyAll();
         }
         if (deliver) deliverResult(choice.origin, choice.resultWho, choice.requestCode,
@@ -2236,12 +2240,12 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
     }
 
     /**
-     * An activity restarts the idle clock; without one it runs (from the activity's end).
+     * Activities and pending chooser UI restart the idle clock; when both end it runs.
      * Whether a background process keeps the device busy is asked by {@link #idleSince}.
      * Guarded by this.
      */
     private void updateIdle() {
-        if (hasActivityLocked()) {
+        if (hasActivityLocked() || !mIntentChoosers.isEmpty()) {
             mIdleSince = 0;
         } else if (mIdleSince == 0) {
             mIdleSince = SystemClock.uptimeMillis();
@@ -2251,8 +2255,8 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
     /**
      * Since when the device is idle (for its idle shutdown); 0 while it is busy.
      *
-     * <p>Busy: some activity exists, or an app process (GMS's aside, as before) is perceptible
-     * to the user without one: it runs a foreground service
+     * <p>Busy: some activity or native intent chooser exists, or an app process (GMS's
+     * aside, as before) is perceptible to the user without one: it runs a foreground service
      * ({@link ActivityManagerService#keepsDeviceBusy}). Both restart the idle clock. An app
      * process with neither is cached, as Android ranks a process whose activities are gone:
      * it is kept (for a fast relaunch) but does not hold the device, also when it runs a
