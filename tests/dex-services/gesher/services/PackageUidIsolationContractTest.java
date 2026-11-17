@@ -7,6 +7,8 @@ package gesher.services;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.PermissionInfo;
+import android.content.pm.Signature;
+import android.content.pm.SigningDetails;
 import android.os.Process;
 import com.android.internal.pm.parsing.pkg.PackageImpl;
 import com.android.internal.pm.pkg.component.ParsedPermissionImpl;
@@ -34,6 +36,8 @@ import sun.misc.Unsafe;
 public final class PackageUidIsolationContractTest {
     private static Unsafe unsafe;
     private static int checks = 0;
+    private static Signature[] verifiedFixture;
+    private static boolean art;
 
     private static void check(boolean condition, String message) {
         if (!condition) throw new AssertionError(message);
@@ -58,6 +62,7 @@ public final class PackageUidIsolationContractTest {
     private static ApkPackage createPackage(String name, int uid, String sharedUserId,
             String... permissions) throws Exception {
         PackageImpl parsed = (PackageImpl) PackageImpl.forTesting(name, "/fixture/" + name + "/base.apk");
+        parsed.setTargetSdkVersion(36);
         if (sharedUserId != null && !sharedUserId.isEmpty()) {
             parsed.setSharedUserId(sharedUserId);
         }
@@ -82,24 +87,83 @@ public final class PackageUidIsolationContractTest {
         return code;
     }
 
+    private static ApkPackage pending(String name, String group, Signature[] signatures) throws Exception {
+        ApkPackage pkg = createPackage(name, -1, group);
+        set(pkg, "mUidPending", true);
+        set(pkg, "mSigningIdentityChecked", true);
+        set(pkg, "mVerifiedSignatures", signatures);
+        set(pkg, "mVerifiedSignatureSchemeVersion", SigningDetails.SignatureSchemeVersion.SIGNING_BLOCK_V2);
+        return pkg;
+    }
+
+    private static ApkPackage signedPending(String name, String group, File fixture) throws Exception {
+        ApkPackage pkg = pending(name, group, null);
+        set(pkg, "apkPath", fixture.getCanonicalPath());
+        set(pkg, "mSigningIdentityChecked", false);
+        return pkg;
+    }
+
+    private static int admitShared(String name, String group) throws Exception {
+        ApkPackage pkg = pending(name, group, verifiedFixture);
+        new PackageManagerService(List.of(pkg));
+        check(pkg.applicationInfo(0).uid == pkg.uid() && pkg.uid() >= 10000,
+                "Application metadata must expose the admitted UID, not the pending parser identity");
+        return pkg.uid();
+    }
+
+    private interface Call { void run() throws Exception; }
+    private static void denied(Call call, String message) throws Exception {
+        try { call.run(); }
+        catch (java.lang.reflect.InvocationTargetException wrapped) {
+            if (wrapped.getCause() instanceof SecurityException) { checks++; return; }
+            throw wrapped;
+        }
+        catch (SecurityException expected) { checks++; return; }
+        throw new AssertionError(message);
+    }
+    private static Properties registry(File data) throws Exception {
+        Properties result = new Properties();
+        File path = new File(data, "system/package-uids");
+        if (path.isFile()) try (FileInputStream input = new FileInputStream(path)) { result.load(input); }
+        return result;
+    }
+    private static Object prepare(ApkPackage pkg) throws Exception {
+        var method = PackageUids.class.getDeclaredMethod("prepare", java.util.Collection.class, java.util.Collection.class);
+        method.setAccessible(true); return method.invoke(null, List.of(pkg), List.of());
+    }
+    private static void transaction(Object value, String method) throws Exception {
+        var call = value.getClass().getDeclaredMethod(method); call.setAccessible(true); call.invoke(value);
+    }
+
     public static void main(String[] args) throws Exception {
-        System.loadLibrary("android_runtime");
-        String root = System.getenv("ANDROID_ROOT");
-        if (root != null) {
-            try {
-                android.content.res.AssetManager.createSystemAssetsInZygoteLocked(false,
-                        root + "/framework/framework-res.apk");
-            } catch (Throwable ignored) {}
+        if (args.length != 1) throw new IllegalArgumentException("Pass a valid signed APK fixture");
+        run(true, args[0]);
+    }
+
+    public static void run(boolean onArt, String signedFixture) throws Exception {
+        art = onArt;
+        if (art) {
+            System.loadLibrary("android_runtime");
+            android.content.res.AssetManager.createSystemAssetsInZygoteLocked(false,
+                    System.getenv("ANDROID_ROOT") + "/framework/framework-res.apk");
         }
         Field f = Unsafe.class.getDeclaredField("theUnsafe");
         f.setAccessible(true);
         unsafe = (Unsafe) f.get(null);
 
-        File tempDir = Files.createTempDirectory("gesher-uid-test-").toFile();
+        File tempDir = art ? Files.createTempDirectory("gesher-uid-test-").toFile()
+                : new File(System.getenv("ANDROID_DATA"));
+        Files.createDirectories(tempDir.toPath());
         try {
-            android.system.Os.setenv("ANDROID_DATA", tempDir.getAbsolutePath(), true);
+            if (art) android.system.Os.setenv("ANDROID_DATA", tempDir.getAbsolutePath(), true);
             // Verify default non-GMS mode still performs distinct UID allocation
-            android.system.Os.setenv("GESHER_MICROG_SPOOF", "0", true);
+            verifiedFixture = ApkPackage.verifySignatures(signedFixture);
+            check(verifiedFixture != null && verifiedFixture.length != 0, "Fixture signing identity must verify");
+            if (art) {
+                ApkPackage archive = ApkPackage.parse(signedFixture);
+                check(archive.uid() == -1, "Parsing an archive must not allocate an installed UID");
+                check(!new File(tempDir, "system/package-uids").exists(), "Archive parsing must not persist identity membership");
+            }
 
             // Test 1: Distinct UID allocation for standard packages
             int uid1 = PackageUids.uidFor("com.example.app1");
@@ -119,8 +183,8 @@ public final class PackageUidIsolationContractTest {
 
             // Test 3: Shared UID allocation with android:sharedUserId
             String sharedGroup = "com.example.shared.group";
-            int sharedUid1 = PackageUids.uidFor("com.example.shared.a", sharedGroup);
-            int sharedUid2 = PackageUids.uidFor("com.example.shared.b", sharedGroup);
+            int sharedUid1 = admitShared("com.example.shared.a", sharedGroup);
+            int sharedUid2 = admitShared("com.example.shared.b", sharedGroup);
 
             check(sharedUid1 >= 10000 && sharedUid1 <= 19999, "Shared UID must be in application UID range");
             check(sharedUid1 == sharedUid2, "Packages with identical sharedUserId must share the same UID");
@@ -131,7 +195,7 @@ public final class PackageUidIsolationContractTest {
 
             // Test 4: Second distinct shared group gets a different shared UID
             String otherGroup = "com.example.other.group";
-            int otherSharedUid = PackageUids.uidFor("com.example.other.c", otherGroup);
+            int otherSharedUid = admitShared("com.example.other.c", otherGroup);
             check(otherSharedUid != sharedUid1, "Different sharedUserId groups must receive distinct UIDs");
 
             // Test 5: Durability across registry reopening
@@ -232,8 +296,19 @@ public final class PackageUidIsolationContractTest {
                     "An unknown UID retains its null position in bulk names");
 
             // Test 9: Permission isolation across distinct UIDs and sharing within sharedUserId
-            android.system.Os.setenv("GESHER_MICROG_SPOOF", "1", true);
+
             PermissionPolicy policy = pms.permissions();
+            if (!art) {
+                // Host-only metadata boundary: no Android resources are installed in
+                // the JVM. Runtime permission decisions execute the production policy.
+                Field catalogField = PermissionPolicy.class.getDeclaredField("mCatalog");
+                catalogField.setAccessible(true); Object catalog = catalogField.get(policy);
+                Field loaded = catalog.getClass().getDeclaredField("mLoaded"); loaded.setAccessible(true); loaded.set(catalog, true);
+                Field definitions = catalog.getClass().getDeclaredField("mFramework"); definitions.setAccessible(true);
+                PermissionInfo definition = new PermissionInfo(); definition.name = perm; definition.packageName = "android";
+                definition.protectionLevel = PermissionInfo.PROTECTION_DANGEROUS;
+                ((java.util.Map<String, PermissionInfo>) definitions.get(catalog)).put(perm, definition);
+            }
             // Initially, permissions are not granted
             check(policy.checkUidPermission(uid1, perm, 0) == PackageManager.PERMISSION_DENIED,
                     "uid1 must initially have permission denied");
@@ -275,11 +350,92 @@ public final class PackageUidIsolationContractTest {
             check(policy.checkPermission("com.example.app2", perm) == PackageManager.PERMISSION_DENIED,
                     "app2 must remain denied when app1 was granted (isolation)");
 
+            // An authenticated package in the same UID sees the shared permission
+            // even when only its sibling requested it in the manifest.
+            ApkPackage sibling = createPackage("com.example.shared.sibling", sharedUid1, sharedGroup);
+            var add = PackageManagerService.class.getDeclaredMethod("add", ApkPackage.class); add.setAccessible(true);
+            add.invoke(pms, sibling);
+            check(policy.checkPermission(sibling.packageName, perm) == PackageManager.PERMISSION_GRANTED,
+                    "Package and UID permission queries must use the same shared state");
+            policy.revokeRuntimePermission(pkgSharedA.packageName, perm, "default:0", 0, "fixture revoke");
+            check(policy.checkPermission(pkgSharedB.packageName, perm) == PackageManager.PERMISSION_DENIED,
+                    "Revocation must reach every shared member");
+            check(policy.checkPermission(sibling.packageName, perm) == PackageManager.PERMISSION_DENIED,
+                    "A sibling cannot retain a stale per-package grant");
+            policy.grantRuntime(pkgSharedA.packageName, perm, 0);
+            policy.forgetPackage(pkgSharedA.packageName);
+            check(policy.checkPermission(pkgSharedB.packageName, perm) == PackageManager.PERMISSION_GRANTED,
+                    "Removing one requester must retain a grant still used by a shared sibling");
+
+            Properties admitted = registry(tempDir);
+            denied(() -> PackageUids.uidFor("com.example.unadmitted", sharedGroup),
+                    "A name and sharedUserId must not allocate a shared identity");
+            check(registry(tempDir).equals(admitted), "Rejected lookup must not change persistent membership");
+            Signature[] unrelated = ApkPackage.verifySignatures(new File(new File(signedFixture).getParentFile().getParentFile(),
+                    "identity-fixtures/old.apk").getPath());
+            check(unrelated != null && !Arrays.equals(unrelated, verifiedFixture), "Independent signer fixture must verify");
+            ApkPackage incompatible = pending("com.example.incompatible", sharedGroup, unrelated);
+            denied(() -> new PackageManagerService(List.of(incompatible)), "Boot/direct admission must verify shared signers");
+            check(incompatible.uid() == -1 && registry(tempDir).equals(admitted),
+                    "Rejected admission must not assign a UID or persist membership");
+            ApkPackage changedGroup = pending(pkgSharedA.packageName, "com.example.changed.group", verifiedFixture);
+            denied(() -> new PackageManagerService(List.of(changedGroup)), "An active package cannot change shared identity");
+            check(changedGroup.uid() == -1 && registry(tempDir).equals(admitted),
+                    "Rejected shared-ID change must preserve the prior registry");
+            ApkPackage tentative = pending("com.example.tentative", null, verifiedFixture);
+            Object admission = prepare(tentative);
+            transaction(admission, "commit");
+            check(tentative.uid() >= 10000, "Prepared publication receives its provisional admitted UID");
+            transaction(admission, "close");
+            check(tentative.uid() == -1 && registry(tempDir).equals(admitted),
+                    "Failed publication rolls back the UID and all identity metadata");
+
+            // Verified APK lineage, actual PM publication and retirement exercise
+            // ordinary signed updates, rather than only comparing certificate arrays.
+            File lineageFixtures = new File(new File(signedFixture).getParentFile().getParentFile(),
+                    "identity-fixtures");
+            String rotationGroup = "com.example.rotation.group";
+            ApkPackage beforeRotation = signedPending("com.example.rotation.member", rotationGroup,
+                    new File(lineageFixtures, "old.apk"));
+            ApkPackage rotationPeer = signedPending("com.example.rotation.peer", rotationGroup,
+                    new File(lineageFixtures, "old.apk"));
+            PackageManagerService rotationPm = new PackageManagerService(List.of(beforeRotation, rotationPeer));
+            int rotationUid = beforeRotation.uid();
+            check(rotationPeer.uid() == rotationUid, "Verified shared peers must receive the same admitted UID");
+            ApkPackage rotated = signedPending(beforeRotation.packageName, rotationGroup,
+                    new File(lineageFixtures, "rotated-no-auth.apk"));
+            add.invoke(rotationPm, rotated);
+            check(rotated.uid() == rotationUid && rotationPeer.uid() == rotationUid,
+                    "A verified rotation with installed-data and shared-UID capability retains the shared UID");
+            check(rotationPm.getPackageUid(rotated.packageName, 0, 0) == rotationUid,
+                    "PM publication must expose the rotated package under the admitted UID");
+
+            var retireMethod = PackageUids.class.getDeclaredMethod("prepareRetire", ApkPackage.class);
+            retireMethod.setAccessible(true);
+            Properties beforeRetire = registry(tempDir);
+            Object retirement = retireMethod.invoke(null, rotated);
+            transaction(retirement, "commit");
+            transaction(retirement, "close");
+            check(registry(tempDir).equals(beforeRetire),
+                    "An unaccepted retirement restores the complete prior identity snapshot");
+
+            var remove = PackageManagerService.class.getDeclaredMethod("remove", String.class);
+            remove.setAccessible(true); remove.invoke(rotationPm, rotated.packageName);
+            check(rotationPm.getPackageUid(rotated.packageName, 0, 0) == -1,
+                    "A retired package is absent from package queries");
+            check(!registry(tempDir).containsKey("active:" + rotated.packageName),
+                    "Accepted retirement clears active signer ownership");
+            ApkPackage reinstalled = signedPending(rotated.packageName, "com.example.rotation.newgroup",
+                    new File(lineageFixtures, "rotated-no-auth.apk"));
+            add.invoke(rotationPm, reinstalled);
+            check(reinstalled.uid() != rotationUid && rotationPeer.uid() == rotationUid,
+                    "Reinstalling into a new shared identity allocates a distinct UID and preserves the old peer");
+
             // Test 10: Registry corruption detection
             Properties corrupt = new Properties();
             try (FileInputStream in = new FileInputStream(registryFile)) { corrupt.load(in); }
             // Add a duplicate non-shared package entry with same UID as app1
-            corrupt.setProperty("com.attacker.duplicate", Integer.toString(uid1));
+            corrupt.setProperty("com.example.duplicate", Integer.toString(uid1));
             try (FileOutputStream out = new FileOutputStream(registryFile)) { corrupt.store(out, "corrupt"); }
 
             boolean rejected = false;
@@ -295,6 +451,38 @@ public final class PackageUidIsolationContractTest {
         } finally {
             deleteRecursively(tempDir);
         }
+    }
+
+    /** Isolated child-process phases exercise interruption of the real transaction. */
+    public static void transactionPhase(String signedFixture, String phase) throws Exception {
+        Field access = Unsafe.class.getDeclaredField("theUnsafe"); access.setAccessible(true);
+        unsafe = (Unsafe) access.get(null);
+        verifiedFixture = ApkPackage.verifySignatures(signedFixture);
+        File data = new File(System.getenv("ANDROID_DATA")); Files.createDirectories(data.toPath());
+        String name = "com.example.interrupted";
+        if (phase.startsWith("prepare-")) {
+            File code = new File(data, "app/interrupted-1"); Files.createDirectories(code.toPath());
+            File base = new File(code, "base.apk"); Files.copy(new File(signedFixture).toPath(), base.toPath());
+            ApkPackage pkg = pending(name, null, verifiedFixture); set(pkg, "apkPath", base.getCanonicalPath());
+            Object admission = prepare(pkg); transaction(admission, "commit");
+            if (phase.equals("prepare-published")) {
+                Files.writeString(new File(data, "system/packages.list").toPath(),
+                        name + "\t" + code.getCanonicalPath() + "\t1\t1\n");
+            }
+            check(new File(data, "system/package-uids.pending").isFile(), "Transaction recovery evidence must exist");
+            System.out.println("UID interruption fixture prepared: " + phase);
+            // Deliberately end this isolated process without accepting or closing the
+            // transaction. OS handle cleanup releases its file lock, as after a crash.
+            return;
+        }
+        check(new File(data, "system/package-uids.pending").isFile(), "Interrupted transaction must reach recovery");
+        int next = PackageUids.uidFor("com.example.afterinterruption");
+        Properties recovered = registry(data);
+        boolean published = phase.equals("check-published");
+        check(recovered.containsKey(name) == published, "Recovery must follow durable package publication");
+        check(next == (published ? 10001 : 10000), "Recovered allocator must retain only committed identities");
+        check(!new File(data, "system/package-uids.pending").exists(), "Completed recovery must retire the journal");
+        System.out.println("UID interruption recovery passed: " + phase);
     }
 
     private static void deleteRecursively(File file) {

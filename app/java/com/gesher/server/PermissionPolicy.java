@@ -25,7 +25,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.WeakHashMap;
 
-/** Package-scoped permission state shared by package/activity/permission services. */
+/** UID permission state shared by package/activity/permission services. */
 public final class PermissionPolicy extends IPermissionManager.Default {
     private final PackageManagerService mPm;
     private final PermissionCatalog mCatalog;
@@ -74,40 +74,59 @@ public final class PermissionPolicy extends IPermissionManager.Default {
 
     boolean granted(String name, String packageName) {
         ApkPackage pkg = mPm.get(packageName);
-        if (pkg == null || name == null || !pkg.parsed.getRequestedPermissions().contains(name)) return false;
+        if (pkg == null || name == null) return false;
         if (GmsSignatureSpoofing.PERMISSION_FAKE_PACKAGE_SIGNATURE.equals(name)) {
-            return GmsSignatureSpoofing.isTrustedPackage(pkg);
+            return pkg.parsed.getRequestedPermissions().contains(name)
+                    && GmsSignatureSpoofing.isTrustedPackage(pkg);
         }
         PermissionInfo info = mCatalog.get(name);
         if (info == null) return false;
+        List<ApkPackage> members = uidMembers(pkg.uid());
+        boolean requested = false;
+        int targetSdk = Integer.MAX_VALUE;
+        for (ApkPackage member : members) {
+            requested |= member.parsed.getRequestedPermissions().contains(name);
+            targetSdk = Math.min(targetSdk, member.parsed.getTargetSdkVersion());
+        }
+        if (!requested) return false;
         int protection = info.protectionLevel & PermissionInfo.PROTECTION_MASK_BASE;
         if (protection == PermissionInfo.PROTECTION_NORMAL) return true;
         if (protection == PermissionInfo.PROTECTION_DANGEROUS) {
-            String decision;
-            synchronized (this) { decision = mDecisions.getProperty(key(pkg, name)); }
-            if (decision != null) return "granted".equals(decision);
-            String[] shared = mPm.getPackagesForUid(pkg.uid());
-            if (shared != null && shared.length > 1) {
-                for (String otherName : shared) {
-                    if (!otherName.equals(packageName)) {
-                        ApkPackage other = mPm.get(otherName);
-                        if (other != null && other.parsed.getRequestedPermissions().contains(name)) {
-                            synchronized (this) { decision = mDecisions.getProperty(key(other, name)); }
-                            if (decision != null) return "granted".equals(decision);
-                        }
-                    }
-                }
-            }
-            // Enabling the protected runtime must not depend on an APK being present;
-            // otherwise removing GmsCore would silently re-grant every dangerous perm.
-            return !GmsSignatureSpoofing.isEnabled();
+            String decision = runtimeDecisionForUid(pkg.uid(), name, members);
+            // Runtime permissions are UID state. New modern applications do not
+            // receive consent merely because an optional compatibility mode is off.
+            return decision != null ? "granted".equals(decision) : targetSdk < 23;
         }
-        if (!"android".equals(info.packageName) && pkg.packageName.equals(info.packageName)) return true;
         ApkPackage owner = mPm.get(info.packageName);
-        if (owner != null && pkg.signaturesMatch(owner)) return true;
-        return (info.protectionLevel & PermissionInfo.PROTECTION_FLAG_PRIVILEGED) != 0
-                && pkg.isSystemAddon() && pkg.hasVerifiedMicrogSigner()
-                && privilegedAllowlist(pkg.packageName, name);
+        for (ApkPackage member : members) {
+            if (!member.parsed.getRequestedPermissions().contains(name)) continue;
+            if (!"android".equals(info.packageName) && member.packageName.equals(info.packageName)) return true;
+            if (owner != null && member.signaturesMatch(owner)) return true;
+            if ((info.protectionLevel & PermissionInfo.PROTECTION_FLAG_PRIVILEGED) != 0
+                    && member.isSystemAddon() && member.hasVerifiedMicrogSigner()
+                    && privilegedAllowlist(member.packageName, name)) return true;
+        }
+        return false;
+    }
+
+    private List<ApkPackage> uidMembers(int uid) {
+        List<ApkPackage> members = new ArrayList<>();
+        for (ApkPackage pkg : mPm.packages()) if (pkg.uid() == uid) members.add(pkg);
+        return members;
+    }
+
+    private synchronized String runtimeDecisionForUid(int uid, String permission, List<ApkPackage> members) {
+        String decision = mDecisions.getProperty(uidKey(uid, permission));
+        if (decision != null) return decision;
+        boolean granted = false;
+        // Migrate old package records deterministically. Conflicting old decisions
+        // must never depend on whichever package happened to be queried first.
+        for (ApkPackage member : members) {
+            String old = mDecisions.getProperty(legacyKey(member, permission));
+            if ("denied".equals(old)) return "denied";
+            granted |= "granted".equals(old);
+        }
+        return granted ? "granted" : null;
     }
 
     /** Explicit allowlist, never all signature permissions simply because an APK is trusted. */
@@ -134,10 +153,14 @@ public final class PermissionPolicy extends IPermissionManager.Default {
         return false;
     }
 
-    private String key(ApkPackage pkg, String permission) {
+    private String legacyKey(ApkPackage pkg, String permission) {
         String signer = pkg.verifiedSignerSha256();
         // Grants never survive replacement by a different signing identity.
         return pkg.packageName + ":" + (signer == null ? "unsigned" : signer) + ":" + permission;
+    }
+
+    private static String uidKey(int uid, String permission) {
+        return "uid:" + uid + ":" + permission;
     }
 
     /** Uninstall must revoke decisions even if a later install reuses a package UID. */
@@ -145,7 +168,20 @@ public final class PermissionPolicy extends IPermissionManager.Default {
         synchronized (this) {
             Properties before = new Properties();
             before.putAll(mDecisions);
-            mDecisions.keySet().removeIf(key -> key.toString().startsWith(packageName + ":"));
+            ApkPackage removed = mPm.get(packageName);
+            List<ApkPackage> remaining = removed == null ? List.of() : uidMembers(removed.uid());
+            String prefix = removed == null ? null : "uid:" + removed.uid() + ":";
+            mDecisions.keySet().removeIf(key -> {
+                String saved = key.toString();
+                if (saved.startsWith(packageName + ":")) return true;
+                if (prefix == null || !saved.startsWith(prefix)) return false;
+                String permission = saved.substring(prefix.length());
+                for (ApkPackage member : remaining) {
+                    if (!member.packageName.equals(packageName)
+                            && member.parsed.getRequestedPermissions().contains(permission)) return false;
+                }
+                return true;
+            });
             try { Device.write(mFile, mDecisions); }
             catch (java.io.IOException e) {
                 mDecisions.clear(); mDecisions.putAll(before);
@@ -218,23 +254,17 @@ public final class PermissionPolicy extends IPermissionManager.Default {
                         != PermissionInfo.PROTECTION_DANGEROUS) {
             throw new IllegalArgumentException("Not a requested runtime permission: " + permission);
         }
+        final boolean wasGranted;
         synchronized (this) {
             if (mPm.get(pkg) != installed || mPm.isRemovalPending(pkg)) {
                 throw new SecurityException("Runtime permission owner changed or is retiring");
             }
+            wasGranted = granted(permission, pkg);
             Properties before = new Properties();
             before.putAll(mDecisions);
-            String[] shared = mPm.getPackagesForUid(installed.uid());
-            if (shared != null && shared.length > 1) {
-                for (String name : shared) {
-                    ApkPackage target = mPm.get(name);
-                    if (target != null && target.parsed.getRequestedPermissions().contains(permission)) {
-                        mDecisions.setProperty(key(target, permission), decision);
-                    }
-                }
-            } else {
-                mDecisions.setProperty(key(installed, permission), decision);
-            }
+            List<ApkPackage> members = uidMembers(installed.uid());
+            mDecisions.setProperty(uidKey(installed.uid(), permission), decision);
+            for (ApkPackage member : members) mDecisions.remove(legacyKey(member, permission));
             try { Device.write(mFile, mDecisions); }
             catch (java.io.IOException e) {
                 mDecisions.clear(); mDecisions.putAll(before);
@@ -242,7 +272,14 @@ public final class PermissionPolicy extends IPermissionManager.Default {
             }
         }
         invalidateCaches();
-        if (NotificationManagerService.sLast != null) NotificationManagerService.sLast.permissionChanged(pkg);
+        NotificationManagerService notifications = NotificationManagerService.sLast;
+        if (notifications != null) for (ApkPackage member : uidMembers(installed.uid())) {
+            notifications.permissionChanged(member.packageName);
+        }
+        Services.Created services = Services.sLast;
+        if (wasGranted && "denied".equals(decision) && services != null && services.pm == mPm) {
+            services.atm.killUidForPermissionChange(installed, () -> !granted(permission, pkg));
+        }
     }
 
     private void invalidateCaches() {
@@ -263,7 +300,8 @@ public final class PermissionPolicy extends IPermissionManager.Default {
         ApkPackage installed = mPm.get(pkg);
         if (installed == null) return 0;
         synchronized (this) {
-            return mDecisions.containsKey(key(installed, permission)) ? PackageManager.FLAG_PERMISSION_USER_SET : 0;
+            return runtimeDecisionForUid(installed.uid(), permission, uidMembers(installed.uid())) != null
+                    ? PackageManager.FLAG_PERMISSION_USER_SET : 0;
         }
     }
     @Override public Map<String, PermissionManager.PermissionState> getAllPermissionStates(String pkg, String deviceId, int userId) {

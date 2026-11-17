@@ -2207,6 +2207,97 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         endProcesses(stop, 5000);
     }
 
+    /**
+     * Android's permission-revocation killUid: retire the affected process generations,
+     * retaining normal activity/service recovery. A force-stop would incorrectly cancel
+     * unrelated work and prevent that recovery. Never signal a PID reopened by number.
+     */
+    void killUidForPermissionChange(ApkPackage expected,
+            java.util.function.BooleanSupplier stillRevoked) {
+        List<ProcessRecord> processes = new ArrayList<>();
+        synchronized (this) {
+            if (mPm.get(expected.packageName) != expected || mPm.isRemovalPending(expected.packageName)
+                    || !stillRevoked.getAsBoolean()) return;
+            for (ProcessRecord app : mProcesses) {
+                if (app.uid == expected.uid() && !app.dead && !app.exiting && !app.pidSuperseded
+                        && app.pid != android.os.Process.myPid()) processes.add(app);
+            }
+            for (Map.Entry<Long, PendingProcess> entry : new ArrayList<>(mStarting.entrySet())) {
+                PendingProcess pending = entry.getValue();
+                if (pending.owner == null || pending.owner.uid() != expected.uid()) continue;
+                pending.cancelled = true;
+                mStarting.remove(entry.getKey());
+                mExitStatus.unavailable(pending.exitGeneration);
+                if (pending.pid > 0) Zygote.killChild(pending.pid, pending.nativeStartTime);
+                for (PendingWork work : mPendingWork) {
+                    if (work.launchGeneration == pending.exitGeneration) work.launchGeneration = null;
+                }
+                for (ActivityRecord activity : mActivities) {
+                    if (activity.app == null && activity.launchGeneration == pending.exitGeneration) {
+                        activity.launchGeneration = null;
+                    }
+                }
+            }
+            notifyAll();
+        }
+        for (ProcessRecord app : processes) {
+            boolean terminated;
+            synchronized (this) {
+                if (mPm.get(expected.packageName) != expected || mPm.isRemovalPending(expected.packageName)) return;
+                if (!stillRevoked.getAsBoolean()) break;
+                if (!mProcesses.contains(app) || app.dead || app.exiting || app.pidSuperseded
+                        || attachedProcessByPid(app.pid) != app) continue;
+                app.reaped = true;
+                app.recoverAfterPidSupersession = false;
+                app.exiting = true;
+                for (ActivityRecord activity : new ArrayList<>(app.activities)) {
+                    if (activity.state == State.INITIALIZING && !activity.finishing
+                            && activityEnabled(activity)) {
+                        app.activities.remove(activity);
+                        activity.app = null;
+                        activity.launchGeneration = null;
+                    }
+                }
+                terminated = app.spawned && Zygote.killChild(app.pid, app.nativeStartTime);
+            }
+            try { processDied(app); }
+            finally {
+                if (!terminated) {
+                    try { app.thread.scheduleExit(); }
+                    catch (RemoteException ignored) { }
+                }
+            }
+        }
+        // A launch retired before attachment has no processDied callback to restart
+        // its waiters. Preserve those requests and admit a new generation normally.
+        record Restart(ApkPackage owner, String processName) { }
+        Map<String, Restart> restart = new java.util.LinkedHashMap<>();
+        synchronized (this) {
+            if (mPm.get(expected.packageName) != expected || mPm.isRemovalPending(expected.packageName)) return;
+            for (PendingWork work : mPendingWork) {
+                if (work.owner != null && work.owner.uid() == expected.uid() && work.current(mPm)) {
+                    restart.put(processKey(work.packageName, work.processName),
+                            new Restart(work.owner, work.processName));
+                }
+            }
+            for (ActivityRecord activity : mActivities) {
+                if (activity.targetCode != null && activity.targetCode.uid() == expected.uid()
+                        && activity.app == null && activity.state == State.INITIALIZING
+                        && !activity.finishing && activityEnabled(activity)) {
+                    String name = activity.targetCode.packageName;
+                    String process = componentProcess(name, activity.info.processName);
+                    restart.put(processKey(name, process), new Restart(activity.targetCode, process));
+                }
+            }
+        }
+        for (Restart pending : restart.values()) {
+            if (mPm.get(pending.owner.packageName) == pending.owner
+                    && !mPm.isRemovalPending(pending.owner.packageName)) {
+                startProcess(pending.owner.packageName, pending.processName, "permission change");
+            }
+        }
+    }
+
     /** Restart existing processes after an enabled-state change, without force-stop state. */
     void restartForEnabledState(ApkPackage expected) {
         restartForEnabledState(expected, () -> true);

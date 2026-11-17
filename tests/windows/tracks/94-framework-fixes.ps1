@@ -303,7 +303,8 @@ Check 'services: URI delegation, provider patterns, exact identities and scoped 
 } @('UriGrantContractTest all passed: 138 checks; binder=true')
 
 $uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
-  'PackageUidIsolationContractTest') 90
+  'PackageUidIsolationContractTest' +
+  (NoDrive (Join-Path $PSScriptRoot '../../dex-services/fixtures/v2only.apk'))) 90
 $uidIsolationCode = $LASTEXITCODE
 Check 'services: per-package identity, distinct UID allocation, sharedUserId and isolation' {
   $global:LASTEXITCODE = $uidIsolationCode

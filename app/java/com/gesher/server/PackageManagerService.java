@@ -138,10 +138,14 @@ public final class PackageManagerService extends IPackageManager.Default {
         mTransientEnabled = !persistentEnabled;
         Map<String, ApkPackage> map = new LinkedHashMap<>();
         for (ApkPackage p : packages) {
-            map.put(p.packageName, p);
+            if (map.put(p.packageName, p) != null) throw new IllegalArgumentException("Duplicate installed package");
         }
-        mPackages = map;
-        enabledStore();
+        try (PackageUids.Admission identity = PackageUids.prepare(map.values(), List.of())) {
+            identity.commit();
+            mPackages = map;
+            enabledStore();
+            identity.accept();
+        }
     }
 
     private synchronized PackageEnabledStore enabledStore() {
@@ -157,14 +161,29 @@ public final class PackageManagerService extends IPackageManager.Default {
     }
 
     /** Finish owner I/O before an installer commits its durable package registry. */
-    synchronized void prepareAdd(ApkPackage p) {
-        PackageEnabledStore store = enabledStore();
-        if (!p.hasEnabledState(store)) p.attachEnabledState(store, store.owner(p.packageName));
+    synchronized PackageUids.Admission prepareAdd(ApkPackage p) {
+        PackageUids.Admission identity = PackageUids.prepare(List.of(p), mPackages.values());
+        try {
+            PackageEnabledStore store = enabledStore();
+            if (!p.hasEnabledState(store)) p.attachEnabledState(store, store.owner(p.packageName));
+            return identity;
+        } catch (RuntimeException failure) {
+            identity.close(); throw failure;
+        }
     }
 
     /** Adds or replaces a package (an install or an update). */
     synchronized void add(ApkPackage p) {
-        prepareAdd(p);
+        try (PackageUids.Admission identity = prepareAdd(p)) {
+            identity.commit();
+            identity.accept();
+            publishPrepared(p);
+        }
+    }
+
+    /** Caller already committed the durable identity and package registry together. */
+    synchronized void publishPrepared(ApkPackage p) {
+        if (p.uidPending() || p.uid() < 0) throw new IllegalStateException("Package identity was not admitted");
         Map<String, ApkPackage> map = new LinkedHashMap<>(mPackages);
         map.put(p.packageName, p);
         mPackages = map;
@@ -173,6 +192,15 @@ public final class PackageManagerService extends IPackageManager.Default {
 
     /** Removes a package (an uninstall); returns it, or null. */
     synchronized ApkPackage remove(String packageName) {
+        try (PackageUids.Admission identity = PackageUids.prepareRetire(mPackages.get(packageName))) {
+            identity.commit();
+            ApkPackage removed = removePrepared(packageName);
+            identity.accept();
+            return removed;
+        }
+    }
+
+    synchronized ApkPackage removePrepared(String packageName) {
         Map<String, ApkPackage> map = new LinkedHashMap<>(mPackages);
         ApkPackage p = map.get(packageName);
         if (p != null) enabledStore().retire(packageName, p.enabledStateOwner());
