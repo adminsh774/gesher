@@ -38,7 +38,7 @@ def main() -> int:
     state = re.search(r"thread_local std::string t_dlerror;\s*thread_local bool t_has_dlerror = false;", body)
     if state is None:
         raise ValueError("production libdl error state marker changed")
-    begin = body.index("// dlsym: the shim's own symbols")
+    begin = body.index("// dlsym:")
     implementation = body[begin:body.index("struct BionicDlInfo", begin)]
     entries = []
     for name in ("dlsym", "dlvsym", "dlerror", "dlclose"):

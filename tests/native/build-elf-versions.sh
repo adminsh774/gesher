@@ -8,6 +8,14 @@ for directory in lookup-gnu lookup-sysv required/good required/bad weak/good wea
   mkdir -p "$output/$directory"
 done
 common=(-shared -fPIC -O2 -fno-stack-protector -nostdlib -Wall -Wextra -Werror)
+mkdir -p "$output/link-only"
+for entry in 1:libgv_test_host.so 2:libdl.so 3:libc.so 4:libm.so; do
+  role=${entry%%:*}; name=${entry#*:}
+  "$compiler" "${common[@]}" -DGV_LINK_ROLE="$role" "-Wl,-soname,$name" \
+    "$here/elf_versions_link_only.c" -o "$output/link-only/$name"
+done
+# Every callback-bearing DSO explicitly declares its isolated host provider.
+common+=("-L$output/link-only" -Wl,--no-as-needed -l:libgv_test_host.so)
 provider() {
   local directory=$1 role=$2 hash=$3 script=$4
   local flags=()
@@ -60,4 +68,31 @@ done
 test ! -e "$output/virtual/libgv_provider.so"
 "$compiler" "${common[@]}" -Wl,--hash-style=both -Wl,-soname,libgv_guest_dlvsym.so \
   "-Wl,--version-script=$here/elf_guest_dlvsym.map" \
-  "$here/elf_guest_dlvsym_fixture.c" -o "$output/libgv_guest_dlvsym.so"
+  "$here/elf_guest_dlvsym_fixture.c" -l:libdl.so -l:libc.so -l:libm.so \
+  -o "$output/libgv_guest_dlvsym.so"
+
+# Defined TLS references must select one provider for both module and offset.
+mkdir -p "$output/tls-scope"
+scope() {
+  local name=$1
+  shift
+  "$compiler" "${common[@]}" -O0 -ftls-model=global-dynamic -Wl,--hash-style=both \
+    "-Wl,-soname,$name" "$@" "$here/elf_versions_tls_scope.c" -o "$output/tls-scope/$name"
+}
+scope libgv_scope_global.so -DGV_SCOPE_PROVIDER -Wl,-z,global
+scope libgv_scope_local.so -DGV_SCOPE_PROVIDER
+scope libgv_scope_requester.so
+scope libgv_scope_protected.so -DGV_SCOPE_PROTECTED
+scope libgv_scope_hidden.so -DGV_SCOPE_HIDDEN
+scope libgv_scope_static.so -DGV_SCOPE_STATIC
+scope libgv_scope_symbolic.so -Wl,-Bsymbolic
+scope libgv_scope_global_versioned.so -DGV_SCOPE_PROVIDER -Wl,-z,global \
+  "-Wl,--version-script=$here/elf_versions/tls-scope.map"
+scope libgv_scope_requester_versioned.so "-Wl,--version-script=$here/elf_versions/tls-scope.map"
+scope libgv_scope_requester_ie.so -DGV_SCOPE_IE_ONLY
+scope libgv_scope_protected_ie.so -DGV_SCOPE_IE_ONLY -DGV_SCOPE_PROTECTED
+scope libgv_scope_hidden_ie.so -DGV_SCOPE_IE_ONLY -DGV_SCOPE_HIDDEN
+scope libgv_scope_static_ie.so -DGV_SCOPE_IE_ONLY -DGV_SCOPE_STATIC
+scope libgv_scope_symbolic_ie.so -DGV_SCOPE_IE_ONLY -Wl,-Bsymbolic
+scope libgv_scope_requester_versioned_ie.so -DGV_SCOPE_IE_ONLY \
+  "-Wl,--version-script=$here/elf_versions/tls-scope.map"

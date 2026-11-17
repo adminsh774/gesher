@@ -39,8 +39,8 @@ def main() -> int:
         '@HOST_LOOKUP@': section(body, 'void* Host(const char* name)', 'int* HostErrno()'),
         '@GUEST_LOOKUP@': section(body, 'void* GuestSymbol(const char* name)', 'int64_t GuestRawSyscall('),
         '@OVERRIDE@': section(body, 'void Override(const char* name, void* host_wrapper)', '// A mismatched host'),
-        '@DISPATCH@': section(body, 'void* g_dlsym = nullptr;', '// --- setjmp / longjmp'),
-        '@REGISTRATION@': section(body, '  g_dlsym = Host("dlsym");', '  for (const Fallback& f : kFenv)'),
+        '@DISPATCH@': section(body, 'void* g_dlopen = nullptr;' if 'void* g_dlopen = nullptr;' in body else 'void* g_dlsym = nullptr;', '// --- setjmp / longjmp'),
+        '@REGISTRATION@': section(body, '  g_dlopen = Host("__loader_dlopen");' if '  g_dlopen = Host("__loader_dlopen");' in body else '  g_dlsym = Host("dlsym");', '  for (const Fallback& f : kFenv)'),
     }
     generated = template
     for marker, text in fragments.items():

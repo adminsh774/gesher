@@ -4,6 +4,7 @@
 // Run each case in a fresh process: the loader deliberately retains SONAMEs.
 // Usage: elf_versions_test <fixture-root> <case> [--arm64]
 #include <gesher/elf_loader.h>
+#include <elf.h>
 #ifdef _WIN32
 #include <gesher/arm64_runtime.h>
 #endif
@@ -28,7 +29,7 @@ namespace elf = gesher::elf;
 namespace {
 int checks, failures;
 std::array<int, 12> constructors{};
-bool arm64, virtual_symbols, virtual_provider;
+bool arm64, virtual_symbols;
 int virtual_data = 555;
 std::string root;
 
@@ -75,14 +76,23 @@ void* Resolve(const char* name) {
   if (virtual_symbols && std::strcmp(name, "gv_data") == 0) return &virtual_data;
   return nullptr;
 }
-bool RecognizeProvider(const char* soname) {
-  return virtual_provider && std::strcmp(soname, "libgv_provider.so") == 0;
+void RegisterCallbacks() {
+  elf::ProviderOptions provider;
+  provider.soname = "libgv_test_host.so";
+  provider.lookup = [](const char* name) -> void* {
+    if (std::strcmp(name, "gv_event") == 0) return reinterpret_cast<void*>(&Event);
+    if (std::strcmp(name, "__tls_get_addr") == 0) return reinterpret_cast<void*>(&GetTls);
+    return nullptr;
+  };
+  std::string error;
+  Check(elf::RegisterProvider(provider, &error) != nullptr, "register actual isolated callback provider");
 }
 
 elf::LoadOptions Options(const std::string& directory) {
   elf::LoadOptions options;
   options.search_paths.push_back(root + "/" + directory);
-  options.allow_shimmed_needed = false;
+  options.allow_shimmed_needed = true;
+  options.flags = 0x102;  // This fixture explicitly verifies DEFAULT/global version lookup.
   options.stub_unresolved_functions = false;
   return options;
 }
@@ -225,8 +235,14 @@ void Virtual() {
   Check(lib == nullptr && !error.empty() && Count() == 0,
         "a symbol callback alone does not invent a required provider identity");
   if (lib) return;
-  virtual_provider = true;
-  elf::SetBionicResolver(Resolve, RecognizeProvider);
+  elf::ProviderOptions provider;
+  provider.soname = "libgv_provider.so";
+  provider.lookup = [](const char* name) -> void* {
+    if (std::strcmp(name, "gv_value") == 0) return reinterpret_cast<void*>(&VirtualValue);
+    if (std::strcmp(name, "gv_data") == 0) return &virtual_data;
+    return nullptr;
+  };
+  Check(elf::RegisterProvider(provider, &error) != nullptr, "register actual owned virtual exports");
   lib = Load("virtual", "libgv_client.so", options, &error);
   Check(lib != nullptr, "an explicitly recognized unversioned virtual provider can satisfy its imports");
   if (!lib) return;
@@ -234,6 +250,109 @@ void Virtual() {
         Call(elf::Lookup(lib, "gv_client_data")) == 1110,
         "recognized virtual provider returns actual function and data definitions");
   Check(constructors[3] == 1 && Count() == 1, "virtual provider retry publishes only the real client object");
+}
+
+void* CallPointer(void* entry) {
+  if (!entry) return nullptr;
+#ifdef _WIN32
+  if (arm64) entry = gesher::arm64::HostEntry(entry);
+#endif
+  return entry ? reinterpret_cast<void*(GV_SYSV*)()>(entry)() : nullptr;
+}
+
+size_t TlsSize(elf::Library* library, const char* entry_name) {
+  const uintptr_t entry = reinterpret_cast<uintptr_t>(elf::Lookup(library, entry_name));
+  size_t result = 0;
+  elf::ForEachLoaded([&](const elf::PhdrInfo& info) {
+    const auto* headers = static_cast<const Elf64_Phdr*>(info.phdr);
+    bool belongs = false;
+    for (size_t i = 0; i < info.phnum; ++i) {
+      const auto& ph = headers[i];
+      if (ph.p_type == PT_LOAD && entry >= info.addr + ph.p_vaddr &&
+          entry - (info.addr + ph.p_vaddr) < ph.p_memsz) belongs = true;
+    }
+    if (belongs) for (size_t i = 0; i < info.phnum; ++i)
+      if (headers[i].p_type == PT_TLS) result = headers[i].p_memsz;
+    return 0;
+  });
+  return result;
+}
+
+void TlsScope() {
+  struct Scenario { const char* requester; bool global, preempt, exported, versioned; };
+  const Scenario cases[] = {
+    {"libgv_scope_requester.so", false, false, true, false},
+    {"libgv_scope_requester.so", true, true, true, false},
+    {"libgv_scope_protected.so", true, false, true, false},
+    {"libgv_scope_hidden.so", true, false, false, false},
+    {"libgv_scope_static.so", true, false, false, false},
+    {"libgv_scope_symbolic.so", true, false, true, false},
+    {"libgv_scope_requester_versioned.so", true, true, true, true},
+  };
+  for (size_t index = 0; index < std::size(cases); ++index) {
+    const Scenario& test = cases[index];
+    elf::NamespaceOptions config;
+    config.name = "version-tls-scope-" + std::to_string(index);
+    config.default_library_paths = {root + "/tls-scope"};
+    std::string error;
+    auto* ns = elf::CreateNamespace(config, &error);
+    Check(ns && elf::LinkNamespaces(ns, elf::DefaultNamespace(), {"libgv_test_host.so"}, &error),
+          "TLS scope has a distinct namespace and actual callback provider");
+    if (!ns) return;
+    auto options = Options("tls-scope"); options.context.name_space = ns;
+    const char* name = test.versioned ? "libgv_scope_global_versioned.so" :
+        test.global ? "libgv_scope_global.so" : "libgv_scope_local.so";
+    auto* provider = Load("tls-scope", name, options, &error);
+    auto* requester = Load("tls-scope", test.requester, options, &error);
+    std::string ie_name = test.requester;
+    ie_name.resize(ie_name.size() - 3);
+    ie_name += "_ie.so";
+    auto* ie_requester = Load("tls-scope", ie_name.c_str(), options, &error);
+    if (!provider || !requester) std::fprintf(stderr, "TLS scope: %s\n", error.c_str());
+    Check(provider && requester && ie_requester, "ordinary TLS provider and GD/IE requesters load");
+    if (!provider || !requester || !ie_requester) return;
+    auto* provider_tls = static_cast<int*>(elf::Lookup(provider, "gv_scope_tls"));
+    auto* own_tls = static_cast<int*>(elf::Lookup(requester, "gv_scope_tls"));
+    void* getter = elf::Lookup(requester, "gv_scope_tls_address");
+    void* reader = elf::Lookup(requester, "gv_scope_tls_read");
+    void* advance = elf::Lookup(requester, "gv_scope_tls_advance");
+    void* ie = elf::Lookup(ie_requester, "gv_scope_requester_ie_offset");
+    auto* selected = static_cast<int*>(CallPointer(getter));
+    const int expected = test.preempt ? 41 : 17;
+    Check(provider_tls && *provider_tls == 41 && selected && Call(reader) == expected,
+          "defined GD/TLSDESC reads selected TLS value, not another symbol's padding");
+    if (!provider_tls || !selected) return;
+    auto* padding = static_cast<int*>(elf::Lookup(provider, "gv_scope_padding"));
+    Check(padding && *padding == 901 && reinterpret_cast<uintptr_t>(provider_tls) ==
+          reinterpret_cast<uintptr_t>(padding) + 7 * sizeof(int) &&
+          TlsSize(provider, "gv_scope_provider_ie_offset") == 8 * sizeof(int) &&
+          TlsSize(requester, "gv_scope_tls_read") == sizeof(int),
+          "actual PT_TLS layouts require provider offset28 and requester offset0");
+    Check((selected == provider_tls) == test.preempt,
+          "selected TLS module and offset identify the same actual provider");
+    Check(test.exported ? own_tls && *own_tls == 17 : own_tls == nullptr,
+          "explicit handle retains own TLS definition or correctly hides a local symbol");
+    Check((CallOffset(ie) == CallOffset(elf::Lookup(provider, "gv_scope_provider_ie_offset"))) == test.preempt,
+          "initial-exec relocation agrees with the GD/TLSDESC provider choice");
+    Check(Call(advance) == expected + 3 && *selected == expected + 3 &&
+          *provider_tls == (test.preempt ? 44 : 41), "real write updates only the selected TLS object");
+    if (test.exported) Check(*own_tls == (test.preempt ? 17 : 20),
+                            "interposition does not overwrite the requester's separate TLS image");
+    if (test.versioned) Check(elf::LookupVersion(provider, "gv_scope_tls", "GV_SCOPE") == provider_tls,
+                              "defined versioned TLS resolves through its actual selected version");
+    int* worker_address = nullptr;
+    bool worker_ok = false;
+    std::thread worker([&] {
+      auto* worker_provider = static_cast<int*>(elf::Lookup(provider, "gv_scope_tls"));
+      worker_address = static_cast<int*>(CallPointer(getter));
+      worker_ok = worker_provider && worker_address && worker_address != selected &&
+          (worker_address == worker_provider) == test.preempt && Call(reader) == expected &&
+          Call(advance) == expected + 3 && *worker_provider == (test.preempt ? 44 : 41);
+    });
+    worker.join();
+    Check(worker_ok && *selected == expected + 3 && *provider_tls == (test.preempt ? 44 : 41),
+          "fresh thread keeps selected definitions, initial images and mutations independent");
+  }
 }
 
 void Tls() {
@@ -348,6 +467,7 @@ int main(int argc, char** argv) {
 #endif
   }
   elf::SetBionicResolver(Resolve);
+  RegisterCallbacks();
   const std::string test = argv[2];
   if (test == "lookup-gnu" || test == "lookup-sysv") Lookup(argv[2]);
   else if (test == "required") Required();
@@ -359,6 +479,7 @@ int main(int argc, char** argv) {
   else if (test == "tls") Tls();
   else if (test == "tls-weak") TlsWeak(false);
   else if (test == "tls-weak-present") TlsWeak(true);
+  else if (test == "tls-scope") TlsScope();
   else { std::fprintf(stderr, "unknown ELF version case: %s\n", argv[2]); return 2; }
   std::printf("ELF versions: %s: %d checks, %d failures\n", argv[2], checks, failures);
   if (!failures) std::puts("elf_versions_test all passed");

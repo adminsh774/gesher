@@ -26,10 +26,10 @@ std::once_flag g_once;
 bool g_ok = false;
 
 // Host callback: the host (bionic shim) definition of a libc symbol, which the
-// translator wraps or calls (guest_libc.cc); else any loaded object's.
+// translator wraps or calls (guest_libc.cc). This internal representation
+// resolver must not select definitions from an unrelated guest namespace.
 void* HostResolve(const char* name) {
-  if (void* a = gesher::elf::ResolveBionic(name)) return a;
-  return gesher::elf::LookupGlobal(name);
+  return gesher::elf::ResolveBionic(name);
 }
 
 // Host callback: describe an address for a guest crash report.

@@ -26,13 +26,13 @@ void Check(bool condition, const char* message) {
 int BIONIC_SYSV V1() { return 111; }
 int BIONIC_SYSV V2() { return 222; }
 int BIONIC_SYSV Unversioned() { return 777; }
-enum class Route { handle, global, handle_version, global_version, shim };
+enum class Route { handle, global, handle_version, global_version, next, next_version, main, main_version, provider, shim };
 struct Call { Route route; std::string symbol, version; };
 thread_local std::vector<Call> calls;
 char platform_handle;
 void* Answer(Route route, const char* name, const char* version = nullptr) {
   calls.push_back({route, name, version ? version : ""});
-  if (route == Route::shim)
+  if (route == Route::shim || route == Route::provider)
     return std::strcmp(name, "unversioned") == 0 ? reinterpret_cast<void*>(&Unversioned) : nullptr;
   if (std::strcmp(name, "versioned") != 0) return nullptr;
   if (version == nullptr || std::strcmp(version, "V2") == 0) return reinterpret_cast<void*>(&V2);
@@ -46,6 +46,26 @@ int Invoke(void* value) {
 
 namespace gesher::elf {
 struct Library {};
+struct LoaderContext { const void* caller_address = nullptr; };
+enum class LookupKind { kHandle, kDefault, kNext, kMain };
+const void* last_caller;
+void* LookupScoped(Library* handle, const char* name, const char* version,
+                    LookupKind kind, const LoaderContext& context, std::string* error) {
+  error->clear();
+  last_caller = context.caller_address;
+  if (std::strcmp(name, "null_ifunc") == 0) return nullptr;
+  Route route = version == nullptr ? Route::handle : Route::handle_version;
+  if (kind == LookupKind::kDefault) route = version == nullptr ? Route::global : Route::global_version;
+  if (kind == LookupKind::kNext) route = version == nullptr ? Route::next : Route::next_version;
+  if (kind == LookupKind::kMain) route = version == nullptr ? Route::main : Route::main_version;
+  if (handle == reinterpret_cast<Library*>(&platform_handle)) route = Route::provider;
+  void* answer = Answer(route, name, version);
+  if (answer == nullptr) {
+    *error = std::string("undefined symbol: ") + name;
+    if (version != nullptr) *error += std::string(", version ") + version;
+  }
+  return answer;
+}
 void* Lookup(Library*, const char* name) { return Answer(Route::handle, name); }
 void* LookupGlobal(const char* name) { return Answer(Route::global, name); }
 void* LookupVersion(Library*, const char* name, const char* version) {
@@ -58,8 +78,8 @@ void* LookupGlobalVersion(const char* name, const char* version) {
 
 namespace gesher::bionic {
 namespace {
-bool IsPlatformLibraryHandle(const void* handle) { return handle == &platform_handle; }
-void* LookupBionicSymbol(const char* name) { return Answer(Route::shim, name); }
+[[maybe_unused]] bool IsPlatformLibraryHandle(const void* handle) { return handle == &platform_handle; }
+[[maybe_unused]] void* LookupBionicSymbol(const char* name) { return Answer(Route::shim, name); }
 bool TraceDl() { return false; }
 @ERROR_STATE@
 @LIBDL_IMPLEMENTATION@
@@ -77,6 +97,8 @@ int main() {
   auto error = reinterpret_cast<const char*(BIONIC_SYSV*)()>(table.at("dlerror"));
   gesher::elf::Library library;
   Check(error() == nullptr, "no initial error");
+  Check(sym(&library, "null_ifunc") == nullptr && error() == nullptr,
+        "a successfully selected null IFUNC result does not fabricate an error");
   Check(Invoke(sym(&library, "versioned")) == 222 && calls.front().route == Route::handle,
         "ordinary dlsym keeps the unversioned lookup path");
   calls.clear();
@@ -118,16 +140,20 @@ int main() {
   for (void* handle : {static_cast<void*>(nullptr), reinterpret_cast<void*>(-1), reinterpret_cast<void*>(-2)}) {
     calls.clear();
     Check(Invoke(vsym(handle, "versioned", "V1")) == 111 &&
-          calls.front().route == Route::global_version, "existing global-handle routing retains the version");
+          calls.front().route == (handle == nullptr ? Route::global_version :
+          handle == reinterpret_cast<void*>(-1) ? Route::next_version : Route::main_version),
+          "DEFAULT, NEXT and main use distinct scoped routes with the exact version");
   }
   calls.clear();
   Check(Invoke(vsym(&platform_handle, "unversioned", "REQUESTED_ABI")) == 777 &&
-        calls.size() == 1 && calls.front().route == Route::shim,
+        calls.size() == 1 && calls.front().route == Route::provider,
         "existing unversioned virtual provider returns only an actual export");
   calls.clear();
-  Check(Invoke(vsym(&library, "unversioned", "REQUESTED_ABI")) == 777 &&
-        calls.size() == 2 && calls[0].route == Route::handle_version && calls[1].route == Route::shim,
-        "existing unversioned shim fallback follows attempted versioned ELF lookup");
+  Check(vsym(&library, "unversioned", "REQUESTED_ABI") == nullptr &&
+        calls.size() == 1 && calls[0].route == Route::handle_version,
+        "ordinary handle failure never falls back to the internal aggregate");
+  Check(gesher::elf::last_caller != nullptr, "public wrapper captures its actual return PC");
+  error();
   Check(vsym(&platform_handle, "not_provided", "REQUESTED_ABI") == nullptr,
         "virtual provider does not fabricate a missing export");
   Check(std::string(error()) == "undefined symbol: not_provided, version REQUESTED_ABI",

@@ -33,6 +33,10 @@ void SYSV Event(int role) {
   if (role != 1 && role != 7) std::abort();
   ++constructor_calls;
 }
+struct TlsIndex { size_t module, offset; };
+void* SYSV GetTls(TlsIndex* index) {
+  return gesher::elf::TlsGetAddr(index->module, index->offset);
+}
 int Call(void* function, bool arm64) {
   if (!function) return -999;
   gesher::bionic::EnterLoadedCode();
@@ -54,7 +58,16 @@ int main(int argc, char** argv) {
   }
   const bool arm64 = argc == 3;
   gesher::bionic::InstallBionicShim();
-  gesher::bionic::AddBionicSymbol("gv_event", reinterpret_cast<void*>(&Event));
+  gesher::elf::ProviderOptions callbacks;
+  callbacks.soname = "libgv_test_host.so";
+  callbacks.lookup = [](const char* name) -> void* {
+    if (std::strcmp(name, "gv_event") == 0) return reinterpret_cast<void*>(&Event);
+    if (std::strcmp(name, "__tls_get_addr") == 0) return reinterpret_cast<void*>(&GetTls);
+    return nullptr;
+  };
+  std::string registration_error;
+  Check(gesher::elf::RegisterProvider(callbacks, &registration_error) != nullptr,
+        "isolated callback provider has actual owned exports");
   if (arm64) Check(gesher::arm64::EnsureLoaded(), "production ARM64 translator is available");
   using Open = void*(SYSV*)(const char*, int);
   using Sym = void*(SYSV*)(void*, const char*);
@@ -68,7 +81,7 @@ int main(int argc, char** argv) {
   Check(error() == nullptr, "actual error storage starts empty");
 
   const std::string path = std::string(argv[1]) + "/lookup-gnu/libgv_provider.so";
-  void* handle = open(path.c_str(), 2);  // RTLD_NOW
+  void* handle = open(path.c_str(), 0x102);  // NOW | GLOBAL: this fixture tests DEFAULT.
   if (!handle) {
     const char* detail = error();
     std::fprintf(stderr, "provider load failed: %s\n", detail ? detail : "no diagnostic");
@@ -146,7 +159,7 @@ int main(int argc, char** argv) {
         "worker errors do not replace the main-thread error");
   Check(constructor_calls == 1, "lookups do not rerun provider constructors");
   const std::string tls_path = std::string(argv[1]) + "/tls/libgv_tls_provider.so";
-  void* tls_handle = open(tls_path.c_str(), 2);
+  void* tls_handle = open(tls_path.c_str(), 0x102);
   Check(tls_handle != nullptr, "real versioned TLS provider loads through shim dlopen");
   auto* tls1 = static_cast<int*>(vsym(tls_handle, "gv_tls", "GV_1"));
   auto* tls2 = static_cast<int*>(vsym(tls_handle, "gv_tls", "GV_2"));

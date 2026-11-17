@@ -1,9 +1,10 @@
-// Only the loader's Library descriptor and IFUNC execution boundary are adapted.
+// The Library descriptor, namespace eligibility and IFUNC boundary are adapted.
 // Hashing and symbol-table probing are extracted unchanged from elf_loader.cc.
 #pragma once
 #include <algorithm>
 #include <mutex>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -13,8 +14,16 @@
 inline std::recursive_mutex g_mutex;
 
 struct SymbolVersion { uint32_t hash; const char* name; const char* provider; };
+struct Namespace {};
+struct LoaderContext {};
+enum class Architecture { kAuto };
+enum class LookupKind { kHandle };
+struct FixtureProvider { void* (*lookup)(const char*); };
 struct Library {
   std::vector<Library*> dependencies;
+  Namespace* name_space = nullptr;
+  const std::vector<Library*>* load_scope = nullptr;
+  FixtureProvider* provider = nullptr;
   bool has_gnu_hash = false, has_sysv_hash = false;
   uint32_t gnu_maskwords = 1, gnu_shift2 = 5, gnu_nbucket = 1, gnu_symndx = 1, sysv_nbucket = 1;
   const uint64_t* gnu_bloom = nullptr;
@@ -34,6 +43,14 @@ struct Library {
   uint32_t bucket = 0;
   void* (*resolver)() = nullptr;
 };
+
+// Every descriptor in this graph/resource gate is an available ELF of the
+// same architecture in one eligible namespace. Providers are not modeled.
+// Complete production translation-unit gates exercise real namespace policy.
+inline bool Available(Library* library) { return library != nullptr; }
+inline bool MatchesArchitecture(Library*, Architecture) { return true; }
+inline bool Accessible(Namespace*, Library*, const std::vector<Library*>*) { return true; }
+inline bool RefreshProviderGraph(Library*, Architecture, std::string*) { std::abort(); }
 
 uint32_t GnuHash(const char* name);
 uint32_t SysvHash(const char* name);

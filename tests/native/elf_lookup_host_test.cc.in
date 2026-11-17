@@ -1,8 +1,10 @@
 // The production graph walk with observing symbol tables. Real ELF parsing,
-// relocations and Android guest calls are exercised by lookup_graph.c in CI.
+// relocations and Android guest calls are exercised by complete-loader gates.
+// Namespace eligibility is explicitly all-visible in this graph-order unit.
 #include <mutex>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <map>
 #include <set>
@@ -12,10 +14,22 @@
 std::recursive_mutex g_mutex;
 struct Elf64_Sym { int value; };
 struct SymbolVersion { uint32_t hash; const char* name; const char* provider; };
+struct Namespace {};
+struct LoaderContext {};
+enum class Architecture { kAuto };
+enum class LookupKind { kHandle };
+struct FixtureProvider { void* (*lookup)(const char*); };
 struct Library {
   std::vector<Library*> dependencies;
   std::map<std::string, Elf64_Sym> symbols;
+  Namespace* name_space = nullptr;
+  const std::vector<Library*>* load_scope = nullptr;
+  FixtureProvider* provider = nullptr;
 };
+inline bool Available(Library* library) { return library != nullptr; }
+inline bool MatchesArchitecture(Library*, Architecture) { return true; }
+inline bool Accessible(Namespace*, Library*, const std::vector<Library*>*) { return true; }
+inline bool RefreshProviderGraph(Library*, Architecture, std::string*) { std::abort(); }
 static std::vector<Library*> visited;
 static Library* resolved;
 static int checks, failures, hashes, resolutions;

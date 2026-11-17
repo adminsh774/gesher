@@ -1956,6 +1956,10 @@ void SetGuestFpcr(uint32_t value) { ThreadEnv()->SetFpcr(value); }
 uint32_t GuestFpsr() { return ThreadEnv()->Fpsr(); }
 void SetGuestFpsr(uint32_t value) { ThreadEnv()->SetFpsr(value); }
 
+const void* GuestCallerAddress() {
+  return reinterpret_cast<const void*>(ThreadEnv()->host_caller());
+}
+
 void AddVaListFunction(const void* fn, int index) {
   if (fn == nullptr) return;
   {

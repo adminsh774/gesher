@@ -78,7 +78,7 @@ foreach ($transactionExe in 'elf_load_transaction_test.exe', 'elf_load_transacti
 
 # Version-script providers execute through the real translator. Each scenario
 # has its own process and cannot reuse another scenario's retained SONAME.
-foreach ($versionCase in 'lookup-gnu', 'lookup-sysv', 'required', 'weak', 'weak-present', 'unversioned', 'global', 'virtual', 'tls', 'tls-weak', 'tls-weak-present') {
+foreach ($versionCase in 'lookup-gnu', 'lookup-sysv', 'required', 'weak', 'weak-present', 'unversioned', 'global', 'virtual', 'tls', 'tls-weak', 'tls-weak-present', 'tls-scope') {
   Check "arm64: ELF versioned providers and relocations ($versionCase)" {
     A64Run "$a64/elf_versions_test.exe" @((NoDrive "$a64/elf-versions-arm64"), $versionCase, '--arm64') 120
   } @('elf_versions_test all passed')
@@ -86,6 +86,20 @@ foreach ($versionCase in 'lookup-gnu', 'lookup-sysv', 'required', 'weak', 'weak-
 Check 'arm64: actual dlvsym ABI, version selection and thread-local errors' {
   A64Run "$a64/elf_dlvsym_test.exe" @((NoDrive "$a64/elf-versions-arm64"), '--arm64') 120
 } @('elf_dlvsym_test all passed')
+
+# The common loader's x86 callback seam is excluded; the full-shim driver
+# separately observes actual guest X30 through the real ARM translator.
+foreach ($namespaceCase in 'identity', 'memory', 'search', 'scope', 'groups', 'links', 'providers', 'concurrent') {
+  Check "arm64: namespace identity, search and visibility ($namespaceCase)" {
+    A64Run "$a64/elf_namespaces_test.exe" @((NoDrive "$a64/elf-namespaces-arm64"), $namespaceCase, '--arm64') 120
+  } @("ELF namespaces $($namespaceCase):", 'checks passed (translated ARM64)')
+}
+Check 'arm64: full libdl namespaces and actual guest X30 caller transport' {
+  A64Run "$a64/guest_libdl_namespaces_test.exe" @((NoDrive "$a64/elf-namespaces-arm64"), '--arm64') 120
+} @('Actual guest libdl namespace contracts:', 'checks; architecture=AArch64 through real Dynarmic')
+Check 'arm64: NativeActivity entry and typed callbacks use actual guest ownership' {
+  A64Run "$a64/native_activity_guest_test.exe" @((NoDrive "$a64/native-activity-dispatch-arm64"), '--arm64') 120
+} @('NativeActivity dispatch contracts:', 'checks; architecture=AArch64 through real Dynarmic')
 
 # Read-only relocations are applied before guest constructors execute. This
 # goes through the bounded guest runner and cannot pass with a missing fixture.

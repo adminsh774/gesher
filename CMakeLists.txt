@@ -213,6 +213,18 @@ add_executable(elf_dlvsym_test tests/native/elf_dlvsym_test.cc)
 target_compile_options(elf_dlvsym_test PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(elf_dlvsym_test PRIVATE gesher_bionic)
 
+# Valid original namespace graphs and a separately linked full libdl driver.
+add_executable(elf_namespaces_test tests/native/elf_namespaces_test.cc)
+target_compile_options(elf_namespaces_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(elf_namespaces_test PRIVATE gesher_elf)
+add_executable(guest_libdl_namespaces_test tests/native/guest_libdl_namespace_test.cc)
+target_compile_options(guest_libdl_namespaces_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(guest_libdl_namespaces_test PRIVATE gesher_bionic gesher_elf)
+add_executable(native_activity_guest_test tests/native/native_activity_guest_test.cc)
+target_include_directories(native_activity_guest_test PRIVATE compat/bionic)
+target_compile_options(native_activity_guest_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(native_activity_guest_test PRIVATE gesher_bionic gesher_elf)
+
 # Compare guest pthread metadata with independently observed Win32 target stacks.
 add_executable(pthread_attributes_target_test tests/native/pthread_attributes_target_test.cc)
 target_compile_options(pthread_attributes_target_test PRIVATE -Wall -Wextra -Werror)

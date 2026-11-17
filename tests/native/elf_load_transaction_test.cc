@@ -86,11 +86,21 @@ struct Watchdog {
   }
 };
 
+// Only this isolated fixture imports host callbacks outside an ELF provider graph.
+// SFINAE keeps historical-source behavioral controls buildable with the old API.
+template<class T> auto DiagnosticResolver(T& options, int)
+    -> decltype(options.allow_unscoped_resolver = true, options.flags = 0x102, void()) {
+  options.allow_unscoped_resolver = true;
+  options.flags = 0x102;  // Make the existing global-publication assertions meaningful.
+}
+template<class T> void DiagnosticResolver(T&, long) {}
+
 elf::LoadOptions Options(const std::string& directory) {
   elf::LoadOptions options;
   options.search_paths.push_back(directory);
   options.allow_shimmed_needed = false;
   options.stub_unresolved_functions = false;
+  DiagnosticResolver(options, 0);
   return options;
 }
 
@@ -125,7 +135,7 @@ void Unpublished(std::initializer_list<const char*> names) {
     Check(elf::LookupGlobal(symbol.c_str()) == nullptr, "failed graph has no global export");
     bool seen = false;
     elf::ForEachLoaded([&](const elf::PhdrInfo& info) {
-      if (std::strcmp(info.name, name) == 0) seen = true;
+      if ((std::string(info.name).substr(std::string(info.name).find_last_of("/\\") + 1) == name)) seen = true;
       return 0;
     });
     Check(!seen, "failed graph is absent from public program-header iteration");
@@ -234,7 +244,7 @@ void MissingDependencyAndRetry() {
   const bool guest_arm64 = elf::IsAarch64(root);
   elf::ForEachLoaded([&](const elf::PhdrInfo& info) {
     for (const char* name : {"tx_newchild.so", "tx_late.so", "tx_middle.so", "tx_root.so"}) {
-      if (std::strcmp(info.name, name) == 0) {
+      if ((std::string(info.name).substr(std::string(info.name).find_last_of("/\\") + 1) == name)) {
         const auto* headers = static_cast<const Elf64_Phdr*>(info.phdr);
         bool has_tls = false;
         for (size_t i = 0; headers && i < info.phnum; ++i) {

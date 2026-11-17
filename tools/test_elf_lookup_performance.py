@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Verify production ELF lookup order, reentry, bounded stack and allocations.
 
-Compiles actual Lookup, GNU/SysV hashes and symbol-table probes. The descriptor
+Compiles the actual handle BFS, GNU/SysV hashes and symbol-table probes. The descriptor
 owns real ELF symbol/hash tables; SymbolAddress adapts IFUNC execution to a
 reentrant host callback. A deque/visited-set oracle independently checks order.
-Actual Android x86-64/ARM64 graph objects remain separate Windows CI gates.
+Namespace eligibility is an explicit all-visible fixture seam; complete-loader
+namespace and actual Android x86-64/ARM64 graph objects have separate gates.
 """
 from __future__ import annotations
 
@@ -25,10 +26,29 @@ def section(text: str, begin: str, end: str) -> str:
     return text[text.index(begin):text.index(end)]
 
 
-def lookup_section(source: str) -> str:
+def lookup_section(source: str, scope: str | None = None) -> str:
     begin = ("void* LookupVersion(Library* library, const char* name, const char* version) {"
              if "void* LookupVersion(" in source else "void* Lookup(Library* library, const char* name) {")
-    return section(source, begin, "void* LookupGlobal(")
+    public = section(source, begin, "void* LookupGlobal(")
+    if '#include "lookup_scope_internal.h"' not in source:
+        return public
+    if scope is None:
+        raise ValueError("namespace-aware source requires its adjacent lookup_scope_internal.h")
+    result = section(source, "struct ResolvedSymbol {", '#include "lookup_scope_internal.h"')
+    graph = section(scope, "ResolvedSymbol LookupCandidate(", "ResolvedSymbol LookupLinear(")
+    # Already-valid, all-visible fixture handles have this explicit namespace
+    # boundary. Production BFS, candidates and public wrappers are unchanged.
+    adapter = '''
+void* LookupScoped(Library* library, const char* name, const char* version,
+                    LookupKind, const LoaderContext&, std::string*) {
+  std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  if (library == nullptr || name == nullptr) return nullptr;
+  const SymbolVersion requested{version ? SysvHash(version) : 0, version, nullptr};
+  return LookupGraph(library, library->name_space, name, version ? &requested : nullptr,
+                     Architecture::kAuto).address;
+}
+'''
+    return result + graph + adapter + public
 
 
 def main() -> None:
@@ -46,7 +66,12 @@ def main() -> None:
         return (ROOT / path).read_text(encoding="utf-8")
 
     source = read("compat/elf/elf_loader.cc")
-    lookup = lookup_section(source)
+    scope = read("compat/elf/lookup_scope_internal.h") if '#include "lookup_scope_internal.h"' in source else None
+    lookup = lookup_section(source, scope)
+    print("BOUNDARY actual production handle BFS/hash probes; explicit all-visible namespace, descriptor and IFUNC seams", flush=True)
+    print("SOURCE_SHA256 elf_loader.cc " + hashlib.sha256(source.encode()).hexdigest(), flush=True)
+    if scope is not None:
+        print("SOURCE_SHA256 lookup_scope_internal.h " + hashlib.sha256(scope.encode()).hexdigest(), flush=True)
     hashes = source[source.index("uint32_t GnuHash(const char* name) {"):source.index("\n}  // namespace")]
     symbols = section(source, "bool SymbolDefined(const Elf64_Sym* sym) {", "// Resolves an IFUNC:")
     # Observe helper calls without changing their hashing/probing logic.
@@ -89,9 +114,11 @@ def main() -> None:
         inputs = ["contract.cc", "lookup.o"]
         if args.compare_ref:
             old = read("compat/elf/elf_loader.cc", args.compare_ref)
-            reference = lookup_section(old)
-            reference = reference.replace("LookupVersion(", "ReferenceLookupVersion(")
-            reference = reference.replace("void* Lookup(", "void* ReferenceLookup(", 1)
+            old_scope = (read("compat/elf/lookup_scope_internal.h", args.compare_ref)
+                         if '#include "lookup_scope_internal.h"' in old else None)
+            reference = lookup_section(old, old_scope)
+            for name in ("LookupCandidate", "LookupGraph", "LookupScoped", "LookupVersion", "Lookup"):
+                reference = reference.replace(name + "(", "Reference" + name + "(")
             (work / "reference.cc").write_text('#include "envelope.h"\n' + reference, encoding="utf-8")
             inputs += ["reference.cc"]
         executable = work / ("test.exe" if os.name == "nt" else "test")

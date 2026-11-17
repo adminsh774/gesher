@@ -27,12 +27,12 @@ import test_elf_atomic_load as host
 
 FIXTURES = (
     "elf_versions_test.cc", "elf_versions_legacy_control.cc",
-    "elf_versions_fixture.c", "build-elf-versions.sh",
+    "elf_versions_fixture.c", "elf_versions_link_only.c", "elf_versions_tls_scope.c", "build-elf-versions.sh",
     "elf_guest_dlvsym_fixture.c", "elf_guest_dlvsym.map",
     "elf_loader_host_platform.cc", "elf_loader_host_arm64.cc",
 )
 CASES = ("lookup-gnu", "lookup-sysv", "required", "weak", "weak-present",
-         "unversioned", "global", "virtual", "tls", "tls-weak", "tls-weak-present")
+         "unversioned", "global", "virtual", "tls", "tls-weak", "tls-weak-present", "tls-scope")
 
 
 def main() -> int:

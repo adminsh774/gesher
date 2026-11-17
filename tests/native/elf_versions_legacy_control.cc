@@ -14,7 +14,7 @@ int main(int argc, char** argv) {
     return std::strcmp(name, "gv_event") == 0 ? reinterpret_cast<void*>(&Event) : nullptr;
   });
   elf::LoadOptions options;
-  options.allow_shimmed_needed = false;
+  options.allow_shimmed_needed = true;  // Historical callback-only test boundary.
   options.stub_unresolved_functions = false;
   std::string error;
   const std::string path = std::string(argv[1]) + "/lookup-gnu/libgv_provider.so";

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Original guest calls exercise the translator's real libdl ABI overrides.
 extern void* dlsym(void*, const char*);
+extern void* dlopen(const char*, int);
 extern void* dlvsym(void*, const char*, const char*);
 extern const char* dlerror(void);
 
@@ -22,11 +23,14 @@ int gv_guest_dlvsym(void* provider, void* self) {
   if (!old || !current || old() != 11 || current() != 22) return 1;
   if (dlvsym(provider, "gv_value", (const char*)0) != (void*)current) return 2;
 
-  void* open_default = dlsym((void*)0, "open");
-  void* open_versioned = dlvsym((void*)0, "open", "LIBC");
+  void* libc = dlopen("libc.so", 2);
+  void* libm = dlopen("libm.so", 2);
+  if (!libc || !libm) return 3;
+  void* open_default = dlsym(libc, "open");
+  void* open_versioned = dlvsym(libc, "open", "LIBC");
   if (!open_default || open_default != open_versioned) return 3;
-  const unsigned int* env = (const unsigned int*)dlvsym((void*)0, "__fe_dfl_env", "LIBC");
-  if (!env || env != dlsym((void*)0, "__fe_dfl_env")) return 4;
+  const unsigned int* env = (const unsigned int*)dlvsym(libm, "__fe_dfl_env", "LIBC");
+  if (!env || env != dlsym(libm, "__fe_dfl_env")) return 4;
   if (env[0] != 0 || env[1] != 0) return 5;  // ARM FPCR/FPSR default, eight bytes.
 
   Open own_open = (Open)dlvsym(self, "open", "GV_GUEST");
