@@ -12,8 +12,10 @@ import android.app.IAlarmManager;
 import android.app.PendingIntent;
 import android.content.IIntentReceiver;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
 import android.os.WorkSource;
@@ -72,11 +74,12 @@ final class AlarmManagerService extends IAlarmManager.Default
         final IAlarmListener listener;
         final String tag;
         final AlarmManager.AlarmClockInfo alarmClock;
+        final boolean exact;
         int count;  // periods passed when delivered
 
         Alarm(String packageName, int type, long when, long windowLength, long interval,
                 int flags, PendingIntent operation, IAlarmListener listener, String tag,
-                AlarmManager.AlarmClockInfo alarmClock) {
+                AlarmManager.AlarmClockInfo alarmClock, boolean exact) {
             this.packageName = packageName;
             this.type = type;
             this.when = when;
@@ -87,6 +90,7 @@ final class AlarmManagerService extends IAlarmManager.Default
             this.listener = listener;
             this.tag = tag;
             this.alarmClock = alarmClock;
+            this.exact = exact;
         }
 
         boolean rtc() {
@@ -148,10 +152,20 @@ final class AlarmManagerService extends IAlarmManager.Default
     /** Still running this long after PBT_APMSUSPEND: Windows did not sleep after all. */
     private static final long SUSPEND_GIVE_UP_MS = 120_000;
 
+    static volatile AlarmManagerService sLast;
+
     AlarmManagerService(ActivityManagerService am, PackageManagerService pm) {
         mAm = am;
         mPm = pm;
+        sLast = this;
         pm.onPackageRemoval(this::removeAll);
+        if (pm.permissions() != null) {
+            pm.permissions().addOnPermissionChangeListener((pkg, perm, granted) -> {
+                if ("android.permission.SCHEDULE_EXACT_ALARM".equals(perm) && !granted) {
+                    onExactAlarmPermissionRevoked(pkg);
+                }
+            });
+        }
         DeviceWork.add(this);
         // The clock watch (TIME_SET, TIMEZONE_CHANGED, DATE_CHANGED) from the system server's
         // start; in an app's own process (--single-process) from its first alarm.
@@ -192,9 +206,24 @@ final class AlarmManagerService extends IAlarmManager.Default
         if (type < AlarmManager.RTC_WAKEUP || type > AlarmManager.ELAPSED_REALTIME) {
             throw new IllegalArgumentException("Invalid alarm type " + type);
         }
+
+        boolean isExact = (windowLength == AlarmManager.WINDOW_EXACT || alarmClock != null);
+        if (isExact) {
+            boolean hasPermission = hasExactAlarmPermission(callingPackage);
+            if (!hasPermission) {
+                boolean backwardCompat = creator != null && creator.parsed.getTargetSdkVersion() < 31;
+                boolean isSystem = (mAm.callers() != null && mAm.callers().isSystem())
+                        || "android".equals(callingPackage);
+                if (!backwardCompat && !isSystem) {
+                    throw new SecurityException("Caller " + callingPackage
+                            + " does not have SCHEDULE_EXACT_ALARM or USE_EXACT_ALARM");
+                }
+            }
+        }
+
         start();
         Alarm a = new Alarm(callingPackage, type, Math.max(0, triggerAtTime), windowLength,
-                Math.max(0, interval), flags, operation, listener, listenerTag, alarmClock);
+                Math.max(0, interval), flags, operation, listener, listenerTag, alarmClock, isExact);
         synchronized (this) {
             if (mPm.isRemovalPending(callingPackage) || mPm.get(callingPackage) != creator) {
                 throw new SecurityException("Alarm owner changed before publication");
@@ -259,14 +288,88 @@ final class AlarmManagerService extends IAlarmManager.Default
         return nextAlarmClockLocked();
     }
 
+    private boolean hasExactAlarmPermission(String packageName) {
+        if (packageName == null) return false;
+        CallerIdentity callers = mAm != null ? mAm.callers() : null;
+        if (callers != null && callers.isSystem() && "android".equals(packageName)) {
+            return true;
+        }
+        if (callers != null && (callers.callerUid() == Process.SYSTEM_UID
+                || callers.callerUid() == Process.ROOT_UID)) {
+            return true;
+        }
+        if (mPm == null) return false;
+        ApkPackage pkg = mPm.get(packageName);
+        if (pkg == null) return false;
+        if (mPm.permissions() != null) {
+            if (mPm.permissions().checkPermission(packageName, "android.permission.SCHEDULE_EXACT_ALARM")
+                    == PackageManager.PERMISSION_GRANTED) {
+                return true;
+            }
+            if (mPm.permissions().checkPermission(packageName, "android.permission.USE_EXACT_ALARM")
+                    == PackageManager.PERMISSION_GRANTED) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @Override
     public boolean canScheduleExactAlarms(String packageName) {
-        return true;
+        if (packageName == null) return false;
+        CallerIdentity callers = mAm != null ? mAm.callers() : null;
+        if (callers != null && !callers.isSystem()) {
+            callers.requirePackage(packageName);
+        }
+        return hasExactAlarmPermission(packageName);
     }
 
     @Override
     public boolean hasScheduleExactAlarm(String packageName, int userId) {
-        return true;
+        if (packageName == null) return false;
+        CallerIdentity callers = mAm != null ? mAm.callers() : null;
+        if (callers != null && !callers.isSystem()) {
+            callers.requirePackage(packageName);
+        }
+        if (callers != null && callers.isSystem() && "android".equals(packageName)) {
+            return true;
+        }
+        if (callers != null && (callers.callerUid() == Process.SYSTEM_UID
+                || callers.callerUid() == Process.ROOT_UID)) {
+            return true;
+        }
+        if (mPm == null || mPm.permissions() == null) return false;
+        return mPm.permissions().checkPermission(packageName,
+                "android.permission.SCHEDULE_EXACT_ALARM", "default:0", userId)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    public void onExactAlarmPermissionRevoked(String packageName) {
+        if (packageName == null) return;
+        boolean clock = false;
+        int removed = 0;
+        synchronized (this) {
+            int before = mAlarms.size();
+            clock = mAlarms.stream().anyMatch(a -> a.alarmClock != null
+                    && packageName.equals(a.packageName) && a.exact);
+            mAlarms.removeIf(a -> packageName.equals(a.packageName) && a.exact);
+            removed = before - mAlarms.size();
+        }
+        if (removed > 0) {
+            SystemServer.log("alarm: removed " + removed + " exact alarm(s) of " + packageName
+                    + " due to permission revocation");
+            if (clock) alarmClocksChanged();
+            WindowsHost.alarmKick();
+        }
+        Intent intent = new Intent(AlarmManager.ACTION_SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED);
+        intent.setPackage(packageName);
+        intent.addFlags(Intent.FLAG_RECEIVER_REPLACE_PENDING);
+        try {
+            mAm.sendBroadcastFor("android", intent, null);
+        } catch (Throwable t) {
+            SystemServer.log("alarm: " + intent.getAction() + " to " + packageName
+                    + " failed: " + t);
+        }
     }
 
     @Override

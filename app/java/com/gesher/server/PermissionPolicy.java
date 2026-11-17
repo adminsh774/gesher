@@ -34,6 +34,33 @@ public final class PermissionPolicy extends IPermissionManager.Default {
     private final Map<IBinder, AttributionSourceState> mAttributions = new WeakHashMap<>();
     private volatile CallerIdentity mCallers;
 
+    public interface OnPermissionChangeListener {
+        void onPermissionChanged(String packageName, String permission, boolean granted);
+    }
+    private final List<OnPermissionChangeListener> mPermissionListeners = new ArrayList<>();
+
+    public synchronized void addOnPermissionChangeListener(OnPermissionChangeListener listener) {
+        if (listener != null) mPermissionListeners.add(listener);
+    }
+
+    private void notifyPermissionChange(String pkg, String permission, boolean granted) {
+        List<OnPermissionChangeListener> listeners;
+        synchronized (this) {
+            listeners = new ArrayList<>(mPermissionListeners);
+        }
+        for (OnPermissionChangeListener l : listeners) {
+            try {
+                l.onPermissionChanged(pkg, permission, granted);
+            } catch (Throwable t) {
+                SystemServer.log("permissions: listener failed: " + t);
+            }
+        }
+        if (listeners.isEmpty() && AlarmManagerService.sLast != null
+                && "android.permission.SCHEDULE_EXACT_ALARM".equals(permission) && !granted) {
+            AlarmManagerService.sLast.onExactAlarmPermissionRevoked(pkg);
+        }
+    }
+
     PermissionPolicy(PackageManagerService pm) {
         mPm = pm;
         mCatalog = new PermissionCatalog(pm);
@@ -76,6 +103,15 @@ public final class PermissionPolicy extends IPermissionManager.Default {
         if (pkg == null || name == null || !pkg.parsed.getRequestedPermissions().contains(name)) return false;
         if (GmsSignatureSpoofing.PERMISSION_FAKE_PACKAGE_SIGNATURE.equals(name)) {
             return GmsSignatureSpoofing.isTrustedPackage(pkg);
+        }
+        if ("android.permission.SCHEDULE_EXACT_ALARM".equals(name)) {
+            String decision;
+            synchronized (this) { decision = mDecisions.getProperty(key(pkg, name)); }
+            if (decision != null) return "granted".equals(decision);
+            return true;
+        }
+        if ("android.permission.USE_EXACT_ALARM".equals(name)) {
+            return true;
         }
         PermissionInfo info = mCatalog.get(name);
         if (info == null) return false;
@@ -200,9 +236,10 @@ public final class PermissionPolicy extends IPermissionManager.Default {
         requireSystem(); user(userId);
         ApkPackage installed = mPm.get(pkg);
         PermissionInfo info = mCatalog.get(permission);
+        boolean isScheduleExactAlarm = "android.permission.SCHEDULE_EXACT_ALARM".equals(permission);
         if (installed == null || !installed.parsed.getRequestedPermissions().contains(permission)
-                || info == null || (info.protectionLevel & PermissionInfo.PROTECTION_MASK_BASE)
-                        != PermissionInfo.PROTECTION_DANGEROUS) {
+                || info == null || ((info.protectionLevel & PermissionInfo.PROTECTION_MASK_BASE)
+                        != PermissionInfo.PROTECTION_DANGEROUS && !isScheduleExactAlarm)) {
             throw new IllegalArgumentException("Not a requested runtime permission: " + permission);
         }
         synchronized (this) {
@@ -219,6 +256,7 @@ public final class PermissionPolicy extends IPermissionManager.Default {
         }
         invalidateCaches();
         if (NotificationManagerService.sLast != null) NotificationManagerService.sLast.permissionChanged(pkg);
+        notifyPermissionChange(pkg, permission, "granted".equals(decision));
     }
 
     private void invalidateCaches() {
