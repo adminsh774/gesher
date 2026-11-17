@@ -629,6 +629,19 @@ class Env final : public A64::UserCallbacks {
     }
   }
 
+  // Address the same block the guest reads through TPIDR_EL0. Looking up an
+  // existing Env never recopies its images or overwrites the thread's writes.
+  void* TlsAddress(int64_t module_offset, size_t symbol_offset) {
+    std::lock_guard<std::mutex> lock(g_tls_mutex);
+    const DWORD owner = GetCurrentThreadId();
+    auto entry = std::find_if(g_tls_images.begin(), g_tls_images.end(),
+        [module_offset](const TlsImage& ti) { return ti.offset == module_offset; });
+    if (tls_block_ == nullptr || tid_ != owner || entry == g_tls_images.end() ||
+        symbol_offset >= entry->total_size ||
+        (!entry->published && !(entry->prepared && entry->owner_thread == owner))) return nullptr;
+    return tls_block_ + module_offset + symbol_offset;
+  }
+
   // The thread is exiting. Afterwards the Env may be pooled for another thread.
   void Detach() {
     if (thread_ != nullptr) {
@@ -1218,6 +1231,12 @@ Env* ThreadEnv() {
     if (ProfilePeriodMs() > 0) StartProfiler();
   }
   return t_env.get();
+}
+
+void* ApiTlsAddress(int64_t module_offset, size_t symbol_offset) {
+  // ThreadEnv/Attach takes g_tls_mutex itself. Acquire the Env before the
+  // method validates the module; a new Env initializes only visible images.
+  return ThreadEnv()->TlsAddress(module_offset, symbol_offset);
 }
 
 uint64_t EnterGuest(const void* fn, const uint64_t gpr[8], const uint64_t xmm[8],
@@ -1872,6 +1891,18 @@ void ApiAddVaListFunction(const void* fn, int index) { AddVaListFunction(fn, ind
 // every other register, as the TLSDESC calling convention requires.
 void* g_tlsdesc_static = nullptr;
 void* ApiTlsDescStatic(void) { return g_tlsdesc_static; }
+void* g_tlsdesc_unresolved_weak = nullptr;
+// TLSDESC permits only X0 to change. Save X1 on a 16-byte aligned stack, load
+// the addend, subtract this thread's TP and restore X1/SP before returning.
+constexpr uint32_t kTlsDescUnresolvedWeak[] = {
+    0xF81F0FE1u,  // str x1, [sp, #-16]!
+    0xF9400400u,  // ldr x0, [x0, #8]
+    0xD53BD041u,  // mrs x1, tpidr_el0
+    0xCB010000u,  // sub x0, x0, x1
+    0xF84107E1u,  // ldr x1, [sp], #16
+    0xD65F03C0u,  // ret
+};
+void* ApiTlsDescUnresolvedWeak(void) { return g_tlsdesc_unresolved_weak; }
 
 int ApiIsGuestCode(const void* addr) {
   return InGuestCode(reinterpret_cast<uintptr_t>(addr)) ? 1 : 0;
@@ -1897,6 +1928,8 @@ gesher_arm64_api g_api = {
     ApiTlsRollback,
     ApiUnbindHostFunction,
     ApiTlsPrepare,
+    ApiTlsAddress,
+    ApiTlsDescUnresolvedWeak,
 };
 
 }  // namespace
@@ -2162,7 +2195,8 @@ extern "C" __declspec(dllexport) void gesher_arm64_print_guest_state() { PrintGu
 
 extern "C" __declspec(dllexport) const gesher_arm64_api* gesher_arm64_init(
     const gesher_arm64_host* host) {
-  // API4 adds load-abort retirement and retains API3's private va_list format.
+  // API5 adds TLS symbol addresses/resolvers and retains earlier lifecycle
+  // operations and the private va_list format.
   // Reject old hosts before resolving any shim symbol or running code.
   if (host == nullptr || host->version != GESHER_ARM64_API_VERSION) {
     return nullptr;
@@ -2174,6 +2208,8 @@ extern "C" __declspec(dllexport) const gesher_arm64_api* gesher_arm64_init(
     g_return_stub = reinterpret_cast<uintptr_t>(EmitGuestCode(ret_stub, 2));
     uint32_t tlsdesc[] = {0xF9400400u /* ldr x0, [x0, #8] */, kRet};
     g_tlsdesc_static = EmitGuestCode(tlsdesc, 2);
+    g_tlsdesc_unresolved_weak = EmitGuestCode(kTlsDescUnresolvedWeak,
+        sizeof(kTlsDescUnresolvedWeak) / sizeof(kTlsDescUnresolvedWeak[0]));
   }
   InitGuestLibc();
   // First in the chain, so an execute fault in guest code (a host call to a

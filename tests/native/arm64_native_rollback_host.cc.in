@@ -59,6 +59,16 @@ void TestRegions() {
   std::puts("PASS native ARM64 rollback: code removal splits overlaps, preserves outside regions and permits retry");
 }
 
+void TestNativeTlsUnavailable() {
+  REQUIRE(!g_tls_images.empty());
+  // The raw native bridge has no architectural TP attachment. Its public
+  // lookup must not substitute a separate copy of a thread-local variable.
+  REQUIRE(NativeTlsAddress(g_tls_images.front().offset, 0) == nullptr);
+  REQUIRE(NativeTlsAddress(g_tls_images.front().offset, SIZE_MAX) == nullptr);
+  REQUIRE(NativeTlsAddress(-1, 0) == nullptr);
+  std::puts("PASS native ARM64 lookup: unavailable TP attachment returns no fabricated TLS address");
+}
+
 void TestTls() {
   std::array<uint8_t, kTlsBlockSize> live{};
   std::array<uint8_t, kTlsBlockSize> second{};
@@ -267,5 +277,6 @@ int main() {
   fixture::TestTls();
   fixture::TestTlsInteriorReuse();
   fixture::TestTlsPreparation();
+  fixture::TestNativeTlsUnavailable();
   std::puts("Native ARM64 rollback host contracts passed (exact production methods; explicit Win32/live-block seams)");
 }

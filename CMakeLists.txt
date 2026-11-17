@@ -204,6 +204,15 @@ target_compile_options(elf_load_transaction_failure_test PRIVATE -Wall -Wextra -
 target_compile_definitions(elf_load_transaction_failure_test PRIVATE GESHER_ELF_TRANSACTION_FAILURE)
 target_link_libraries(elf_load_transaction_failure_test PRIVATE gesher_elf_transaction_failure)
 
+# Original version-script DSOs cover public lookup and relocation matching; the
+# companion driver calls the actual three-argument libdl shim entry points.
+add_executable(elf_versions_test tests/native/elf_versions_test.cc)
+target_compile_options(elf_versions_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(elf_versions_test PRIVATE gesher_elf)
+add_executable(elf_dlvsym_test tests/native/elf_dlvsym_test.cc)
+target_compile_options(elf_dlvsym_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(elf_dlvsym_test PRIVATE gesher_bionic)
+
 # Compare guest pthread metadata with independently observed Win32 target stacks.
 add_executable(pthread_attributes_target_test tests/native/pthread_attributes_target_test.cc)
 target_compile_options(pthread_attributes_target_test PRIVATE -Wall -Wextra -Werror)

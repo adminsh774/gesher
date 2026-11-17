@@ -118,6 +118,10 @@ bool TlsRollback(int64_t offset, size_t total_size) {
   return g_api && g_api->tls_rollback(offset, total_size) != 0;
 }
 
+void* TlsAddress(int64_t module_offset, size_t symbol_offset) {
+  return g_api && g_api->tls_address ? g_api->tls_address(module_offset, symbol_offset) : nullptr;
+}
+
 void AddVaListFunction(const void* fn, int index) {
   if (g_api) g_api->add_va_list_function(fn, index);
 }
@@ -131,6 +135,10 @@ uint64_t RunProgram(const void* entry, const uint64_t* block, size_t words) {
 void* GuestSymbol(const char* name) { return g_api ? g_api->guest_symbol(name) : nullptr; }
 
 void* TlsDescStatic() { return g_api ? g_api->tlsdesc_static() : nullptr; }
+
+void* TlsDescUnresolvedWeak() {
+  return g_api && g_api->tlsdesc_unresolved_weak ? g_api->tlsdesc_unresolved_weak() : nullptr;
+}
 
 uint64_t CallIfuncResolver(const void* resolver) {
   // bionic's arm64 IFUNC resolvers take (hwcap | _IFUNC_ARG_HWCAP, &arg), with

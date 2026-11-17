@@ -54,6 +54,9 @@ void TlsPublish(int64_t offset, const void* image, size_t image_size, size_t tot
 // Discards only an unpublished reservation owned by this loader thread. Clear
 // the caller's reservation flag on success: its offset can be reused later.
 bool TlsRollback(int64_t offset, size_t total_size);
+// The calling thread's copy of a TLS symbol. Only published modules or this
+// loader thread's prepared image are visible; unknown/out-of-range is nullptr.
+void* TlsAddress(int64_t module_offset, size_t symbol_offset);
 
 // Marks host function `fn` as taking a va_list at argument `index`, so the
 // guest's AAPCS64 va_list is converted when it calls it (the shim's vsnprintf,
@@ -70,6 +73,9 @@ void* GuestSymbol(const char* name);
 
 // The guest TLSDESC resolver for static TLS (descriptor word 1 = TP offset).
 void* TlsDescStatic();
+// Resolver for an unresolved weak TLS symbol: returns addend minus guest TP,
+// so the caller's TLSDESC sequence computes a null address plus the addend.
+void* TlsDescUnresolvedWeak();
 
 // The AT_HWCAP the guest sees: FP, ASIMD, AES, PMULL, SHA1, SHA2, CRC32.
 constexpr uint64_t kGuestHwcap = 0xFB;

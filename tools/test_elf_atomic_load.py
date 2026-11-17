@@ -53,7 +53,9 @@ def run(command: list[str], label: str, *, timeout: int = 120,
     subprocess.run(command, check=True, timeout=timeout, env=env)
 
 
-def snapshot(folder: Path, source_ref: str | None) -> tuple[Path, Path]:
+def snapshot(folder: Path, source_ref: str | None,
+             fixture_names: tuple[str, ...] = FIXTURES,
+             fixture_directories: tuple[str, ...] = ()) -> tuple[Path, Path]:
     source = folder / "source"
     if source_ref:
         revision = subprocess.check_output(
@@ -86,8 +88,10 @@ def snapshot(folder: Path, source_ref: str | None) -> tuple[Path, Path]:
     # files used even while another contributor edits the shared worktree.
     fixtures = folder / "fixtures"
     fixtures.mkdir()
-    for name in FIXTURES:
+    for name in fixture_names:
         shutil.copy2(ROOT / "tests/native" / name, fixtures / name)
+    for name in fixture_directories:
+        shutil.copytree(ROOT / "tests/native" / name, fixtures / name)
     shutil.copytree(ROOT / "tests/native/elf_loader_host_platform",
                     fixtures / "elf_loader_host_platform")
     shutil.copytree(ROOT / "compat/arm64/include", fixtures / "arm64-include")

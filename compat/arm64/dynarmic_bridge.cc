@@ -204,10 +204,22 @@ int NativeTlsRollback(int64_t offset, size_t total_size) {
   return 1;
 }
 
+void* NativeTlsAddress(int64_t /*module_offset*/, size_t /*symbol_offset*/) {
+  // The raw native execution bridge has no guest thread-pointer attachment
+  // yet. A separately allocated lookup copy would disagree with native TLS
+  // instructions, so do not claim a usable current-thread symbol address.
+  return nullptr;
+}
+
 void* g_tlsdesc_static = nullptr;
 
 void* NativeTlsDescStatic(void) {
   return g_tlsdesc_static;
+}
+
+void* NativeTlsDescUnresolvedWeak(void) {
+  // No coherent native guest TP exists yet; leave this relocation unavailable.
+  return nullptr;
 }
 
 int NativeIsGuestCode(const void* addr) {
@@ -270,6 +282,8 @@ gesher_arm64_api g_native_api = {
     NativeTlsRollback,
     NativeUnbindHostFunction,
     NativeTlsPrepare,
+    NativeTlsAddress,
+    NativeTlsDescUnresolvedWeak,
 };
 
 }  // namespace

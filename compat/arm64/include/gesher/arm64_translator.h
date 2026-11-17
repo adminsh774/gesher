@@ -34,10 +34,10 @@
 extern "C" {
 #endif
 
-// Version 4 adds pending-load rollback/private TLS preparation and retains
-// version 3's tagged va_list.
+// Version 5 adds current-thread TLS addresses for dlsym/dlvsym, retaining
+// version 4's rollback/private preparation and version 3's tagged va_list.
 // Neither an old host/new DLL nor a new host/old DLL is compatible.
-#define GESHER_ARM64_API_VERSION 4
+#define GESHER_ARM64_API_VERSION 5
 
 // What the host gives the translator.
 struct gesher_arm64_host {
@@ -109,6 +109,13 @@ struct gesher_arm64_api {
   // Prepare a relocated pending image for its owner only, without committing
   // its lifetime. Nonzero on success; an identical repeat preserves writes.
   int (*tls_prepare)(int64_t offset, const void* image, size_t image_size, size_t total_size);
+  // Current-thread address inside a live TLS module. Pending images are
+  // visible only when prepared and owned by this thread. Returns nullptr
+  // for an unknown module, out-of-range offset or unavailable storage.
+  void* (*tls_address)(int64_t module_offset, size_t symbol_offset);
+  // Guest TLSDESC resolver whose result plus TP equals descriptor word 1.
+  // Used when an undefined weak TLS import has no matching definition.
+  void* (*tlsdesc_unresolved_weak)(void);
 };
 
 // The DLL's one export.

@@ -487,6 +487,69 @@ void TestPreparedAttach() {
   std::puts("PASS ARM64 pending rollback: owner Attach sees private prepared TLS, foreign threads see only committed images");
 }
 
+void TestTlsAddress() {
+  REQUIRE(g_tls_blocks.empty());
+  static const std::array<uint32_t, 2> image{17, 29};
+  const int64_t offset = ApiTlsRegister(sizeof(image), alignof(uint32_t));
+  REQUIRE(offset >= 0);
+  Env owner;
+  REQUIRE(owner.TlsAddress(offset, 0) == nullptr);
+  owner.Attach();
+  REQUIRE(owner.TlsAddress(offset, 0) == nullptr);  // Not prepared yet.
+  REQUIRE(ApiTlsPrepare(offset, image.data(), sizeof(image), sizeof(image)));
+  auto* first = static_cast<uint32_t*>(owner.TlsAddress(offset, 0));
+  auto* second = static_cast<uint32_t*>(owner.TlsAddress(offset, sizeof(uint32_t)));
+  REQUIRE(first == reinterpret_cast<uint32_t*>(owner.tls_block_ + offset));
+  REQUIRE(second == first + 1 && *first == 17 && *second == 29);
+  REQUIRE(owner.TlsAddress(-1, 0) == nullptr && owner.TlsAddress(INT64_MAX, 0) == nullptr);
+  REQUIRE(owner.TlsAddress(offset, sizeof(image)) == nullptr);
+  REQUIRE(owner.TlsAddress(offset, SIZE_MAX) == nullptr);
+  REQUIRE(owner.TlsAddress(offset + 1, 0) == nullptr);
+  *first = 20;
+  *second = 34;
+  REQUIRE(owner.TlsAddress(offset, 0) == first && *first == 20 && *second == 34);
+  REQUIRE(ApiTlsPrepare(offset, image.data(), sizeof(image), sizeof(image)));
+  REQUIRE(*first == 20 && *second == 34);
+  std::barrier rendezvous(2);
+  std::thread foreign([&] {
+    Env other;
+    other.Attach();
+    REQUIRE(other.TlsAddress(offset, 0) == nullptr);
+    REQUIRE(owner.TlsAddress(offset, 0) == nullptr);  // Wrong Env's thread.
+    rendezvous.arrive_and_wait();
+    rendezvous.arrive_and_wait();
+    auto* value = static_cast<uint32_t*>(other.TlsAddress(offset, 0));
+    REQUIRE(value && value != first && value[0] == 17 && value[1] == 29);
+    value[0] = 87;
+    REQUIRE(other.TlsAddress(offset, 0) == value && value[0] == 87);
+  });
+  rendezvous.arrive_and_wait();
+  ApiTlsPublish(offset, image.data(), sizeof(image), sizeof(image));
+  REQUIRE(owner.TlsAddress(offset, 0) == first && *first == 20 && *second == 34);
+  rendezvous.arrive_and_wait();
+  foreign.join();
+  std::thread late([&] {
+    Env other;
+    other.Attach();
+    auto* value = static_cast<uint32_t*>(other.TlsAddress(offset, 0));
+    REQUIRE(value && value != first && value[0] == 17 && value[1] == 29);
+  });
+  late.join();
+  REQUIRE(*first == 20 && *second == 34);
+  const int64_t pending = ApiTlsRegister(sizeof(image), alignof(uint32_t));
+  REQUIRE(ApiTlsPrepare(pending, image.data(), sizeof(image), sizeof(image)));
+  auto* abandoned = static_cast<uint32_t*>(owner.TlsAddress(pending, 0));
+  REQUIRE(abandoned && *abandoned == 17);
+  *abandoned = 93;
+  REQUIRE(ApiTlsRollback(pending, sizeof(image)));
+  REQUIRE(owner.TlsAddress(pending, 0) == nullptr && *abandoned == 0);
+  REQUIRE(owner.TlsAddress(offset, 0) == first && *first == 20 && *second == 34);
+  const int64_t empty = ApiTlsRegister(0, 1);
+  REQUIRE(ApiTlsPrepare(empty, nullptr, 0, 0));
+  REQUIRE(owner.TlsAddress(empty, 0) == nullptr && ApiTlsRollback(empty, 0));
+  std::puts("PASS ARM64 TLS lookup: actual Env block, private ownership, bounds, mutations and thread isolation");
+}
+
 void Cleanup() {
   REQUIRE(g_tls_blocks.empty());
   g_entries.clear();
@@ -515,6 +578,7 @@ int main() {
   fixture::TestTlsInteriorReuse();
   fixture::TestTlsPreparation();
   fixture::TestPreparedAttach();
+  fixture::TestTlsAddress();
   fixture::Cleanup();
   std::puts("ARM64 pending rollback host contracts passed (verbatim production methods; Win32/Jit adapter, no guest execution)");
 }

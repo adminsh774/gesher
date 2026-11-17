@@ -31,6 +31,17 @@ foreach ($transactionExe in 'elf_load_transaction_test.exe', 'elf_load_transacti
   } @('elf_load_transaction_test all passed')
 }
 
+# Each version case uses a fresh process so alternate providers with the same
+# SONAME cannot be satisfied by an earlier scenario's retained library.
+foreach ($versionCase in 'lookup-gnu', 'lookup-sysv', 'required', 'weak', 'weak-present', 'unversioned', 'global', 'virtual', 'tls', 'tls-weak', 'tls-weak-present') {
+  Check "ELF versions: real provider and relocation contracts ($versionCase)" {
+    & "$Dir/elf_versions_test.exe" (NoDrive "$Dir/elf-versions") $versionCase
+  } @('elf_versions_test all passed')
+}
+Check 'ELF versions: actual dlvsym ABI, version selection and thread-local errors' {
+  & "$Dir/elf_dlvsym_test.exe" (NoDrive "$Dir/elf-versions")
+} @('elf_dlvsym_test all passed')
+
 # textrel.so contains dynamic relocations into a read-only pointer table.
 # Its constructor and selftest both require the relocated pointers to work.
 Check 'ELF loader: TEXTREL pages relocate before constructors and selftest' {

@@ -11,6 +11,7 @@
 
 std::recursive_mutex g_mutex;
 struct Elf64_Sym { int value; };
+struct SymbolVersion { uint32_t hash; const char* name; const char* provider; };
 struct Library {
   std::vector<Library*> dependencies;
   std::map<std::string, Elf64_Sym> symbols;
@@ -25,7 +26,7 @@ static void Check(const char* label, bool ok) {
 static uint32_t GnuHash(const char*) { ++hashes; return 123; }
 static uint32_t SysvHash(const char*) { ++hashes; return 456; }
 static const Elf64_Sym* FindDefinedSymbol(Library* lib, const char* name,
-                                         uint32_t gh, uint32_t sh) {
+                                         uint32_t gh, uint32_t sh, const SymbolVersion* = nullptr) {
   Check("cached symbol hashes", gh == 123 && sh == 456);
   visited.push_back(lib);
   const auto it = lib->symbols.find(name);
@@ -35,6 +36,9 @@ static void* SymbolAddress(Library* lib, const Elf64_Sym* sym) {
   resolved = lib;
   ++resolutions;
   return const_cast<Elf64_Sym*>(sym);
+}
+[[maybe_unused]] static void* LookupSymbolAddress(Library* lib, const Elf64_Sym* sym) {
+  return SymbolAddress(lib, sym);
 }
 
 @LOOKUP_IMPLEMENTATION@
