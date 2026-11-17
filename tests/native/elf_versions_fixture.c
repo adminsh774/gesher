@@ -39,8 +39,10 @@ __asm__(".symver gv_hash_new,gv_hash_value@@GV_aQ");
 
 static int ifunc_old_impl(void) { return 71; }
 static int ifunc_new_impl(void) { return 72; }
-static int (*ifunc_old_resolver(void))(void) { return ifunc_old_impl; }
-static int (*ifunc_new_resolver(void))(void) { return ifunc_new_impl; }
+// The resolver is named by the ELF alias, not a C call. Keep it explicitly
+// emitted on the supported NDK compiler as well as newer host compilers.
+static __attribute__((used)) int (*ifunc_old_resolver(void))(void) { return ifunc_old_impl; }
+static __attribute__((used)) int (*ifunc_new_resolver(void))(void) { return ifunc_new_impl; }
 int gv_ifunc_old(void) __attribute__((ifunc("ifunc_old_resolver")));
 int gv_ifunc_new(void) __attribute__((ifunc("ifunc_new_resolver")));
 __asm__(".symver gv_ifunc_old,gv_ifunc@GV_1");
