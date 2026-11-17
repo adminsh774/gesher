@@ -5,12 +5,14 @@
 package com.gesher.server;
 
 import android.app.IUriGrantsManager;
+import android.content.pm.PackageManager;
 import android.content.pm.ParceledListSlice;
 import android.net.Uri;
 import android.os.IBinder;
 
-/** Explicit API outcomes for persistence/owner tokens beyond the ephemeral AM grants. */
+/** Android URI persistence, ownership and privileged administration entry points. */
 public final class UriGrantsManagerService extends IUriGrantsManager.Default {
+    private final PackageManagerService mPm;
     private final CallerIdentity mCallers;
     private final UriGrants mGrants;
 
@@ -21,6 +23,7 @@ public final class UriGrantsManagerService extends IUriGrantsManager.Default {
 
     public UriGrantsManagerService(PackageManagerService pm, ActivityTaskManagerService atm,
             UriGrants uriGrants) {
+        mPm = pm;
         mCallers = new CallerIdentity(pm, atm);
         mGrants = uriGrants;
         if (mGrants != null) {
@@ -31,54 +34,73 @@ public final class UriGrantsManagerService extends IUriGrantsManager.Default {
     private void user(int userId) {
         if (userId != 0) throw new SecurityException("Only user 0 is available");
     }
-    private void host() {
-        if (!mCallers.isSystem()) throw new SecurityException("URI administration requires the host");
+    private void permission(String permission) {
+        if (!mCallers.isSystem() && mPm.permissions().checkPermission(mCallers.callerPackage(), permission)
+                != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("URI operation requires " + permission);
+        }
     }
-    private void target(String packageName) {
-        if (!mCallers.isSystem()) mCallers.requirePackage(packageName);
+    private int callerUid() {
+        int uid = mCallers.callerUid();
+        if (android.os.UserHandle.isIsolated(uid)) {
+            throw new SecurityException("Isolated callers cannot use URI grant administration");
+        }
+        if (!mCallers.isSystem()) mCallers.callerPackage();
+        return uid;
+    }
+    private int persistenceUid(String packageName, int userId) {
+        if (packageName == null) return callerUid();
+        permission(android.Manifest.permission.FORCE_PERSISTABLE_URI_PERMISSIONS);
+        return installedUid(packageName, userId);
+    }
+    private int installedUid(String packageName, int userId) {
+        if (userId != 0) return -1;
+        if ("android".equals(packageName)) return android.os.Process.SYSTEM_UID;
+        if ("com.android.shell".equals(packageName)) return android.os.Process.SHELL_UID;
+        synchronized (mPm) {
+            if (mPm.isRemovalPending(packageName)) return -1;
+            ApkPackage target = mPm.get(packageName);
+            return target == null ? -1 : target.uid();
+        }
     }
     @Override public void takePersistableUriPermission(Uri uri, int modes, String packageName, int userId) {
+        int uid = persistenceUid(packageName, userId);
         user(userId);
-        if (packageName == null) {
-            if (!mCallers.isSystem()) packageName = mCallers.callerPackage();
-        } else {
-            target(packageName);
-        }
-        mGrants.takePersistable(packageName, uri, modes, userId);
+        mGrants.takePersistable(uid, uri, modes, userId);
     }
     @Override public void releasePersistableUriPermission(Uri uri, int modes, String packageName, int userId) {
+        int uid = persistenceUid(packageName, userId);
         user(userId);
-        if (packageName == null) {
-            if (!mCallers.isSystem()) packageName = mCallers.callerPackage();
-        } else {
-            target(packageName);
-        }
-        mGrants.releasePersistable(packageName, uri, modes, userId);
+        mGrants.releasePersistable(uid, uri, modes, userId, packageName == null);
     }
     @Override public void grantUriPermissionFromOwner(IBinder owner, int fromUid, String targetPackage,
             Uri uri, int modes, int sourceUserId, int targetUserId) {
-        host(); user(sourceUserId); user(targetUserId);
-        throw new UnsupportedOperationException("URI owner-token and Intent grants are not implemented");
+        // AOSP resolves the owner before checking fromUid and nullable arguments.
+        user(targetUserId);
+        mGrants.grantFromOwner(owner, fromUid, targetPackage, uri, modes, sourceUserId, targetUserId);
     }
     @Override public ParceledListSlice getGrantedUriPermissions(String packageName, int userId) {
-        host(); user(userId);
-        return new ParceledListSlice(mGrants.list(packageName, false, true));
+        permission(android.Manifest.permission.GET_APP_GRANTED_URI_PERMISSIONS); user(userId);
+        return new ParceledListSlice(mGrants.granted(packageName));
     }
     @Override public void clearGrantedUriPermissions(String packageName, int userId) {
-        host(); user(userId);
-        if (packageName == null) throw new IllegalArgumentException("Missing URI grant package");
-        mGrants.clear(packageName);
+        permission(android.Manifest.permission.CLEAR_APP_GRANTED_URI_PERMISSIONS); user(userId);
+        mGrants.clearGranted(packageName);
     }
     @Override public ParceledListSlice getUriPermissions(String packageName, boolean incoming,
             boolean persistedOnly) {
-        target(packageName);
-        if (packageName == null) throw new IllegalArgumentException("Missing URI grant package");
+        int uid = callerUid();
+        java.util.Objects.requireNonNull(packageName, "packageName");
+        if (installedUid(packageName, 0) != uid) {
+            throw new SecurityException("Package does not belong to the calling UID");
+        }
         return new ParceledListSlice(mGrants.list(packageName, incoming, persistedOnly));
     }
     @Override public int checkGrantUriPermission_ignoreNonSystem(int sourceUid, String targetPackage,
             Uri uri, int modes, int userId) {
-        if (!mCallers.isSystem()) return -1;
+        if (!mCallers.isSystem() && mPm.permissions().checkUidPermission(mCallers.callerUid(),
+                android.Manifest.permission.INTERACT_ACROSS_USERS_FULL, 0) != PackageManager.PERMISSION_GRANTED) return -1;
         user(userId);
-        throw new UnsupportedOperationException("URI owner-token and Intent grants are not implemented");
+        return mGrants.checkGrantUriPermission_ignoreNonSystem(sourceUid, targetPackage, uri, modes, userId);
     }
 }

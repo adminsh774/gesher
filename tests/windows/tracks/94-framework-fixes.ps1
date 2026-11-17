@@ -103,6 +103,14 @@ Check 'services: queued job completion, stopping work and alarm-clock replacemen
   $schedulerWorkOut
 } @('SchedulerWorkContractTest all passed:')
 
+$activityRestoreOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'ActivityRestoreContractTest') 90
+$activityRestoreCode = $LASTEXITCODE
+Check 'services: activity state restoration, process death survival and LaunchActivityItem delivery' {
+  $global:LASTEXITCODE = $activityRestoreCode
+  $activityRestoreOut
+} @('ActivityRestoreContractTest all passed:')
+
 $mediaRequestsOut = FixesRun ($dvmFixes + 'gesher.services.MediaStoreRequestContractTest') 90
 $mediaRequestsCode = $LASTEXITCODE
 Check 'framework: MediaStore request forwarding, provider errors and SDK callback descriptors' {
@@ -292,7 +300,36 @@ $uriGrantsCode = $LASTEXITCODE
 Check 'services: URI delegation, provider patterns, exact identities and scoped revocation' {
   $global:LASTEXITCODE = $uriGrantsCode
   $uriGrantsOut
-} @('UriGrantContractTest all passed: 138 checks; binder=true')
+} @('UriGrantContractTest all passed: 132 checks; binder=true')
+
+# Direct-service fixture: actual metadata publication, persisted record reload,
+# owner retirement, shared UID, file IO concurrency, admin types and quota.
+# Actual APK removal/reinstall is covered by PackageUninstallTest separately;
+# this fixture does not claim to exercise Binder transport or process teardown.
+$persistableUriGrantsOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'PersistableUriGrantContractTest') 90
+$persistableUriGrantsCode = $LASTEXITCODE
+Check 'services: persisted URI records, release, reload and quota' {
+  $global:LASTEXITCODE = $persistableUriGrantsCode
+  $persistableUriGrantsOut
+} @('PersistableUriGrantContractTest all passed: 80 checks')
+
+$uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'PackageUidIsolationContractTest' +
+  (NoDrive (Join-Path $PSScriptRoot '../../dex-services/fixtures/v2only.apk'))) 90
+$uidIsolationCode = $LASTEXITCODE
+Check 'services: per-package identity, distinct UID allocation, sharedUserId and isolation' {
+  $global:LASTEXITCODE = $uidIsolationCode
+  $uidIsolationOut
+} @('PackageUidIsolationContractTest passed:')
+
+$intentUriGrantsOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'IntentUriGrantContractTest') 90
+$intentUriGrantsCode = $LASTEXITCODE
+Check 'services: Intent URI grants, IBinder owner lifecycle and non-system ignore' {
+  $global:LASTEXITCODE = $intentUriGrantsCode
+  $intentUriGrantsOut
+} @('IntentUriGrantContractTest passed: 28 checks')
 
 # Caller identity and URI snapshots must survive actual ActivityThread delivery,
 # relaunch and results, including a PendingIntent holder cleared by its own send.
@@ -410,6 +447,7 @@ foreach ($fixture in @(
   @('NdefDataContractTest', 'NDEF bytes, helpers, malformed input and native Parcel round trips'),
   @('PowerWakeLockCallbackTest', 'wake lock listener callbacks, real held state and token lifetime'),
   @('PackageManifestFlagsTest', 'complete parsed manifest flags preserve installed application state'),
+  @('AppStorageContextTest', 'distinct CE/DE contexts, files, preferences, databases and data migration'),
   @('PackageServiceQueriesTest', 'package UID/group queries and Android 16 dex-module completion'),
   @('BluetoothValueContractTest', 'BLE settings, filters, advertisements and parcels without an adapter'),
   @('MediaStoreContractTest', 'media collections, resolver forwarding and unavailable-provider handling'),

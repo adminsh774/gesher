@@ -135,6 +135,7 @@ final class Installer {
     /**
      * The installed packages, parsed from their code paths, as PackageManagerService scans
      * them at boot. A package that does not parse any more is left out (and logged).
+     * Storage preparation follows SystemServer's verified system-package scan policy.
      */
     static List<ApkPackage> loadInstalled() throws IOException {
         List<ApkPackage> result = new ArrayList<>();
@@ -160,7 +161,7 @@ final class Installer {
                 result.add(open(e));
             } catch (Exception ex) {
                 SystemServer.log("installed package " + e.packageName + " at " + e.codePath
-                        + " does not parse: " + ex);
+                        + " could not be loaded: " + ex);
             }
         }
         return result;
@@ -260,7 +261,6 @@ final class Installer {
         if (!p.packageName.equals(e.packageName)) {
             throw new IllegalStateException("base.apk is " + p.packageName);
         }
-        p.setDataDir(Device.dataDir() + "/data/" + p.packageName);
         // lib/x86_64, or lib/arm64 for an arm64-v8a-only package (docs/arm64.md); its
         // splits count (an .xapk's libraries are in config.arm64_v8a.apk).
         String[] apks = apksOf(e.codePath);
@@ -269,7 +269,6 @@ final class Installer {
                 + NativeLibs.instructionSetDir(abi != null ? abi : NativeLibs.ABI));
         p.setPrimaryCpuAbi(abi);
         p.setInstallTimes(e.firstInstallTime, e.lastUpdateTime);
-        new File(p.dataDir()).mkdirs();
         return p;
     }
 
@@ -350,6 +349,9 @@ final class Installer {
             if (previous != null && previous.hasVerifiedSigningIdentity()
                     && !parsed.updateContinuityFrom(previous)) {
                 throw new SecurityException("INSTALL_FAILED_UPDATE_INCOMPATIBLE: " + pkg);
+            }
+            try (PackageUids.Admission checked = PackageUids.prepare(List.of(parsed), mPm.packages())) {
+                // Preflight only. Parsing/validation never commits shared membership.
             }
             File[] incomingSplits = companionSplits(source);
             if (incomingSplits != null) {
@@ -436,6 +438,9 @@ final class Installer {
                     throw new SecurityException("INSTALL_FAILED_CHANGED_SPLIT: " + pkg);
                 }
             }
+            try (PackageUids.Admission checked = PackageUids.prepare(List.of(staged), mPm.packages())) {
+                // Recheck the copied cluster before stopping the working generation.
+            }
             if (old != null || previous != null) mAtm.forceStopPackage(pkg);
             if (previous != null && !previous.hasVerifiedSigningIdentity()) {
                 mPm.permissions().forgetPackage(pkg);
@@ -462,9 +467,11 @@ final class Installer {
                 }
                 installed.setSystemAddon(true);
             }
-            mEntries.put(pkg, entry);
-            writeRegistry();
-            mPm.add(installed);
+            // The incoming manifest cannot authorize moving an older app's data.
+            // Boot preparation used the committed manifest before any update;
+            // changing defaultToDeviceProtectedStorage later does not migrate CE.
+            installed.prepareInstallDataDirectories(old != null || previous != null);
+            publishInstalled(entry, installed);
             if (old != null && !old.codePath.equals(entry.codePath)) {
                 delete(new File(old.codePath));
             }
@@ -477,6 +484,27 @@ final class Installer {
             return new String[] {pkg, what, code.getPath(), String.valueOf(installed.versionCode())};
         } finally {
             if (tempDir != null) deleteTree(tempDir);
+        }
+    }
+
+    /** Owner creation can fail; finish it before committing the installed registry. */
+    private void publishInstalled(Entry entry, ApkPackage installed) throws IOException {
+        synchronized (mPm) {
+            try (PackageUids.Admission identity = mPm.prepareAdd(installed)) {
+                identity.commit();
+                Entry previous = mEntries.put(entry.packageName, entry);
+                try {
+                    writeRegistry();
+                } catch (IOException | RuntimeException failure) {
+                    if (previous == null) mEntries.remove(entry.packageName);
+                    else mEntries.put(entry.packageName, previous);
+                    // Closing the unaccepted transaction rolls back shared membership,
+                    // signer ownership and the tentative record's UID as one snapshot.
+                    throw failure;
+                }
+                identity.acceptPublished();
+                mPm.publishPrepared(installed);
+            }
         }
     }
 
@@ -493,7 +521,16 @@ final class Installer {
                 SystemServer.log("install " + pkg + ": shared-library context/content changed");
             }
             Dexopt.onInstall(pkg, old.codePath, parsed.sharedLibraries);
-            mPm.add(open(old));
+            ApkPackage installed = open(old);
+            ApkPackage previous = mPm.get(pkg);
+            if (previous != null && previous.isSystemAddon()) {
+                if (!GmsSignatureSpoofing.verifyAddonApk(pkg, installed.apkPath)) {
+                    throw new SecurityException("INSTALL_FAILED_UNTRUSTED_ADDON_UPDATE: " + pkg);
+                }
+                installed.setSystemAddon(true);
+            }
+            installed.prepareInstalledDataDirectories();
+            mPm.add(installed);
         }
         return new String[] {pkg, "unchanged", old.codePath,
                 String.valueOf(parsed.versionCode())};
@@ -614,11 +651,15 @@ final class Installer {
             if (notifications != null) notifications.packageRemoved(packageName);
             // Retire any background start already queued while capabilities were canceled.
             mAtm.forceStopPackage(packageName);
-            quarantine.stage();
-            mEntries.remove(packageName);
-            writeRegistry();
-            committed = true;
-            mPm.remove(packageName);
+            try (PackageUids.Admission identity = PackageUids.prepareRetire(target)) {
+                quarantine.stage();
+                identity.commit();
+                mEntries.remove(packageName);
+                writeRegistry();
+                committed = true;
+                identity.acceptPublished();
+                mPm.removePrepared(packageName);
+            }
         } catch (IOException | RuntimeException failure) {
             if (!committed) {
                 mEntries.put(packageName, e);

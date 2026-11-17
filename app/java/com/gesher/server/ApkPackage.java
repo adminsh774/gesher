@@ -33,6 +33,7 @@ import com.android.internal.pm.parsing.pkg.ParsedPackage;
 import com.android.internal.pm.pkg.component.ParsedActivity;
 import com.android.internal.pm.pkg.component.ParsedComponent;
 import com.android.internal.pm.pkg.component.ParsedIntentInfo;
+import com.android.internal.pm.pkg.component.ParsedMainComponent;
 
 import java.io.File;
 import java.io.IOException;
@@ -81,40 +82,109 @@ public final class ApkPackage {
     private long mInstallTime = System.currentTimeMillis();
     private long mUpdateTime = mInstallTime;
     private String mDataDir;
+    private AppDataStorage mDataStorage;
     private String mNativeLibraryDir;  // null: <data dir>/lib
     private String mPrimaryCpuAbi;     // null: no native code (NativeLibs.abiFor)
     private final boolean mHasCode;
     private Boolean mVerifiedMicrogSigner;
-    private final int mUid;
+    private int mUid;
+    // Parsing an archive is not package admission. Only the server's identity
+    // transaction may attach a stable UID after validating the complete candidate.
+    private boolean mUidPending;
     private boolean mSystemAddon;
     private boolean mSigningIdentityChecked;
     private Signature[] mVerifiedSignatures;
     private int mVerifiedSignatureSchemeVersion;
     private com.android.apksig.SigningCertificateLineage mVerifiedLineage;
-    // Immutable snapshots: metadata generation also runs outside the PM monitor.
-    private volatile Map<String, Integer> mComponentStates = Collections.emptyMap();
+    // A parsed record can be used before a package service owns it (standalone tools).
+    // Installed records all read the service's single atomic enabled-state snapshot.
+    private volatile PackageEnabledStore.State mLocalEnabledState = PackageEnabledStore.State.DEFAULT;
+    private volatile PackageEnabledStore mEnabledStore;
+    private String mEnabledOwner;
+    // Only a committed non-DONT_KILL_APP change retires this process generation.
+    // Component cleanup itself follows AOSP's current enabled state at dispatch.
+    private EnabledProcess mEnabledProcess;
+    private static final class EnabledProcess implements java.util.function.BooleanSupplier {
+        volatile boolean current = true;
+        @Override public boolean getAsBoolean() { return current; }
+    }
+
+    synchronized java.util.function.BooleanSupplier enabledProcessLifetime() {
+        if (mEnabledProcess == null) mEnabledProcess = new EnabledProcess();
+        return mEnabledProcess;
+    }
+
+    synchronized void retireEnabledProcesses() {
+        if (mEnabledProcess != null) mEnabledProcess.current = false;
+        mEnabledProcess = null;
+    }
+
+    void attachEnabledState(PackageEnabledStore store, String owner) {
+        mEnabledOwner = owner; mEnabledStore = store;
+    }
+    boolean hasEnabledState(PackageEnabledStore store) {
+        return mEnabledStore == store && mEnabledOwner != null;
+    }
+    String enabledStateOwner() { return mEnabledOwner; }
+    PackageEnabledStore.State enabledState() {
+        PackageEnabledStore store = mEnabledStore;
+        if (store != null) return store.state(packageName, mEnabledOwner);
+        return mLocalEnabledState == null ? PackageEnabledStore.State.DEFAULT : mLocalEnabledState;
+    }
+    int applicationEnabledState() { return enabledState().application(); }
 
     int componentEnabledState(String name) {
-        Map<String, Integer> states = mComponentStates;
-        Integer state = states == null ? null : states.get(name);
-        return state == null ? PackageManager.COMPONENT_ENABLED_STATE_DEFAULT : state;
+        return enabledState().component(name);
     }
 
     synchronized void setComponentEnabledState(String name, int state) {
-        Map<String, Integer> states = mComponentStates == null ? new LinkedHashMap<>()
-                : new LinkedHashMap<>(mComponentStates);
-        if (state == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT) states.remove(name);
-        else states.put(name, state);
-        mComponentStates = Collections.unmodifiableMap(states);
-    }
-
-    /** An update keeps installed component settings; a fresh install has none. */
-    void inheritComponentStates(ApkPackage previous) {
-        if (previous != null && previous != this) mComponentStates = previous.mComponentStates;
+        PackageEnabledStore.State next = enabledState().component(name, state);
+        if (mEnabledStore == null) mLocalEnabledState = next;
+        else mEnabledStore.commit(Map.of(packageName, new PackageEnabledStore.Entry(mEnabledOwner, next)));
     }
 
     void clearComponentStates() {
-        mComponentStates = Collections.emptyMap();
+        retireEnabledProcesses();
+        mEnabledStore = null; mEnabledOwner = null;
+        mLocalEnabledState = PackageEnabledStore.State.DEFAULT;
+    }
+
+    boolean matchesEnabledApplication(long flags) {
+        return matchesEnabledApplication(enabledState(), flags);
+    }
+
+    enum ComponentKind { ACTIVITY, SERVICE, RECEIVER, PROVIDER }
+
+    /** Admission after an asynchronous wait must use today's installed state and family. */
+    boolean componentEnabled(String name, ComponentKind kind) {
+        PackageEnabledStore.State state = enabledState();
+        if (!matchesEnabledApplication(state, 0)) return false;
+        List<? extends ParsedMainComponent> declarations = switch (kind) {
+            case ACTIVITY -> parsed.getActivities();
+            case SERVICE -> parsed.getServices();
+            case RECEIVER -> parsed.getReceivers();
+            case PROVIDER -> parsed.getProviders();
+        };
+        for (ParsedMainComponent component : declarations) {
+            if (!component.getName().equals(name)) continue;
+            return switch (state.component(name)) {
+                case PackageManager.COMPONENT_ENABLED_STATE_ENABLED -> true;
+                case PackageManager.COMPONENT_ENABLED_STATE_DISABLED -> false;
+                default -> component.isEnabled();
+            };
+        }
+        return false;
+    }
+    private boolean matchesEnabledApplication(PackageEnabledStore.State state, long flags) {
+        if ((flags & PackageManager.MATCH_DISABLED_COMPONENTS) != 0) return true;
+        return switch (state.application()) {
+            case PackageManager.COMPONENT_ENABLED_STATE_ENABLED -> true;
+            case PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER -> false;
+            case PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED ->
+                    (flags & PackageManager.MATCH_DISABLED_UNTIL_USED_COMPONENTS) != 0 && parsed.isEnabled();
+            default -> parsed.isEnabled();
+        };
     }
 
     private ApkPackage(String apkPath, ParsedPackage parsed) throws IOException {
@@ -124,7 +194,9 @@ public final class ApkPackage {
         if ("android".equals(packageName)) {
             throw new SecurityException("The platform package name is reserved");
         }
-        mUid = PackageUids.uidFor(packageName);
+        mUid = -1;
+        mUidPending = true;
+        parsed.setUid(-1);
         // Resolve the newly parsed APK, including before an install replaces the old one.
         sharedLibraries = SharedLibraryRegistry.resolve(parsed);
         mHasCode = parsed.isDeclaredHavingCode() && hasDex(apkPath);
@@ -138,7 +210,8 @@ public final class ApkPackage {
                 }
             }
         }
-        setDataDir(env("ANDROID_DATA", "/data") + "/data/" + packageName);
+        mDataStorage = AppDataStorage.installed(new File(Device.dataDir()), packageName);
+        mDataDir = mDataStorage.credential.toString();
     }
 
     /** PackageParser2's callback outside system_server: no compat change is enabled. */
@@ -312,13 +385,48 @@ public final class ApkPackage {
                 + parsed.getTargetSdkVersion();
     }
 
-    /** The app's data directory (default {@code $ANDROID_DATA/data/<package>}). */
+    /** An explicit CE directory override; its separate DE directory is a sibling. */
     public void setDataDir(String dataDir) {
-        mDataDir = dataDir;
+        mDataStorage = AppDataStorage.custom(dataDir);
+        mDataDir = mDataStorage.credential.toString();
     }
 
+    /** AOSP ScanPackageUtils permits this manifest default only for system packages. */
+    private boolean defaultsToDeviceProtectedStorage() {
+        return mSystemAddon && parsed.isDefaultToDeviceProtectedStorage();
+    }
+
+    /** The effective installed default area after system-package policy is applied. */
     public String dataDir() {
+        return defaultsToDeviceProtectedStorage() ? deviceProtectedDataDir() : mDataDir;
+    }
+
+    public String credentialProtectedDataDir() {
         return mDataDir;
+    }
+
+    public String deviceProtectedDataDir() {
+        return mDataStorage != null ? mDataStorage.device.toString()
+                : mDataDir == null ? null : AppDataStorage.custom(mDataDir).device.toString();
+    }
+
+    /** Prepare a launch/new install, without guessing which manifest created legacy data. */
+    public void prepareDataDirectories() throws IOException {
+        storage().prepare(defaultsToDeviceProtectedStorage(), false);
+    }
+
+    /** Only the already committed installed manifest may authorize legacy default-DE migration. */
+    void prepareInstalledDataDirectories() throws IOException {
+        storage().prepare(defaultsToDeviceProtectedStorage(), true);
+    }
+
+    void prepareInstallDataDirectories(boolean replacing) throws IOException {
+        if (replacing) storage().prepareUpdate(defaultsToDeviceProtectedStorage());
+        else prepareDataDirectories();
+    }
+
+    private AppDataStorage storage() {
+        return mDataStorage != null ? mDataStorage : AppDataStorage.custom(mDataDir);
     }
 
     /**
@@ -353,6 +461,13 @@ public final class ApkPackage {
     }
 
     public int uid() { return mUid; }
+    public String sharedUserId() { return parsed != null ? parsed.getSharedUserId() : null; }
+    boolean uidPending() { return mUidPending; }
+    void assignUid(int uid) {
+        mUid = uid;
+        mUidPending = uid < 0;
+        parsed.setUid(uid);
+    }
     void setSystemAddon(boolean enabled) {
         if (enabled) {
             Signature[] verified = verifiedSignatures();
@@ -430,6 +545,37 @@ public final class ApkPackage {
     }
 
     public boolean hasVerifiedSigningIdentity() { return verifiedSignatures() != null; }
+
+    /** Signing lineage derived solely from a successful full APK verifier. */
+    synchronized SigningDetails verifiedSigningDetails() {
+        Signature[] current = verifiedSignatures();
+        if (current == null) return SigningDetails.UNKNOWN;
+        try {
+            Signature[] past = null;
+            if (mVerifiedLineage != null) {
+                List<X509Certificate> certificates = mVerifiedLineage.getCertificatesInLineage();
+                if (!certificates.isEmpty() && current.length == 1
+                        && current[0].equals(new Signature(certificates.get(certificates.size() - 1).getEncoded()))) {
+                    past = new Signature[certificates.size()];
+                    for (int i = 0; i < past.length; i++) {
+                        X509Certificate certificate = certificates.get(i);
+                        past[i] = new Signature(certificate.getEncoded());
+                        var capabilities = mVerifiedLineage.getSignerCapabilities(certificate);
+                        int flags = 0;
+                        if (capabilities.hasInstalledData()) flags |= SigningDetails.CertCapabilities.INSTALLED_DATA;
+                        if (capabilities.hasSharedUid()) flags |= SigningDetails.CertCapabilities.SHARED_USER_ID;
+                        if (capabilities.hasPermission()) flags |= SigningDetails.CertCapabilities.PERMISSION;
+                        if (capabilities.hasRollback()) flags |= SigningDetails.CertCapabilities.ROLLBACK;
+                        if (capabilities.hasAuth()) flags |= SigningDetails.CertCapabilities.AUTH;
+                        past[i].setFlags(flags);
+                    }
+                }
+            }
+            return new SigningDetails(current, mVerifiedSignatureSchemeVersion, past);
+        } catch (Exception invalid) {
+            throw new SecurityException("Invalid verified signing lineage", invalid);
+        }
+    }
 
     public String verifiedSignerSha256() {
         Signature[] signatures = verifiedSignatures();
@@ -527,12 +673,15 @@ public final class ApkPackage {
         if ((flags & DIRECT_BOOT) == 0) {
             flags |= DIRECT_BOOT;
         }
-        PackageInfo pi = PackageInfoCommonUtils.generate(parsed, flags, 0 /* userId */);
-        installed(pi.applicationInfo);
-        pi.activities = installedComponents(pi.activities, pi.applicationInfo, flags);
-        pi.receivers = installedComponents(pi.receivers, pi.applicationInfo, flags);
-        pi.services = installedComponents(pi.services, pi.applicationInfo, flags);
-        pi.providers = installedComponents(pi.providers, pi.applicationInfo, flags);
+        PackageEnabledStore.State state = enabledState();
+        // Include manifest-disabled declarations before applying installed overrides.
+        PackageInfo pi = PackageInfoCommonUtils.generate(parsed,
+                flags | PackageManager.MATCH_DISABLED_COMPONENTS, 0 /* userId */);
+        installed(pi.applicationInfo, state, flags);
+        pi.activities = installedComponents(pi.activities, pi.applicationInfo, flags, state);
+        pi.receivers = installedComponents(pi.receivers, pi.applicationInfo, flags, state);
+        pi.services = installedComponents(pi.services, pi.applicationInfo, flags, state);
+        pi.providers = installedComponents(pi.providers, pi.applicationInfo, flags, state);
         pi.firstInstallTime = mInstallTime;
         pi.lastUpdateTime = mUpdateTime;
         return GmsSignatureSpoofing.maybeSpoofPackageInfo(this, pi, flags);
@@ -540,16 +689,18 @@ public final class ApkPackage {
 
     /** Apply installed state once, including provider startup and activity-options queries. */
     private <T extends ComponentInfo> T[] installedComponents(T[] components,
-            ApplicationInfo application, long flags) {
+            ApplicationInfo application, long flags, PackageEnabledStore.State state) {
         if (components == null) return null;
-        Map<String, Integer> states = mComponentStates;
         boolean includeDisabled = (flags & PackageManager.MATCH_DISABLED_COMPONENTS) != 0;
+        boolean applicationMatches = matchesEnabledApplication(state, flags);
         int count = 0;
         for (T info : components) {
             component(info, application);
-            Integer state = states == null ? null : states.get(info.name);
-            if (state != null) info.enabled = state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
-            if (includeDisabled || info.enabled) components[count++] = info;
+            int componentState = state.component(info.name);
+            if (componentState != PackageManager.COMPONENT_ENABLED_STATE_DEFAULT) {
+                info.enabled = componentState == PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
+            }
+            if (includeDisabled || applicationMatches && info.enabled) components[count++] = info;
         }
         return count == components.length ? components
                 : count == 0 ? null : Arrays.copyOf(components, count);
@@ -815,14 +966,18 @@ public final class ApkPackage {
     }
 
     /** What installing gives a package beyond its manifest: paths, uid, data, enabled. */
-    private void installed(ApplicationInfo ai) {
+    private void installed(ApplicationInfo ai, PackageEnabledStore.State state, long flags) {
         ai.sourceDir = apkPath;
         ai.publicSourceDir = apkPath;
         if (ai.processName == null) {
             ai.processName = packageName;
         }
         ai.uid = mUid;
-        ai.enabled = true;
+        ai.enabledSetting = state.application();
+        ai.enabled = state.application() == PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                || state.application() == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT && parsed.isEnabled()
+                || state.application() == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED
+                    && (flags & PackageManager.MATCH_DISABLED_UNTIL_USED_COMPONENTS) != 0;
         // PackageParser2 returns a ParsedPackage, before PackageImpl.hideAsFinal
         // fills its cached ApplicationInfo flags. Derive all manifest flags using
         // the same AOSP helpers; restoring individual flags leaves heap, network,
@@ -831,6 +986,11 @@ public final class ApkPackage {
         ai.flags = (ai.flags | AppInfoUtils.appInfoFlags(parsed))
                 & ~ApplicationInfo.FLAG_HAS_CODE;
         ai.privateFlags |= AppInfoUtils.appInfoPrivateFlags(parsed);
+        if (!defaultsToDeviceProtectedStorage()) {
+            // Parsed manifest flags have not passed AOSP's system-package scan policy.
+            // The published default flag and all directory preparation must agree.
+            ai.privateFlags &= ~ApplicationInfo.PRIVATE_FLAG_DEFAULT_TO_DEVICE_PROTECTED_STORAGE;
+        }
         ai.flags |= ApplicationInfo.FLAG_INSTALLED;
         if (mSystemAddon) {
             ai.flags |= ApplicationInfo.FLAG_SYSTEM;
@@ -849,9 +1009,9 @@ public final class ApkPackage {
         ai.privateFlagsExt |= AppInfoUtils.appInfoPrivateFlagsExt(parsed,
                 false /* not allowlisted for hidden APIs */)
                 & ~ApplicationInfo.PRIVATE_FLAG_EXT_ATTRIBUTIONS_ARE_USER_VISIBLE;
-        ai.dataDir = mDataDir;
-        ai.credentialProtectedDataDir = mDataDir;
-        ai.deviceProtectedDataDir = mDataDir;
+        ai.dataDir = dataDir();
+        ai.credentialProtectedDataDir = credentialProtectedDataDir();
+        ai.deviceProtectedDataDir = deviceProtectedDataDir();
         ai.nativeLibraryDir = nativeLibraryDir();
         ai.primaryCpuAbi = mPrimaryCpuAbi;
 

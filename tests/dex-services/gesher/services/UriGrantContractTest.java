@@ -42,7 +42,7 @@ import sun.misc.Unsafe;
 public final class UriGrantContractTest {
     private static final String OWNER = "fixture.uri.owner", DELEGATE = "fixture.uri.delegate";
     private static final String BOTH = "fixture.uri.both", CLIENT = "fixture.uri.client";
-    private static final String OTHER = "fixture.uri.other", COLLISION = "fixture.uri.collision";
+    private static final String OTHER = "fixture.uri.other", PEER = "fixture.uri.peer";
     private static final String READ_PERMISSION = "fixture.uri.permission.READ";
     private static final String WRITE_PERMISSION = "fixture.uri.permission.WRITE";
     private static final String BLOCKED_PERMISSION = "fixture.uri.permission.BLOCKED";
@@ -131,6 +131,7 @@ public final class UriGrantContractTest {
         set(record, "apkPath", "/fixture/" + name + "/base.apk"); set(record, "mUid", uid);
         set(record, "mDataDir", "/fixture/" + name + "/data");
         set(record, "sharedLibraries", SharedLibraryGraph.EMPTY);
+        set(record, "mEnabledOwner", "fixture-install-owner:" + name);
         return record;
     }
     private static IBinder token() {
@@ -165,12 +166,10 @@ public final class UriGrantContractTest {
             records.put(BOTH, record(BOTH, 12103, READ_PERMISSION, WRITE_PERMISSION));
             records.put(CLIENT, record(CLIENT, 12104));
             records.put(OTHER, record(OTHER, 12105));
-            records.put(COLLISION, record(COLLISION, 12101));
-            if (binder) {
-                pm = new PackageManagerService(records.values());
-            } else {
-                // Omit only the unrelated PackageInstaller Binder construction.
-                // Provider projection and the complete permission policy stay real.
+            // Seed admitted provider/shared-UID metadata. Signed identity admission
+            // is exercised by PackageUidIsolationContractTest, not by these manifests.
+            records.put(PEER, record(PEER, 12101));
+            {
                 pm = (PackageManagerService) unsafe.allocateInstance(PackageManagerService.class);
                 set(pm, "mPackages", new LinkedHashMap<>(records));
                 set(pm, "mRemoving", new LinkedHashMap<String, ApkPackage>());
@@ -253,14 +252,23 @@ public final class UriGrantContractTest {
                     new Class<?>[]{String.class, boolean.class, boolean.class}, target, true, false);
         }
         String snapshot() throws Exception {
-            StringBuilder text = new StringBuilder();
-            for (Object grant : (List<?>) field(grants.getClass(), "mGrants").get(grants)) {
-                for (String key : new String[]{"owner", "target", "uri", "modes", "prefix"}) {
-                    Object value = field(grant.getClass(), key).get(grant);
-                    text.append(value instanceof ApkPackage ? ((ApkPackage) value).packageName : value).append('|');
+            List<String> rows = new ArrayList<>();
+            Map<?, ?> uids = (Map<?, ?>) field(grants.getClass(), "mGrants").get(grants);
+            for (Object table : uids.values()) {
+                for (Object permission : ((Map<?, ?>) table).values()) {
+                    StringBuilder row = new StringBuilder();
+                    for (String key : new String[]{"sourcePackage", "targetPackage", "targetUid", "identity"}) {
+                        row.append(field(permission.getClass(), key).get(permission)).append('|');
+                    }
+                    Object modes = field(permission.getClass(), "modes").get(permission);
+                    for (String key : new String[]{"global", "persistable", "persisted", "persistedTime"}) {
+                        row.append(field(modes.getClass(), key).get(modes)).append('|');
+                    }
+                    rows.add(row.toString());
                 }
             }
-            return text.toString();
+            java.util.Collections.sort(rows);
+            return rows.toString();
         }
         void rejected(Class<? extends Throwable> type, Operation operation) throws Exception {
             String before = snapshot();
@@ -300,7 +308,8 @@ public final class UriGrantContractTest {
         h.rejected(SecurityException.class, () -> h.grant(DELEGATE, CLIENT, uri("path", "/outside"), READ));
         Uri privateUri = uri("private", "/item");
         h.rejected(SecurityException.class, () -> h.grant(BOTH, CLIENT, privateUri, READ));
-        h.rejected(SecurityException.class, () -> h.grant(COLLISION, CLIENT, privateUri, READ));
+        h.grant(PEER, CLIENT, privateUri, READ);
+        h.access(CLIENT, privateUri, READ, true);
         h.grant(OWNER, CLIENT, privateUri, READ); h.acquire(CLIENT, privateUri);
         h.grant(CLIENT, OTHER, privateUri, READ); h.access(OTHER, privateUri, READ, true);
         h.rejected(SecurityException.class, () -> h.grant(CLIENT, OTHER, privateUri, WRITE));
@@ -429,14 +438,21 @@ public final class UriGrantContractTest {
     private static void validation() throws Exception {
         Harness h = new Harness(); Uri value = uri("private", "/item");
         h.grant(OWNER, CLIENT, value, READ);
-        for (Uri invalid : new Uri[]{null, Uri.parse("file:///tmp/item"), Uri.parse("content:/item"),
+        for (Uri invalid : new Uri[]{Uri.parse("content:/item"),
                 Uri.parse("content://10@fixture.uri.private/item"), uri("private", "/a/../item"),
                 uri("private", "/a/%2e%2e/item")}) {
             h.rejected(SecurityException.class, () -> h.grant(OWNER, OTHER, invalid, READ));
         }
-        for (int modes : new int[]{0, 0x40000000, READ | 0x40000000}) {
+        for (int modes : new int[]{0x40000000, READ | 0x40000000}) {
             h.rejected(IllegalArgumentException.class, () -> h.grant(OWNER, OTHER, value, modes));
         }
+        String unchanged = h.snapshot();
+        h.grant(OWNER, OTHER, null, READ);
+        h.grant(OWNER, OTHER, Uri.parse("file:///tmp/item"), READ);
+        h.grant(OWNER, OTHER, value, 0);
+        h.revoke(OWNER, null, null, READ);
+        h.revoke(OWNER, null, value, 0);
+        check(unchanged.equals(h.snapshot()), "No URI or access mode changed existing grants");
         h.grant(OWNER, OTHER, value, READ | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         check(true, "persistable grant accepted");
         h.revoke(OWNER, OTHER, value, READ);
