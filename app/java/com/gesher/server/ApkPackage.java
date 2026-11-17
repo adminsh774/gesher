@@ -124,7 +124,8 @@ public final class ApkPackage {
         if ("android".equals(packageName)) {
             throw new SecurityException("The platform package name is reserved");
         }
-        mUid = PackageUids.uidFor(packageName);
+        mUid = PackageUids.uidFor(packageName, parsed.getSharedUserId());
+        parsed.setUid(mUid);
         // Resolve the newly parsed APK, including before an install replaces the old one.
         sharedLibraries = SharedLibraryRegistry.resolve(parsed);
         mHasCode = parsed.isDeclaredHavingCode() && hasDex(apkPath);
@@ -353,6 +354,7 @@ public final class ApkPackage {
     }
 
     public int uid() { return mUid; }
+    public String sharedUserId() { return parsed != null ? parsed.getSharedUserId() : null; }
     void setSystemAddon(boolean enabled) {
         if (enabled) {
             Signature[] verified = verifiedSignatures();

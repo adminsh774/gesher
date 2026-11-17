@@ -37,6 +37,7 @@ public final class PermissionPolicy extends IPermissionManager.Default {
     PermissionPolicy(PackageManagerService pm) {
         mPm = pm;
         mCatalog = new PermissionCatalog(pm);
+        mCallers = new CallerIdentity(pm, null);
         Properties saved = Device.read(mFile);
         mDecisions = saved == null ? new Properties() : saved;
     }
@@ -85,6 +86,18 @@ public final class PermissionPolicy extends IPermissionManager.Default {
             String decision;
             synchronized (this) { decision = mDecisions.getProperty(key(pkg, name)); }
             if (decision != null) return "granted".equals(decision);
+            String[] shared = mPm.getPackagesForUid(pkg.uid());
+            if (shared != null && shared.length > 1) {
+                for (String otherName : shared) {
+                    if (!otherName.equals(packageName)) {
+                        ApkPackage other = mPm.get(otherName);
+                        if (other != null && other.parsed.getRequestedPermissions().contains(name)) {
+                            synchronized (this) { decision = mDecisions.getProperty(key(other, name)); }
+                            if (decision != null) return "granted".equals(decision);
+                        }
+                    }
+                }
+            }
             // Enabling the protected runtime must not depend on an APK being present;
             // otherwise removing GmsCore would silently re-grant every dangerous perm.
             return !GmsSignatureSpoofing.isEnabled();
@@ -209,11 +222,22 @@ public final class PermissionPolicy extends IPermissionManager.Default {
             if (mPm.get(pkg) != installed || mPm.isRemovalPending(pkg)) {
                 throw new SecurityException("Runtime permission owner changed or is retiring");
             }
-            String key = key(installed, permission);
-            Object previous = mDecisions.setProperty(key, decision);
+            Properties before = new Properties();
+            before.putAll(mDecisions);
+            String[] shared = mPm.getPackagesForUid(installed.uid());
+            if (shared != null && shared.length > 1) {
+                for (String name : shared) {
+                    ApkPackage target = mPm.get(name);
+                    if (target != null && target.parsed.getRequestedPermissions().contains(permission)) {
+                        mDecisions.setProperty(key(target, permission), decision);
+                    }
+                }
+            } else {
+                mDecisions.setProperty(key(installed, permission), decision);
+            }
             try { Device.write(mFile, mDecisions); }
             catch (java.io.IOException e) {
-                if (previous == null) mDecisions.remove(key); else mDecisions.put(key, previous);
+                mDecisions.clear(); mDecisions.putAll(before);
                 throw new IllegalStateException("Cannot persist permission decision", e);
             }
         }

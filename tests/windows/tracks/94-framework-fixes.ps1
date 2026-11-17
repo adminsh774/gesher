@@ -294,6 +294,14 @@ Check 'services: URI delegation, provider patterns, exact identities and scoped 
   $uriGrantsOut
 } @('UriGrantContractTest all passed: 138 checks; binder=true')
 
+$uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'PackageUidIsolationContractTest') 90
+$uidIsolationCode = $LASTEXITCODE
+Check 'services: per-package identity, distinct UID allocation, sharedUserId and isolation' {
+  $global:LASTEXITCODE = $uidIsolationCode
+  $uidIsolationOut
+} @('PackageUidIsolationContractTest passed:')
+
 # Caller identity and URI snapshots must survive actual ActivityThread delivery,
 # relaunch and results, including a PendingIntent holder cleared by its own send.
 . "$PSScriptRoot/../component-caller-contracts.ps1"

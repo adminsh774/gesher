@@ -351,6 +351,23 @@ final class Installer {
                     && !parsed.updateContinuityFrom(previous)) {
                 throw new SecurityException("INSTALL_FAILED_UPDATE_INCOMPATIBLE: " + pkg);
             }
+            String sharedUserId = parsed.sharedUserId();
+            if (sharedUserId != null && !sharedUserId.isEmpty()) {
+                for (ApkPackage existing : mPm.packages()) {
+                    if (!existing.packageName.equals(pkg) && sharedUserId.equals(existing.sharedUserId())) {
+                        if (!parsed.signaturesMatch(existing)) {
+                            throw new SecurityException("INSTALL_FAILED_SHARED_USER_INCOMPATIBLE: " + pkg);
+                        }
+                    }
+                }
+            }
+            if (previous != null) {
+                String prevShared = previous.sharedUserId();
+                if ((prevShared == null && sharedUserId != null)
+                        || (prevShared != null && !prevShared.equals(sharedUserId))) {
+                    throw new SecurityException("INSTALL_FAILED_SHARED_USER_INCOMPATIBLE: " + pkg);
+                }
+            }
             File[] incomingSplits = companionSplits(source);
             if (incomingSplits != null) {
                 for (File split : incomingSplits) {

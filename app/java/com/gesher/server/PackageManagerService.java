@@ -691,8 +691,15 @@ public final class PackageManagerService extends IPackageManager.Default {
     @Override
     public String getNameForUid(int uid) {
         if (uid == android.os.Process.SYSTEM_UID) return "android.uid.system";
+        if (uid == android.os.Process.SHELL_UID) return "com.android.shell";
         String[] names = getPackagesForUid(uid);
-        return names == null || names.length == 0 ? null : names[0];
+        if (names == null || names.length == 0) return null;
+        if (names.length == 1) return names[0];
+        ApkPackage first = get(names[0]);
+        if (first != null && first.sharedUserId() != null && !first.sharedUserId().isEmpty()) {
+            return first.sharedUserId();
+        }
+        return names[0];
     }
 
     @Override
@@ -710,6 +717,7 @@ public final class PackageManagerService extends IPackageManager.Default {
     @Override
     public String[] getPackagesForUid(int uid) {
         if (uid == android.os.Process.SYSTEM_UID) return new String[] {"android"};
+        if (uid == android.os.Process.SHELL_UID) return new String[] {"com.android.shell"};
         List<String> result = new ArrayList<>();
         for (ApkPackage pkg : mPackages.values()) if (pkg.uid() == uid) result.add(pkg.packageName);
         return result.isEmpty() ? null : result.toArray(new String[0]);
@@ -717,7 +725,10 @@ public final class PackageManagerService extends IPackageManager.Default {
 
     @Override
     public int getPackageUid(String name, long flags, int userId) {
-        ApplicationInfo info = userId == 0 ? getApplicationInfo(name, flags, userId) : null;
+        if (userId != 0) return -1;
+        if ("android".equals(name)) return android.os.Process.SYSTEM_UID;
+        if ("com.android.shell".equals(name)) return android.os.Process.SHELL_UID;
+        ApplicationInfo info = getApplicationInfo(name, flags, userId);
         return info == null ? -1 : info.uid;
     }
 

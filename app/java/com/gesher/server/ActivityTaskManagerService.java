@@ -1977,8 +1977,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                     throw new SecurityException("App process does not match its start sequence");
                 }
                 ApkPackage expected = mPm.get(started.packageName);
-                if (GmsSignatureSpoofing.isEnabled()
-                        && (expected == null || expected.uid() != app.uid)) {
+                if (expected == null || expected.uid() != app.uid) {
                     throw new SecurityException("App Binder UID does not match its package");
                 }
                 mStarting.remove(startSeq);
