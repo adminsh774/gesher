@@ -29,6 +29,7 @@ import android.app.servertransaction.TopResumedActivityChangeItem;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.IIntentSender;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
@@ -1214,7 +1215,21 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                                 || "mailto".equalsIgnoreCase(scheme)) {
                             // Also a VIEW for the Windows default browser's package
                             // (BrowserPackageSupport, of which resolve() runs nothing).
-                            boolean opened = sOpenExternalUrl.test(data.toString());
+                            final ActivityRecord resultSource;
+                            final ProcessRecord resultProcess;
+                            synchronized (this) {
+                                ActivityRecord source = requestCode >= 0 ? forToken(resultToToken) : null;
+                                // IntentSender already authenticated its holder before clearing
+                                // Binder identity. The creator is not the result recipient.
+                                boolean authenticated = internalCreator
+                                        ? publication != null && publication.getAsBoolean()
+                                        : originalProcess != null && source != null
+                                            && source.app == originalProcess;
+                                resultSource = authenticated ? source : null;
+                                resultProcess = resultSource == null ? null : resultSource.app;
+                            }
+                            boolean externalTarget = canDelegateExternalUrl(intent, resolvedType);
+                            boolean opened = externalTarget && sOpenExternalUrl.test(data.toString());
                             SystemServer.log("startActivity: Windows external URL "
                                     + (opened ? "opened" : "unavailable") + " (" + scheme + ")");
                             // ActivityStarter cancels a failed launch or detaches an explicit
@@ -1222,15 +1237,13 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                             // result-producing activity finished; do not fabricate that completion.
                             boolean cancelResult = !opened
                                     || (intent.getFlags() & Intent.FLAG_ACTIVITY_NEW_TASK) != 0;
-                            if (cancelResult && requestCode >= 0 && resultToToken != null && originalProcess != null
-                                    && callerProcess(originalPid) == originalProcess) {
-                                ActivityRecord source = forToken(resultToToken);
-                                if (source != null && source.app == originalProcess) {
-                                    deliverResult(source, new ResultInfo(resultWho, requestCode,
-                                            android.app.Activity.RESULT_CANCELED, null, null), null, null);
-                                }
+                            if (cancelResult && resultSource != null && resultProcess != null) {
+                                deliverResult(resultSource, new ResultInfo(resultWho, requestCode,
+                                        android.app.Activity.RESULT_CANCELED, null, null), null, null, resultProcess);
                             }
                             return opened ? ActivityManager.START_SUCCESS
+                                    : !externalTarget && resolutionIntent(intent).getComponent() != null
+                                            ? ActivityManager.START_CLASS_NOT_FOUND
                                     : ActivityManager.START_INTENT_NOT_RESOLVED;
                         }
                     }
@@ -1665,6 +1678,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
     }
 
     private ActivityInfo resolve(Intent intent, String resolvedType, boolean defaultOnly) {
+        intent = resolutionIntent(intent);
         long flags = PackageManager.GET_META_DATA | PackageManager.GET_SHARED_LIBRARY_FILES;
         ActivityInfo info;
         if (intent.getComponent() != null) {
@@ -1683,6 +1697,29 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             info.applicationInfo = mPm.getApplicationInfo(info.packageName, flags, 0);
         }
         return info;
+    }
+
+    /** An unresolved app-specific or filter-constrained request must not become a shell launch. */
+    private boolean canDelegateExternalUrl(Intent intent, String resolvedType) {
+        Intent target = resolutionIntent(intent);
+        if ("mailto".equalsIgnoreCase(intent.getScheme())) {
+            // No synthetic Android mail package is advertised. Only an implicit
+            // mail viewer request may use the Windows protocol handler.
+            if (target.getComponent() != null || target.getPackage() != null) return false;
+            IntentFilter mail = new IntentFilter(Intent.ACTION_VIEW);
+            mail.addCategory(Intent.CATEGORY_DEFAULT);
+            mail.addCategory(Intent.CATEGORY_BROWSABLE);
+            mail.addDataScheme("mailto");
+            return mail.match(target.getAction(), resolvedType != null ? resolvedType : target.getType(),
+                    target.getScheme(), target.getData(), target.getCategories(), "gesher") >= 0;
+        }
+        return mPm.get(BrowserPackageSupport.PACKAGE) == null
+                && !BrowserPackageSupport.queryIntentActivities(target, resolvedType,
+                        PackageManager.MATCH_DEFAULT_ONLY).isEmpty();
+    }
+
+    private static Intent resolutionIntent(Intent intent) {
+        return intent.getComponent() == null && intent.getSelector() != null ? intent.getSelector() : intent;
     }
 
     /**
@@ -3353,29 +3390,42 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         }
         IBinder callerToken = new Binder("Server activity result caller");
         ResultInfo info = new ResultInfo(resultWho, requestCode, resultCode, resultData, callerToken);
-        deliverResult(r, info, callerToken, snapshot);
+        deliverResult(r, info, callerToken, snapshot, null);
     }
 
     /** Launch cancellation has no activity caller token; server UI results retain theirs. */
     private void deliverResult(ActivityRecord r, ResultInfo info, IBinder callerToken,
-            ActivityCallerState.Snapshot snapshot) {
+            ActivityCallerState.Snapshot snapshot, ProcessRecord expectedProcess) {
         boolean resumed;
+        final ProcessRecord recipient;
+        final IApplicationThread recipientThread;
         synchronized (this) {
             if (!mActivities.contains(r) || r.finishing || r.state == State.DESTROYED
                     || !activityCodeCurrent(r)) return;
+            if (expectedProcess != null && (r.app != expectedProcess
+                    || processByPid(expectedProcess.pid) != expectedProcess)) return;
             if (callerToken != null) r.callerState.add(callerToken, snapshot);
             resumed = (r.state == State.RESUMED || r.state == State.LAUNCHING || r.state == State.RESUMING);
             if (!resumed) {
                 r.pendingResults.add(info);
                 return;
             }
+            recipient = r.app;
+            recipientThread = recipient == null ? null : recipient.thread;
         }
-        if (r.app != null && r.app.thread != null) {
+        if (recipientThread != null) {
             List<ResultInfo> list = new ArrayList<>();
             list.add(info);
-            ClientTransaction t = new ClientTransaction(r.app.thread);
+            ClientTransaction t = new ClientTransaction(recipientThread);
             t.addTransactionItem(new ActivityResultItem(r.token, list));
-            schedule(r, t, "ActivityResultItem");
+            // A reattachment after admission must not redirect an old process's
+            // cancellation to its replacement through schedule()'s mutable r.app.
+            SystemServer.log("scheduleTransaction ActivityResultItem to " + r.name() + " in " + recipient);
+            try {
+                recipientThread.scheduleTransaction(t);
+            } catch (RemoteException e) {
+                SystemServer.log("scheduleTransaction to " + recipient + " failed: " + e);
+            }
         }
     }
 
