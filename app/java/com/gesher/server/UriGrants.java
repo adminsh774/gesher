@@ -209,7 +209,7 @@ public final class UriGrants {
                 && Objects.equals(permission.sourceOwner, source.durableOwner());
     }
 
-    /** Listings describe retained records even while a provider component is disabled. */
+    /** Retained permission state survives disabled providers, but not installation retirement. */
     private boolean installedParticipants(Permission permission) {
         ApkPackage target = mPm.get(permission.targetPackage);
         if (!current(target) || target.uid() != permission.targetUid
@@ -226,6 +226,16 @@ public final class UriGrants {
     }
 
     private boolean holdsLocked(int uid, Source source, Uri uri, int flags, boolean requirePrefix) {
+        return holdsLocked(uid, source, uri, flags, requirePrefix, false);
+    }
+
+    private boolean holdsRetainedLocked(int uid, Uri uri, int flags, boolean requirePrefix) {
+        return holdsLocked(uid, null, uri, flags, requirePrefix, true);
+    }
+
+    /** Access and delegation match a resolved provider; state queries validate retained owners. */
+    private boolean holdsLocked(int uid, Source source, Uri uri, int flags, boolean requirePrefix,
+            boolean retained) {
         Map<GrantIdentity, Permission> grants = mGrants.get(uid);
         if (grants == null) return false;
         retireStaleTransientsLocked(grants);
@@ -233,10 +243,12 @@ public final class UriGrants {
         int strength = (flags & Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) != 0
                 ? UriPermissionModes.PERSISTABLE : UriPermissionModes.OWNED;
         Permission exact = grants.get(new GrantIdentity(uri, requirePrefix));
-        if (exact != null && current(exact, source) && exact.modes.strength(flags) >= strength) return true;
+        if (exact != null && (retained ? installedParticipants(exact) : current(exact, source))
+                && exact.modes.strength(flags) >= strength) return true;
         for (Permission permission : grants.values()) {
             if (permission.identity.prefix && matches(permission.identity.uri, true, uri)
-                    && current(permission, source) && permission.modes.strength(flags) >= strength) return true;
+                    && (retained ? installedParticipants(permission) : current(permission, source))
+                    && permission.modes.strength(flags) >= strength) return true;
         }
         return false;
     }
@@ -277,14 +289,15 @@ public final class UriGrants {
         synchronized (mPm) {
             ApkPackage target = name == null ? null : mPm.get(name);
             if (!current(target) || target.uid() != uid) return PackageManager.PERMISSION_DENIED;
-            Source source = source(uri.getAuthority());
-            if (source == null) return PackageManager.PERMISSION_DENIED;
-            if (source.uid() == uid) return PackageManager.PERMISSION_GRANTED;
             synchronized (this) {
-                return holdsLocked(uid, source, uri, modes,
-                        (modes & Intent.FLAG_GRANT_PREFIX_URI_PERMISSION) != 0) ? PackageManager.PERMISSION_GRANTED
-                        : PackageManager.PERMISSION_DENIED;
+                if (holdsRetainedLocked(uid, uri, modes,
+                        (modes & Intent.FLAG_GRANT_PREFIX_URI_PERMISSION) != 0)) {
+                    return PackageManager.PERMISSION_GRANTED;
+                }
             }
+            Source source = source(uri.getAuthority());
+            return source != null && source.uid() == uid ? PackageManager.PERMISSION_GRANTED
+                    : PackageManager.PERMISSION_DENIED;
         }
     }
 
@@ -656,15 +669,14 @@ public final class UriGrants {
         checkPersistableFlags(flags);
         Uri uri = checkedUri(original, userId);
         synchronized (mPm) {
-            Source source = source(uri.getAuthority());
             synchronized (this) {
                 Map<GrantIdentity, Permission> grants = mGrants.get(uid);
                 if (grants != null) retireStaleTransientsLocked(grants);
                 Permission exact = grants == null ? null : grants.get(new GrantIdentity(uri, false));
                 Permission prefix = grants == null ? null : grants.get(new GrantIdentity(uri, true));
-                boolean exactValid = exact != null && current(exact, source)
+                boolean exactValid = exact != null && installedParticipants(exact)
                         && (exact.modes.persistable & flags) == flags;
-                boolean prefixValid = prefix != null && current(prefix, source)
+                boolean prefixValid = prefix != null && installedParticipants(prefix)
                         && (prefix.modes.persistable & flags) == flags;
                 if (!exactValid && !prefixValid) throw new SecurityException("No persistable URI grant for UID " + uid);
                 boolean changed = false;

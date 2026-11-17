@@ -300,7 +300,7 @@ $uriGrantsCode = $LASTEXITCODE
 Check 'services: URI delegation, provider patterns, exact identities and scoped revocation' {
   $global:LASTEXITCODE = $uriGrantsCode
   $uriGrantsOut
-} @('UriGrantContractTest all passed: 132 checks; binder=true')
+} @('UriGrantContractTest all passed: 154 checks; binder=true')
 
 # Direct-service fixture: actual metadata publication, persisted record reload,
 # owner retirement, shared UID, file IO concurrency, admin types and quota.
@@ -312,7 +312,7 @@ $persistableUriGrantsCode = $LASTEXITCODE
 Check 'services: persisted URI records, release, reload and quota' {
   $global:LASTEXITCODE = $persistableUriGrantsCode
   $persistableUriGrantsOut
-} @('PersistableUriGrantContractTest all passed: 80 checks')
+} @('PersistableUriGrantContractTest all passed: 99 checks')
 
 $uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'PackageUidIsolationContractTest' +

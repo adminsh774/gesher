@@ -8,6 +8,8 @@ AOSP frameworks/base revision `45034f0663f960d9ee5fb0a101a4732b71f6e2f4`:
 - [UriPermissionOwner](https://android.googlesource.com/platform/frameworks/base/+/45034f0663f960d9ee5fb0a101a4732b71f6e2f4/services/core/java/com/android/server/uri/UriPermissionOwner.java)
 - [UriGrantsManagerService](https://android.googlesource.com/platform/frameworks/base/+/45034f0663f960d9ee5fb0a101a4732b71f6e2f4/services/core/java/com/android/server/uri/UriGrantsManagerService.java)
 - [ActivityManagerService](https://android.googlesource.com/platform/frameworks/base/+/45034f0663f960d9ee5fb0a101a4732b71f6e2f4/services/core/java/com/android/server/am/ActivityManagerService.java)
+- [ContentProviderHelper](https://android.googlesource.com/platform/frameworks/base/+/45034f0663f960d9ee5fb0a101a4732b71f6e2f4/services/core/java/com/android/server/am/ContentProviderHelper.java)
+- [ContentProvider](https://android.googlesource.com/platform/frameworks/base/+/45034f0663f960d9ee5fb0a101a4732b71f6e2f4/core/java/android/content/ContentProvider.java)
 
 ## Permission state
 
@@ -50,6 +52,26 @@ Advanced `checkUriPermission` queries retain their persistable strength and pref
 identity. The framework `DocumentsProvider` itself queries `READ | PERSISTABLE`
 when preserving an offer across canonicalization or rename.
 
+Retained permission queries and `takePersistableUriPermission` consult the
+canonical permission and its modes, independently of whether the provider is
+currently enabled. This follows `checkUriPermissionLocked` and
+`takePersistableUriPermission` in the pinned AOSP service. Disabling a package or
+provider component does not erase an existing offer, persisted mode or live
+owner membership. Installation epochs and owner retirement still constrain the
+retained record. Provider acquisition, access and new grant publication retain
+their separate current-provider and admission checks; a successful permission
+query does not make a disabled provider available.
+
+Provider acquisition recognizes ownership by authenticated UID, including a
+different package admitted into the provider's shared UID. AOSP's
+`ContentProviderHelper.checkContentProviderPermission` checks the provider UID
+through component permission checks; `ContentProvider` also recognizes the
+owner's app identity before exported/read/write policy. Gesher validates the
+current admitted package identities and provider metadata before matching UIDs.
+Missing, pending, negative or retired identities do not establish ownership.
+An unrelated UID still needs the provider's exported permissions or a real URI
+grant. Acquiring a provider does not grant unrestricted access to its contents.
+
 ## Installation identity and durability
 
 Prepared grants retain the actual source registration/installed-package object
@@ -69,7 +91,8 @@ undergo actual authority and installed-package validation.
 
 Force stop clears transient rights. Permanent package-removal callbacks clear
 both transient and persisted rights. A temporarily disabled provider does not
-erase its retained persisted-list records.
+erase its retained permission records or prevent an eligible retained mode from
+being taken. Explicit revocation and release continue to change that state.
 
 Writes use Android `AtomicFile`, an immutable snapshot and a single queued writer.
 Changes coalesce with the AOSP ten-second delay. Parsing and writing occur outside
@@ -106,14 +129,21 @@ work; the empty registry alone advertises none of those capabilities.
 - `UriPermissionModesOracleTest`: 27,326 assertions against the unmodified pinned
   AOSP `UriPermission` and `UriPermissionOwner`; source blob IDs are recorded in
   `tests/uri/aosp/README.md`.
-- `PersistableUriGrantContractTest`: 80 production-service checks, including
+- `PersistableUriGrantContractTest`: 99 production-service checks, including
   exact/prefix take/release, public/admin result types, timestamps, quota,
   shared UID, owner retirement, actual PM metadata publication, AtomicFile
   incomplete-write recovery, restart, installation epochs, removal callbacks,
-  hosted-provider batch publication and blocked-file-IO concurrency.
-- `UriGrantContractTest`: 132 checks. Existing validation expectations now match
+  hosted-provider batch publication and blocked-file-IO concurrency. Disabled
+  package/component cases exercise first and repeated take, exact and prefix
+  queries, unoffered-mode rejection, transient owner retirement, source/recipient
+  installation epochs, explicit revocation and the separate access check.
+- `UriGrantContractTest`: 154 checks. Existing validation expectations now match
   Android's no-op behavior for absent URI/access modes, and the fixture represents
-  admitted shared UIDs rather than an accidental UID collision.
+  admitted shared UIDs rather than an accidental UID collision. The provider
+  admission cases publish through the production registry and acquire/release
+  through AMS. They cover shared-UID private access, unrelated-UID denial, real
+  URI-grant access/revocation, connection cleanup, invalid metadata and retiring
+  identities.
 - `IntentUriGrantContractTest`: 28 checks through production preparation,
   publication and started-service owner retirement.
 - `TaskStackContractTest --case tasks`: 59 host checks, including reordered,
@@ -131,6 +161,10 @@ Windows gates. No host result claims remote Binder transport, ART, a window,
 an actual document selection, or a signed APK uninstall/reinstall execution.
 Windows track 94 requires the exact URI/persistence check totals; the removal
 fixture is also registered by the existing Windows compatibility runner.
+The existing Windows `ProviderSecurityTest` reads APK UIDs and provider metadata
+after package admission, issues grants as the authenticated provider owner, and
+expects Android's `SecurityException` for a missing persistable offer. Its
+publication, reference, lock-order and retirement assertions remain in place.
 
 A fresh `app/build.sh` attempt regenerated the Binder stubs but stopped at its
 required compatibility-table generation gate: the cached framework API and

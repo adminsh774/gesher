@@ -224,18 +224,28 @@ final class ContentProviders {
     }
 
     private void enforceAccess(String pkg, ProviderInfo info) {
-        if (pkg == null || pkg.equals(info.packageName)) return;
-        ApkPackage target = mPm.get(pkg);
-        boolean uriGrant = target != null && mUriGrants.hasAny(target, info);
-        if (!info.exported && !uriGrant) throw new SecurityException("Content provider is not exported");
-        if (uriGrant || holds(pkg, info.readPermission) || holds(pkg, info.writePermission)) return;
-        if (info.pathPermissions != null) {
-            for (android.content.pm.PathPermission path : info.pathPermissions) {
-                if ((path.getReadPermission() != null && holds(pkg, path.getReadPermission()))
-                        || (path.getWritePermission() != null && holds(pkg, path.getWritePermission()))) return;
+        if (pkg == null) return;
+        synchronized (mPm) {
+            ApkPackage target = mPm.get(pkg);
+            if (target == null || target.uidPending() || target.uid() < 0
+                    || mPm.isRemovalPending(pkg)) throw new SecurityException("Unknown content caller");
+            ApkPackage owner = mPm.get(info.packageName);
+            // Android provider ownership is per UID, including admitted shared-UID
+            // packages. Invalid or retired metadata cannot establish that identity.
+            if (info.applicationInfo != null && info.applicationInfo.uid >= 0
+                    && owner != null && !owner.uidPending() && !mPm.isRemovalPending(owner.packageName)
+                    && owner.uid() == info.applicationInfo.uid && target.uid() == owner.uid()) return;
+            boolean uriGrant = mUriGrants.hasAny(target, info);
+            if (!info.exported && !uriGrant) throw new SecurityException("Content provider is not exported");
+            if (uriGrant || holds(pkg, info.readPermission) || holds(pkg, info.writePermission)) return;
+            if (info.pathPermissions != null) {
+                for (android.content.pm.PathPermission path : info.pathPermissions) {
+                    if ((path.getReadPermission() != null && holds(pkg, path.getReadPermission()))
+                            || (path.getWritePermission() != null && holds(pkg, path.getWritePermission()))) return;
+                }
             }
+            throw new SecurityException("Content provider permissions denied");
         }
-        throw new SecurityException("Content provider permissions denied");
     }
 
     /** The providers a process of {@code ai}'s package installs at bindApplication. */

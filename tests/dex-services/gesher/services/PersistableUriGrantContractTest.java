@@ -391,6 +391,63 @@ public final class PersistableUriGrantContractTest {
                 "An actual prefix offer answers its descendant's advanced query");
     }
 
+    private static void disabledProviderPermissions() throws Exception {
+        Harness h = new Harness(null);
+        Uri exact = Uri.parse("content://" + AUTHORITY + "/disabled/exact");
+        Uri tree = Uri.parse("content://" + AUTHORITY + "/disabled/tree");
+        Uri child = Uri.withAppendedPath(tree, "child");
+        Uri owned = Uri.parse("content://" + AUTHORITY + "/disabled/owned");
+        h.grant(OWNER, CLIENT, exact, READ | PERSISTABLE);
+        h.grant(OWNER, CLIENT, tree, READ | PERSISTABLE | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+        IBinder owner = token();
+        h.owned(owner, CLIENT, owned, READ);
+        ParsedProviderImpl component = (ParsedProviderImpl)
+                ((PackageImpl) h.records.get(OWNER).parsed).getProviders().get(0);
+        component.setEnabled(false);
+
+        // AOSP takes and queries the retained canonical record without resolving
+        // an enabled provider; actual acquisition still needs an available one.
+        h.take(CLIENT, exact, READ);
+        check(h.getPersisted(CLIENT, true).size() == 1,
+                "An existing offer can first be taken while its provider component is disabled");
+        check(!h.canAccess(CLIENT, exact, READ),
+                "Retained permission does not make a disabled provider available for access");
+        h.take(CLIENT, tree, READ);
+        check(h.getPersisted(CLIENT, true).size() == 2
+                && h.checkUri(CLIENT, child, READ | PERSISTABLE
+                        | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION) == PackageManager.PERMISSION_GRANTED,
+                "Disabled providers retain prefix offers and persisted permissions");
+        check(h.checkUri(CLIENT, child, WRITE) == PackageManager.PERMISSION_DENIED,
+                "A disabled provider does not expand retained read modes to write");
+        h.rejected(SecurityException.class, () -> h.take(CLIENT, child, READ));
+        check(h.checkUri(CLIENT, owned, READ) == PackageManager.PERMISSION_GRANTED,
+                "A live owner grant remains queryable while the provider is disabled");
+        h.retire(owner);
+        check(h.checkUri(CLIENT, owned, READ) == PackageManager.PERMISSION_DENIED,
+                "Owner retirement still removes transient permission with a disabled provider");
+        check(h.checkUri(CLIENT, exact, READ | PERSISTABLE) == PackageManager.PERMISSION_GRANTED,
+                "Owner retirement preserves an independently retained persisted permission");
+
+        set(h.records.get(OWNER), "mEnabledOwner", "fixture-next-install:" + OWNER);
+        check(h.checkUri(CLIENT, exact, READ) == PackageManager.PERMISSION_DENIED,
+                "A retired source installation cannot answer a retained permission query");
+        h.rejected(SecurityException.class, () -> h.take(CLIENT, exact, READ));
+        set(h.records.get(OWNER), "mEnabledOwner", "fixture-install-owner:" + OWNER);
+        set(h.records.get(CLIENT), "mEnabledOwner", "fixture-next-install:" + CLIENT);
+        check(h.checkUri(CLIENT, exact, READ) == PackageManager.PERMISSION_DENIED,
+                "A retired recipient installation cannot answer a retained permission query");
+        h.rejected(SecurityException.class, () -> h.take(CLIENT, exact, READ));
+        set(h.records.get(CLIENT), "mEnabledOwner", "fixture-install-owner:" + CLIENT);
+        check(h.checkUri(CLIENT, exact, READ) == PackageManager.PERMISSION_GRANTED,
+                "Only the original admitted installation owns the retained modes");
+
+        h.ugm.clearGrantedUriPermissions(CLIENT, 0);
+        check(h.getPersisted(CLIENT, true).isEmpty()
+                && h.checkUri(CLIENT, exact, READ) == PackageManager.PERMISSION_DENIED,
+                "Explicit administrative revocation remains effective while the provider is disabled");
+        h.rejected(SecurityException.class, () -> h.take(CLIENT, exact, READ));
+    }
+
     private static void persistenceDoesNotHoldStateLocks(File file, Uri uri) throws Exception {
         Harness h = new Harness(file);
         h.grant(OWNER, CLIENT, uri, READ | PERSISTABLE);
@@ -666,6 +723,16 @@ public final class PersistableUriGrantContractTest {
         lifecycle.take(CLIENT, uriPersisted, READ);
         lifecycle.grants.flush();
         ((PackageImpl)lifecycle.records.get(OWNER).parsed).setEnabled(false);
+        lifecycle.take(CLIENT, uriPersisted, READ);
+        check(lifecycle.checkUri(CLIENT, uriPersisted, READ) == PackageManager.PERMISSION_GRANTED,
+                "A retained grant remains queryable after disabling its provider package");
+        check(lifecycle.checkUri(CLIENT, uriPersisted, READ | PERSISTABLE)
+                == PackageManager.PERMISSION_GRANTED,
+                "Disabled provider packages preserve retained persistable strength");
+        check(lifecycle.checkUri(CLIENT, uriPersisted, WRITE) == PackageManager.PERMISSION_DENIED,
+                "A retained read grant does not gain write permission during disablement");
+        check(!lifecycle.canAccess(CLIENT, uriPersisted, READ),
+                "Grant queries do not bypass disabled-package acquisition checks");
         check(lifecycle.getPersisted(CLIENT, true).size() == 1,
                 "Persisted listings retain records while their provider package is disabled");
         ((PackageImpl)lifecycle.records.get(OWNER).parsed).setEnabled(true);
@@ -693,6 +760,7 @@ public final class PersistableUriGrantContractTest {
         persistenceDoesNotHoldStateLocks(new File(stateFile.getParentFile(), "uri-concurrency.xml"), uriPersisted);
         registeredProviderBatch();
         advancedPermissionQueries();
+        disabledProviderPermissions();
 
         stateFile.delete();
         System.out.println("PersistableUriGrantContractTest all passed: " + checks + " checks");
