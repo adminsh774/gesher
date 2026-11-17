@@ -43,12 +43,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: |
+            .github/scripts
+            .github/actions/runner-route
       - uses: actions/setup-node@v4
         with:
           node-version: 20
       - name: Native queue label and exact-head QA contracts
         run: node --test .github/scripts/native-merge-queue.test.js
+      - name: Owner-only runner routing and source ancestry contracts
+        run: node --test .github/actions/runner-route/route.test.cjs
       - name: Queue workflow coverage and failure propagation
         run: |
           python3 -m pip install PyYAML==6.0.3
@@ -126,6 +130,7 @@ jobs:
           python3 -m unittest discover -s tools/ci -p test_source_identity.py
           python3 -m unittest discover -s tools/ci -p test_workflow_actor_metadata.py
           python3 -m unittest discover -s tools/ci -p test_self_hosted_trial.py
+          python3 -m unittest discover -s .github/actions/local-build-cache -p test_cache.py
           python3 -m unittest discover -s tools/ci -p test_github_read.py
           python3 tools/toolchain/test_coherent_tcp_context.py
           python3 tools/host-pthread-authority/test_minimum_supplier_entry.py
@@ -659,7 +664,10 @@ jobs:
   # runs on its own (gh workflow run framework --ref <branch>).
   framework:
     needs: [artifact-preflight]
-    uses: ./.github/workflows/framework.yml
+    # This immutable policy, not PR-controlled workflow YAML, may use the runner.
+    uses: gesher-runtime/gesher/.github/workflows/framework.yml@936cd045698e8b883705b6630598dbe488c9e365
+    with:
+      local-runner: true
 
   # Phase 6 (native libraries): the Android NDK test .so files, built on the
   # Linux runner. .github/workflows/native-libs.yml, which also runs on its own.
