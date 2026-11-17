@@ -13,6 +13,9 @@ inputs:
   restore-keys:
     description: Ordered fallback prefixes
     default: ''
+  namespace:
+    description: Original cache ref boundary; diagnostics explicitly name their authorized PR ref
+    default: ${{ github.ref }}
 outputs:
   cache-hit:
     description: True only for an exact key hit
@@ -39,6 +42,7 @@ runs:
         CACHE_PATHS: ${{ inputs.path }}
         CACHE_KEY: ${{ inputs.key }}
         CACHE_RESTORE_KEYS: ${{ inputs.restore-keys }}
+        CACHE_NAMESPACE: ${{ inputs.namespace }}
       run: python3 "$CACHE_ACTION/cache.py"
     - name: Hosted restore
       if: runner.environment != 'self-hosted' && inputs.phase == 'restore'

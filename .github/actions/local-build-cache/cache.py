@@ -36,10 +36,11 @@ def valid_key(key):
 
 
 class DiskCache:
-    def __init__(self, root, workspace, budget=10 * 1024**3):
+    def __init__(self, root, workspace, budget=10 * 1024**3, namespace='isolated-fixture'):
         self.root = Path(root).absolute()
         self.workspace = Path(workspace).resolve(strict=True)
         self.budget = budget
+        self.namespace = valid_key(namespace)
         self.root.mkdir(parents=True, exist_ok=True)
         if self.root.is_symlink() or self.root.resolve() != self.root:
             raise CacheError('Cache root must be a real directory')
@@ -93,7 +94,7 @@ class DiskCache:
 
     def bucket(self, names):
         self.paths(names)
-        version = hashlib.sha256(json.dumps(names).encode()).hexdigest()
+        version = hashlib.sha256(json.dumps([self.namespace, names]).encode()).hexdigest()
         bucket = self.root / version
         bucket.mkdir(exist_ok=True)
         if bucket.is_symlink():
@@ -115,7 +116,8 @@ class DiskCache:
             candidates = []
             for entry in self.entries(bucket):
                 meta = json.loads((entry / 'manifest.json').read_text())
-                if meta['paths'] != names or hashlib.sha256(meta['key'].encode()).hexdigest() != entry.name:
+                if (meta['paths'] != names or meta['namespace'] != self.namespace
+                        or hashlib.sha256(meta['key'].encode()).hexdigest() != entry.name):
                     raise CacheError('Cache manifest identity mismatch')
                 rank = 0 if meta['key'] == key else next(
                     (i + 1 for i, prefix in enumerate(prefixes) if meta['key'].startswith(prefix)), None)
@@ -173,7 +175,7 @@ class DiskCache:
                 if payload.stat().st_size > self.budget:
                     print('LOCAL_CACHE_SKIP snapshot exceeds disk budget')
                     return False
-                manifest = dict(key=key, paths=names, sha256=digest_file(payload))
+                manifest = dict(key=key, namespace=self.namespace, paths=names, sha256=digest_file(payload))
                 (stage / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
                 os.replace(stage, entry)
             self.prune(entry)
@@ -210,7 +212,10 @@ def main():
     home = Path.home().resolve(strict=True)
     root = home / '.cache' / 'gesher-ci' / 'v1'
     workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
-    cache = DiskCache(root, workspace)
+    namespace = os.environ['CACHE_NAMESPACE']
+    if not re.fullmatch(r'refs/(?:pull/[1-9][0-9]*/merge|heads/[A-Za-z0-9_./-]+)', namespace):
+        raise CacheError('An explicit repository ref cache boundary is required')
+    cache = DiskCache(root, workspace, namespace=namespace)
     phase = os.environ['CACHE_PHASE']
     if phase == 'initialize':
         for tool in ('git', 'curl', 'python3', 'cmake', 'ninja', 'ccache', 'javac'):

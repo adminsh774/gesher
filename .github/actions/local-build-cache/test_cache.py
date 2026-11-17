@@ -79,6 +79,11 @@ class CacheContracts(unittest.TestCase):
         self.cache.save(self.names, 'same-key')
         self.assertEqual(self.cache.restore(['out/framework'], 'same-key'), '')
 
+    def test_other_pr_cannot_restore_an_identical_key(self):
+        self.cache.save(self.names, 'same-key')
+        other = cache_module.DiskCache(self.root / 'cache', self.workspace, namespace='another-pr')
+        self.assertEqual(other.restore(self.names, 'same-key', ['same-']), '')
+
     def test_absent_optional_path_is_not_recorded_as_a_cache_hit(self):
         self.assertFalse(self.cache.save(['out/not-built'], 'key'))
         self.assertEqual(self.cache.restore(['out/not-built'], 'key'), '')
