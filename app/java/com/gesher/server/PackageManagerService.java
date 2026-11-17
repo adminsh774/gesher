@@ -337,15 +337,16 @@ public final class PackageManagerService extends IPackageManager.Default {
                 caller, specifics, specificTypes, intent, resolvedType, flags));
     }
 
-    private List<ResolveInfo> query(Intent intent, String resolvedType, long flags) {
+    List<ResolveInfo> query(Intent intent, String resolvedType, long flags) {
         List<ResolveInfo> result = new ArrayList<>();
+        if (intent == null) return result;
         for (ApkPackage p : mPackages.values()) {
             if (isRemovalPending(p.packageName)) continue;
             result.addAll(p.queryIntentActivities(intent, resolvedType, flags));
         }
         // The Windows default browser (BrowserPackageSupport), after the installed apps'
         // activities: an app's own http(s) filter still resolves first.
-        if (intent != null && get(BrowserPackageSupport.PACKAGE) == null) {
+        if (get(BrowserPackageSupport.PACKAGE) == null) {
             result.addAll(BrowserPackageSupport.queryIntentActivities(intent, resolvedType,
                     flags));
         }

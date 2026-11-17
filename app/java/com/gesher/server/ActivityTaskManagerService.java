@@ -41,6 +41,7 @@ import android.os.Binder;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Parcel;
+import android.os.Parcelable;
 import android.os.RemoteException;
 import android.os.SystemClock;
 import android.util.MergedConfiguration;
@@ -55,9 +56,13 @@ import com.gesher.app.DeviceProfile;
 import com.gesher.app.window.TaskConfiguration;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.function.Consumer;
 
@@ -126,6 +131,109 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
 
     /** A fixed ms-settings: page for an Android Settings screen (SettingsIntents). */
     static volatile java.util.function.Predicate<String> sOpenSettingsPage = WindowsHost::openUrl;
+
+    /** Receives resolved chooser requests when multiple targets or custom actions exist. */
+    public interface ChooserDispatcher {
+        int dispatch(ActivityTaskManagerService atm, ChooserRequest request);
+    }
+
+    /** Observes intents launched by the chooser contract (both auto-launch and user choice). */
+    public static volatile java.util.function.Consumer<Intent> sChooserTargetLaunchConsumer = null;
+
+    /** Active chooser resolver / share contract dispatcher. */
+    public static volatile ChooserDispatcher sChooserDispatcher = (atm, request) -> {
+        SystemServer.log("startActivity: chooser multi-target resolution ("
+                + request.totalOptions() + " options), auto-selecting first option");
+        return request.launchOption(atm, 0);
+    };
+
+    public static final class ChooserRequest {
+        public final IApplicationThread caller;
+        public final String callingPackage;
+        public final Intent chooserIntent;
+        public final Intent targetIntent;
+        public final CharSequence title;
+        public final List<Intent> initialIntents;
+        public final List<ResolveInfo> targets;
+        public final IBinder resultToToken;
+        public final String resultWho;
+        public final int requestCode;
+        public final int launchTaskId;
+        public final boolean shareIdentity;
+        public final ActivityRecord[] started;
+
+        public ChooserRequest(IApplicationThread caller, String callingPackage,
+                Intent chooserIntent, Intent targetIntent, CharSequence title,
+                List<Intent> initialIntents, List<ResolveInfo> targets,
+                IBinder resultToToken, String resultWho, int requestCode,
+                int launchTaskId, boolean shareIdentity, ActivityRecord[] started) {
+            this.caller = caller;
+            this.callingPackage = callingPackage;
+            this.chooserIntent = chooserIntent;
+            this.targetIntent = targetIntent;
+            this.title = title;
+            this.initialIntents = Collections.unmodifiableList(new ArrayList<>(initialIntents));
+            this.targets = Collections.unmodifiableList(new ArrayList<>(targets));
+            this.resultToToken = resultToToken;
+            this.resultWho = resultWho;
+            this.requestCode = requestCode;
+            this.launchTaskId = launchTaskId;
+            this.shareIdentity = shareIdentity;
+            this.started = started;
+        }
+
+        public int totalOptions() {
+            return initialIntents.size() + targets.size();
+        }
+
+        public int launchOption(ActivityTaskManagerService atm, int index) {
+            if (index < 0 || index >= totalOptions()) {
+                throw new IndexOutOfBoundsException("Chooser option index " + index + " out of bounds");
+            }
+            Intent launch;
+            if (index < initialIntents.size()) {
+                Intent initial = initialIntents.get(index);
+                launch = prepareChooserTarget(initial, chooserIntent);
+            } else {
+                ResolveInfo ri = targets.get(index - initialIntents.size());
+                launch = prepareChooserTarget(targetIntent, chooserIntent);
+                if (ri.activityInfo != null) {
+                    launch.setComponent(new ComponentName(ri.activityInfo.packageName, ri.activityInfo.name));
+                }
+            }
+            java.util.function.Consumer<Intent> consumer = sChooserTargetLaunchConsumer;
+            if (consumer != null) {
+                consumer.accept(launch);
+            }
+            return atm.start(caller, launch, launch.getType(), callingPackage,
+                    resultToToken, resultWho, requestCode, launchTaskId, shareIdentity, started);
+        }
+    }
+
+    static Intent prepareChooserTarget(Intent baseTarget, Intent chooserIntent) {
+        Intent launch = new Intent(baseTarget);
+        final int uriGrantFlags = chooserIntent.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+        launch.addFlags(uriGrantFlags);
+        launch.addFlags(chooserIntent.getFlags());
+        if (launch.getClipData() == null && chooserIntent.getClipData() != null) {
+            launch.setClipData(chooserIntent.getClipData());
+        }
+        if (launch.getData() == null && chooserIntent.getData() != null) {
+            launch.setDataAndType(chooserIntent.getData(), chooserIntent.getType());
+        }
+        return launch;
+    }
+
+    private int dispatchChooser(ChooserRequest request) {
+        ChooserDispatcher dispatcher = sChooserDispatcher;
+        if (dispatcher != null) {
+            return dispatcher.dispatch(this, request);
+        }
+        return request.launchOption(this, 0);
+    }
 
     /** STARTED: made visible again without being resumed (StartActivityItem). */
     enum State { INITIALIZING, LAUNCHING, RESUMING, RESUMED, PAUSING, PAUSED, STARTED, STOPPING,
@@ -926,6 +1034,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
     private int start(IApplicationThread caller, Intent intent, String resolvedType,
             String callingPackage, IBinder resultToToken, String resultWho, int requestCode,
             int launchTaskId, boolean shareIdentity, ActivityRecord[] started) {
+        if (started == null) started = new ActivityRecord[1];
         final int originalPid = Binder.getCallingPid();
         final int originalUid = Binder.getCallingUid();
         final ProcessRecord originalProcess = callerProcess(originalPid);
@@ -972,18 +1081,146 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         if (AccountChooser.handles(intent)) {
             return chooseAccount(caller, callingPackage, intent, resultToToken, resultWho, requestCode);
         }
-        // ACTION_CHOOSER ("open with", "share via"): the device has no ChooserActivity, so the
-        // choice is the first target, as a chooser with one option starts it at once; an
-        // http(s) VIEW goes on to the Windows browser below.
+        // ACTION_CHOOSER ("open with", "share via"): resolve matching targets, filter
+        // EXTRA_EXCLUDE_COMPONENTS, prepend EXTRA_INITIAL_INTENTS, propagate URI grants,
+        // auto-launch sole targets, and dispatch multi-target choices.
         if (mAccountCompletion.get() == null && intent != null && Intent.ACTION_CHOOSER.equals(intent.getAction())) {
-            Intent target = intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent.class);
-            if (target != null && !Intent.ACTION_CHOOSER.equals(target.getAction())) {
-                target = new Intent(target);
-                target.addFlags(intent.getFlags());
-                SystemServer.log("startActivity: chooser, starting its target " + target);
-                return start(caller, target, target.getType(), callingPackage, resultToToken,
-                        resultWho, requestCode, launchTaskId, shareIdentity, started);
+            Intent target = null;
+            try {
+                target = intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent.class);
+            } catch (Throwable ignored) {
             }
+            if (target == null) {
+                Object extra = null;
+                try {
+                    extra = intent.getExtra(Intent.EXTRA_INTENT);
+                } catch (Throwable ignored) {
+                }
+                if (extra instanceof Intent) {
+                    target = (Intent) extra;
+                }
+            }
+            if (target == null) {
+                throw new IllegalArgumentException("ACTION_CHOOSER requires EXTRA_INTENT");
+            }
+            if (Intent.ACTION_CHOOSER.equals(target.getAction())) {
+                throw new IllegalArgumentException("Cannot start chooser with ACTION_CHOOSER target");
+            }
+
+            // Query matching candidates
+            List<ResolveInfo> candidates;
+            synchronized (mPm) {
+                candidates = mPm.query(target, target.getType(),
+                        PackageManager.MATCH_DEFAULT_ONLY | PackageManager.GET_META_DATA);
+            }
+            if (candidates == null) {
+                candidates = new ArrayList<>();
+            }
+
+            // Parse EXTRA_EXCLUDE_COMPONENTS
+            Set<ComponentName> excludedComponents = new HashSet<>();
+            Object extraExclude = null;
+            try {
+                extraExclude = intent.getExtra(Intent.EXTRA_EXCLUDE_COMPONENTS);
+            } catch (Throwable ignored) {
+            }
+            if (extraExclude instanceof ComponentName[]) {
+                Collections.addAll(excludedComponents, (ComponentName[]) extraExclude);
+            } else if (extraExclude instanceof Parcelable[]) {
+                for (Parcelable p : (Parcelable[]) extraExclude) {
+                    if (p instanceof ComponentName) {
+                        excludedComponents.add((ComponentName) p);
+                    }
+                }
+            } else if (extraExclude instanceof java.util.Collection<?>) {
+                for (Object o : (java.util.Collection<?>) extraExclude) {
+                    if (o instanceof ComponentName) {
+                        excludedComponents.add((ComponentName) o);
+                    }
+                }
+            } else if (extraExclude instanceof ComponentName) {
+                excludedComponents.add((ComponentName) extraExclude);
+            }
+
+            // Filter candidates
+            List<ResolveInfo> filteredCandidates = new ArrayList<>();
+            for (ResolveInfo ri : candidates) {
+                if (ri.activityInfo != null) {
+                    ComponentName cn = new ComponentName(ri.activityInfo.packageName, ri.activityInfo.name);
+                    if (excludedComponents.contains(cn)) {
+                        continue;
+                    }
+                }
+                filteredCandidates.add(ri);
+            }
+
+            // Parse EXTRA_INITIAL_INTENTS
+            List<Intent> initialIntents = new ArrayList<>();
+            Object extraInitials = null;
+            try {
+                extraInitials = intent.getExtra(Intent.EXTRA_INITIAL_INTENTS);
+            } catch (Throwable ignored) {
+            }
+            if (extraInitials instanceof Intent[]) {
+                for (Intent in : (Intent[]) extraInitials) {
+                    if (in != null) initialIntents.add(in);
+                }
+            } else if (extraInitials instanceof Parcelable[]) {
+                for (Parcelable p : (Parcelable[]) extraInitials) {
+                    if (p instanceof Intent) {
+                        initialIntents.add((Intent) p);
+                    }
+                }
+            } else if (extraInitials instanceof java.util.Collection<?>) {
+                for (Object o : (java.util.Collection<?>) extraInitials) {
+                    if (o instanceof Intent) {
+                        initialIntents.add((Intent) o);
+                    }
+                }
+            } else if (extraInitials instanceof Intent) {
+                initialIntents.add((Intent) extraInitials);
+            }
+
+            // Exclude components from initialIntents if listed
+            if (!excludedComponents.isEmpty()) {
+                Iterator<Intent> it = initialIntents.iterator();
+                while (it.hasNext()) {
+                    Intent in = it.next();
+                    if (in.getComponent() != null && excludedComponents.contains(in.getComponent())) {
+                        it.remove();
+                    }
+                }
+            }
+
+            // If no activities match: return START_INTENT_NOT_RESOLVED
+            if (initialIntents.isEmpty() && filteredCandidates.isEmpty()) {
+                SystemServer.log("startActivity: chooser, no targets resolved for " + target);
+                return ActivityManager.START_INTENT_NOT_RESOLVED;
+            }
+
+            // If exactly 1 option exists and no initial intents: auto-launch that single target directly
+            if (initialIntents.isEmpty() && filteredCandidates.size() == 1) {
+                ResolveInfo soleTarget = filteredCandidates.get(0);
+                Intent launchTarget = prepareChooserTarget(target, intent);
+                if (soleTarget.activityInfo != null) {
+                    launchTarget.setComponent(new ComponentName(
+                            soleTarget.activityInfo.packageName, soleTarget.activityInfo.name));
+                }
+                SystemServer.log("startActivity: chooser single target auto-launch " + launchTarget);
+                java.util.function.Consumer<Intent> consumer = sChooserTargetLaunchConsumer;
+                if (consumer != null) {
+                    consumer.accept(launchTarget);
+                }
+                return start(caller, launchTarget, launchTarget.getType(), callingPackage,
+                        resultToToken, resultWho, requestCode, launchTaskId, shareIdentity, started);
+            }
+
+            // Multiple options exist: present compliant chooser resolution or dispatch
+            CharSequence title = intent.getCharSequenceExtra(Intent.EXTRA_TITLE);
+            ChooserRequest request = new ChooserRequest(caller, callingPackage, intent, target,
+                    title, initialIntents, filteredCandidates, resultToToken, resultWho,
+                    requestCode, launchTaskId, shareIdentity, started);
+            return dispatchChooser(request);
         }
         // Starts from apps resolve implicit intents to filters with CATEGORY_DEFAULT, as
         // ActivityStarter asks (MATCH_DEFAULT_ONLY); gesher-app's launcher (no caller)
