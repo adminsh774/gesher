@@ -1214,10 +1214,21 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                                 || "mailto".equalsIgnoreCase(scheme)) {
                             // Also a VIEW for the Windows default browser's package
                             // (BrowserPackageSupport, of which resolve() runs nothing).
-                            String url = data.toString();
-                            SystemServer.log("startActivity: delegating external URL to Windows: " + url);
-                            sOpenExternalUrl.test(url);
-                            return ActivityManager.START_SUCCESS;
+                            boolean opened = sOpenExternalUrl.test(data.toString());
+                            SystemServer.log("startActivity: Windows external URL "
+                                    + (opened ? "opened" : "unavailable") + " (" + scheme + ")");
+                            // A failed launch cancels the requested result. A Windows handler
+                            // that accepts the URL starts outside this task and cannot reply either.
+                            if (requestCode >= 0 && resultToToken != null && originalProcess != null
+                                    && callerProcess(originalPid) == originalProcess) {
+                                ActivityRecord source = forToken(resultToToken);
+                                if (source != null && source.app == originalProcess) {
+                                    deliverResult(source, resultWho, requestCode,
+                                            android.app.Activity.RESULT_CANCELED, null);
+                                }
+                            }
+                            return opened ? ActivityManager.START_SUCCESS
+                                    : ActivityManager.START_INTENT_NOT_RESOLVED;
                         }
                     }
                 } else if (Intent.ACTION_OPEN_DOCUMENT_TREE.equals(action)
@@ -3330,8 +3341,8 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
     private void deliverResult(ActivityRecord r, String resultWho, int requestCode,
             int resultCode, Intent resultData) {
         if (r == null) return;
-        // Only server-owned permission/account/document callbacks enter here.
-        // Their worker thread is not the app that originally requested the UI.
+        // These results come from server-owned UI flows. Attribute them to the server
+        // even when completion runs on a worker with no original Binder caller.
         final ActivityCallerState.Snapshot snapshot;
         synchronized (mPm) {
             snapshot = ActivityCallerState.capture(new ActivityCallerState.Origin(null,

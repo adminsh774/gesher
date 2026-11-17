@@ -3,8 +3,10 @@ package com.gesher.server;
 
 import android.app.Activity;
 import android.app.ActivityClient;
+import android.app.ActivityManager;
 import android.app.IActivityClientController;
 import android.app.IApplicationThread;
+import android.app.Instrumentation;
 import android.app.ResultInfo;
 import android.app.servertransaction.ActivityResultItem;
 import android.app.servertransaction.ActivityTransactionItem;
@@ -14,8 +16,10 @@ import android.app.servertransaction.DestroyActivityItem;
 import android.app.servertransaction.PauseActivityItem;
 import android.app.servertransaction.ResumeActivityItem;
 import android.app.servertransaction.StopActivityItem;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
+import android.net.Uri;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.IInterface;
@@ -29,6 +33,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Predicate;
 import sun.misc.Unsafe;
 
 /** Exercises production finish selection and lifecycle using real framework transaction objects. */
@@ -388,11 +393,76 @@ public final class ActivityFinishFixture {
         System.out.println("Activity finish: child parent/resultWho/request routing, canceled results and result-before-resume passed");
     }
 
+    private static void externalUrlResults() throws Exception {
+        Harness h = new Harness();
+        Object source = h.record("Caller", 51, "a", "RESUMED");
+        IBinder sourceToken = token(source);
+        ActivityTaskManagerService atm = (ActivityTaskManagerService) h.atm;
+        Field opener = field(h.atmType, "sOpenExternalUrl");
+        Object previousOpener = opener.get(null);
+        List<String> attempts = new ArrayList<>();
+        try {
+            opener.set(null, (Predicate<String>) url -> {
+                attempts.add(url);
+                return url.startsWith("https:");
+            });
+            Intent web = new Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com/page"));
+            Intent mail = new Intent(Intent.ACTION_VIEW, Uri.parse("mailto:help@example.com"));
+            h.asApp(() -> {
+                int failedStart = atm.startActivity(h.thread, OWNER, null, mail, null, sourceToken,
+                        "compose", 7, 0, null, null);
+                check(failedStart == ActivityManager.START_INTENT_NOT_RESOLVED,
+                        "A failed Windows launch reported success");
+                try {
+                    Instrumentation.checkStartActivityResult(failedStart, mail);
+                    throw new AssertionError("A failed launch must surface as ActivityNotFoundException");
+                } catch (ActivityNotFoundException expected) {
+                    // The same exception a caller of Activity.startActivity receives.
+                }
+                check(atm.startActivity(h.thread, OWNER, null, web, null, sourceToken,
+                                "browse", 8, 0, null, null) == ActivityManager.START_SUCCESS,
+                        "An accepted Windows launch did not report success");
+                check(atm.startActivity(h.thread, OWNER, null, mail, null, sourceToken,
+                                null, -1, 0, null, null) == ActivityManager.START_INTENT_NOT_RESOLVED,
+                        "A failed Windows launch without a result request reported success");
+            });
+            check(attempts.equals(List.of(mail.getDataString(), web.getDataString(), mail.getDataString())),
+                    "Windows received incorrect URLs or more than one call per request: " + attempts);
+            List<ResultInfo> results = h.thread.results(source);
+            check(results.size() == 2, "Each result request must complete once: " + results);
+            for (int i = 0; i < results.size(); i++) {
+                ResultInfo result = results.get(i);
+                check(result.mResultCode == Activity.RESULT_CANCELED && result.mData == null
+                                && result.mRequestCode == 7 + i
+                                && List.of("compose", "browse").get(i).equals(result.mResultWho),
+                        "External URL cancellation lost its routing fields: " + result);
+            }
+            check(h.records.equals(List.of(source)), "External URLs created an Android activity");
+
+            opener.set(null, (Predicate<String>) url -> {
+                try {
+                    set(h.process, "exiting", true);
+                } catch (Exception failure) {
+                    throw new AssertionError(failure);
+                }
+                return true;
+            });
+            h.asApp(() -> check(atm.startActivity(h.thread, OWNER, null, web, null, sourceToken,
+                            "afterExit", 9, 0, null, null) == ActivityManager.START_SUCCESS,
+                    "The Windows launch was accepted before the caller exited"));
+            check(h.thread.results(source).size() == 2, "Exit during the launch left a stale result");
+        } finally {
+            opener.set(null, previousOpener);
+        }
+        System.out.println("External URL results: Windows launch status and canceled result routing passed");
+    }
+
     public static int run(boolean realBinder, String group) throws Exception {
         binder = realBinder; checks = 0;
         if (group.equals("all") || group.equals("task")) removeTask();
         if (group.equals("all") || group.equals("affinity")) affinity();
         if (group.equals("all") || group.equals("sub")) subActivities();
+        if (group.equals("all")) externalUrlResults();
         return checks;
     }
 }
