@@ -5,8 +5,11 @@ import android.app.ActivityManager;
 import android.app.ActivityOptions;
 import android.app.ActivityThread;
 import android.app.IActivityManager;
+import android.app.IAppTask;
 import android.app.PendingIntent;
+import android.app.TaskStackListener;
 import android.app.TaskStackBuilder;
+import android.app.TaskWindowingLayerRequestHandler;
 import android.app.IActivityTaskManager;
 import android.app.IApplicationThread;
 import android.app.servertransaction.ClientTransaction;
@@ -25,6 +28,7 @@ import android.os.Binder;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.IInterface;
+import android.os.IRemoteCallback;
 import android.os.Parcel;
 import android.os.RemoteException;
 import android.view.Display;
@@ -38,6 +42,8 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import sun.misc.Unsafe;
 
 /**
@@ -555,6 +561,161 @@ public final class TaskStackContractTest {
                 }), "Task removal instantiated history during synchronous pause reentry");
     }
 
+    private static IAppTask appTask(IBinder target) {
+        if (!realBinder) return IAppTask.Stub.asInterface(target);
+        IBinder transport = new Binder() {
+            @Override public IInterface queryLocalInterface(String descriptor) { return null; }
+            @Override protected boolean onTransact(int code, Parcel request, Parcel reply, int flags)
+                    throws RemoteException {
+                return target.transact(code, request, reply, flags);
+            }
+        };
+        return IAppTask.Stub.asInterface(transport);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void appTaskRecents() throws Exception {
+        Harness h = new Harness();
+        CountDownLatch changed = new CountDownLatch(1);
+        TaskStackListener listener = new TaskStackListener() {
+            @Override public void onTaskStackChanged() { changed.countDown(); }
+        };
+        h.asApp(() -> rejects(SecurityException.class, () -> h.api.registerTaskStackListener(listener)));
+        h.api.registerTaskStackListener(listener);
+
+        Intent root = launch("Root").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("base", "original");
+        check(h.start(root, launch("Middle")) == ActivityManager.START_SUCCESS, "first AppTask launch");
+        check(changed.await(5, TimeUnit.SECONDS), "task listener missed publication");
+        h.api.unregisterTaskStackListener(listener);
+        Object middle = h.record("Middle");
+        h.acknowledge("activityResumed", middle);
+        int rootId = (Integer) get(middle, "taskId");
+        check(h.start(launch("Other").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK))
+                == ActivityManager.START_SUCCESS, "second AppTask launch");
+
+        String second = PKG + ".second";
+        check(h.api.startActivity(null, second, null, launch(second, "Root"), null,
+                null, null, -1, 0, null, null) == ActivityManager.START_SUCCESS, "foreign task launched");
+        check(h.api.getRecentTasks(10, 0, 0).getList().size() == 3, "system Recents lost tasks");
+        IAppTask[] retained = new IAppTask[1];
+        h.asApp(() -> {
+            List<IBinder> owned = h.api.getAppTasks(PKG);
+            check(owned.size() == 2, "AppTasks leaked another package");
+            check(appTask(owned.get(0)).getTaskInfo().taskId != rootId, "most recent AppTask first");
+            IAppTask task = retained[0] = appTask(owned.get(1));
+            ActivityManager.RecentTaskInfo first = task.getTaskInfo();
+            check(first.id == rootId && first.persistentId == rootId && first.numActivities == 2,
+                    "AppTask snapshot has unsteady identity or incomplete members");
+            check(first.topActivity.getClassName().endsWith(".Middle")
+                            && "original".equals(first.baseIntent.getStringExtra("base")),
+                    "AppTask lost the original base Intent");
+            first.baseIntent.putExtra("base", "mutation");
+            check("original".equals(task.getTaskInfo().baseIntent.getStringExtra("base")),
+                    "AppTask snapshot aliases the server Intent");
+            List<ActivityManager.RecentTaskInfo> recent = h.api.getRecentTasks(10, 0, 0).getList();
+            check(recent.size() == 2 && recent.get(1).baseIntent.getExtras() == null,
+                    "public Recents leaks foreign tasks or Intent extras");
+            check(h.api.getRecentTasks(1, 0, 0).getList().size() == 1, "Recents limit not applied");
+            rejects(SecurityException.class, () -> h.api.getAppTasks(second));
+            rejects(SecurityException.class, () -> h.api.getRecentTasks(10, 0, 10));
+
+            check(h.api.getActivityClientController().moveActivityTaskToBack((IBinder)get(middle, "token"), true),
+                    "could not move AppTask to the back");
+            task.setExcludeFromRecents(true);
+            check(h.api.getRecentTasks(10, 0, 0).getList().size() == 1, "excluded background task visible");
+            check(h.api.getRecentTasks(10, ActivityManager.RECENT_WITH_EXCLUDED, 0).getList().size() == 2,
+                    "RECENT_WITH_EXCLUDED failed");
+            check(h.api.getAppTasks(PKG).size() == 2, "excluded task lost its AppTask capability");
+            task.setExcludeFromRecents(false);
+            check(h.api.getRecentTasks(10, 0, 0).getList().size() == 2, "un-excluding did not restore task");
+            task.moveToFront(h.thread, PKG);
+            check(appTask(h.api.getAppTasks(PKG).get(0)).getTaskInfo().taskId == rootId,
+                    "AppTask.moveToFront did not update recency");
+            check(task.startActivity(h.thread.asBinder(), PKG, null, launch(second, "Middle"), null, null)
+                    == ActivityManager.START_SUCCESS, "AppTask.startActivity rejected exported target");
+            ActivityManager.RecentTaskInfo mixed = task.getTaskInfo();
+            check(mixed.numActivities == 3 && mixed.topActivity.getPackageName().isEmpty()
+                            && mixed.topActivityInfo == null && mixed.token.equals(first.token),
+                    "mixed-package snapshot exposed another app or replaced the task token");
+            check(((Integer)get(h.record(second, "Middle"), "taskId")) == rootId,
+                    "AppTask.startActivity created an unrelated task");
+            Bundle[] result = new Bundle[1];
+            task.requestWindowingLayer(0, new IRemoteCallback.Stub() {
+                @Override public void sendResult(Bundle reply) { result[0] = reply; }
+            });
+            check(result[0].getInt(TaskWindowingLayerRequestHandler.REMOTE_CALLBACK_RESULT_KEY)
+                    == TaskWindowingLayerRequestHandler.RESULT_FAILED_BAD_STATE,
+                    "unavailable windowing-layer transition never completed");
+        });
+
+        Class<?> processType = h.process.getClass();
+        long previous = Binder.clearCallingIdentity();
+        try {
+            // An attached caller may not operate another package's AppTask
+            // through a passed binder.
+            int foreignPid = PID + 100;
+            Binder.restoreCallingIdentity(((long) (UID + 1) << 32) | foreignPid);
+            Object otherProcess = make(processType, new Class<?>[]{h.tasks.getClass(), int.class,
+                    IApplicationThread.class}, h.tasks, foreignPid, new AppThread());
+            set(otherProcess, "packageName", second);
+            set(otherProcess, "processName", second);
+            set(otherProcess, "ready", true);
+            ((List<Object>) get(h.tasks, "mProcesses")).add(otherProcess);
+            rejects(SecurityException.class, () -> retained[0].getTaskInfo());
+            rejects(SecurityException.class, () -> retained[0].finishAndRemoveTask());
+            check(h.api.getRecentTasks(10, 0, 0).getList().size() == 1, "foreign app sees unrelated Recents");
+        } finally { Binder.restoreCallingIdentity(previous); }
+
+        h.asApp(() -> {
+            IAppTask task = retained[0];
+            task.finishAndRemoveTask();
+            check(task.getTaskInfo() == null && h.api.getAppTasks(PKG).size() == 1,
+                    "removed task remains accessible through live or retained handle");
+            rejects(IllegalArgumentException.class, () -> task.setExcludeFromRecents(true));
+            rejects(IllegalArgumentException.class, () -> task.startActivity(h.thread.asBinder(), PKG,
+                    null, launch("Top"), null, null));
+        });
+
+        Harness died = new Harness();
+        died.start(launch("Root").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        Object record = died.record("Root");
+        set(record, "savedState", new Bundle());
+        IAppTask handle = appTask(died.api.getAppTasks(PKG).get(0));
+        ActivityManager.RecentTaskInfo beforeDeath = handle.getTaskInfo();
+        Method death = died.tasks.getClass().getDeclaredMethod("processDied", died.process.getClass());
+        death.setAccessible(true);
+        death.invoke(died.tasks, died.process);
+        ActivityManager.RecentTaskInfo afterDeath = handle.getTaskInfo();
+        check(afterDeath != null && afterDeath.taskId == beforeDeath.taskId
+                        && afterDeath.token.equals(beforeDeath.token) && !afterDeath.isVisible,
+                "process death retired the AppTask instead of preserving saved history");
+
+        Harness cleared = new Harness();
+        cleared.start(launch("Root").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), launch("Middle"));
+        IAppTask clearedTask = appTask(cleared.api.getAppTasks(PKG).get(0));
+        ActivityManager.RecentTaskInfo original = clearedTask.getTaskInfo();
+        cleared.start(launch("Root").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                .putExtra("base", "replacement"));
+        ActivityManager.RecentTaskInfo renewed = clearedTask.getTaskInfo();
+        check(renewed != null && renewed.taskId == original.taskId && renewed.token.equals(original.token)
+                        && renewed.numActivities == 1 && "replacement".equals(renewed.baseIntent.getStringExtra("base")),
+                "CLEAR_TASK did not reset metadata while retaining the task identity");
+
+        Harness race = new Harness();
+        race.start(launch("Root").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        IAppTask racingHandle = appTask(race.api.getAppTasks(PKG).get(0));
+        set(race.tasks, "mBeforeActivityPublication", (Runnable) () -> {
+            try { racingHandle.finishAndRemoveTask(); }
+            catch (RemoteException e) { throw new AssertionError(e); }
+        });
+        race.asApp(() -> {
+            check(racingHandle.startActivity(race.thread.asBinder(), PKG, null,
+                    launch("Middle"), null, null) == ActivityManager.START_CANCELED,
+                    "a removed AppTask silently published a new task");
+            check(race.api.getAppTasks(PKG).isEmpty(), "task launch race published replacement work");
+        });
+    }
+
     private static void attachAndReentry() throws Exception {
         Harness h = new Harness();
         set(h.process, "ready", false);
@@ -798,6 +959,7 @@ public final class TaskStackContractTest {
         if (selected.equals("all") || selected.equals("history")) { fullStack(); acceptedHistoryLifetimes(); disabledDeferredHistory(); }
         if (selected.equals("all") || selected.equals("validation")) invalidBatch();
         if (selected.equals("all") || selected.equals("tasks")) { taskFlags(); reorderedUriOwner(); abandonedUriOwners(); processDeathUriOwners(); forceStopTransientUris(); }
+        if (selected.equals("all") || selected.equals("recents")) appTaskRecents();
         if (selected.equals("all") || selected.equals("attach")) attachAndReentry();
         if (selected.equals("all") || selected.equals("visibility")) visibilityAndRemoval();
         if (selected.equals("all") || selected.equals("permissions")) permissions();
