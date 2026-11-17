@@ -61,6 +61,9 @@ namespace gesher::bionic {
 namespace {
 
 constexpr int kNsig = 65;  // signals 1..64
+// Android 16 Bionic reserves kernel realtime signals 32..41 for its runtime.
+// Public SIGRTMIN/SIGRTMAX call these exports rather than expose kernel bounds.
+constexpr int kSigrtMin = 32 + 10;
 constexpr uintptr_t kSigDfl = 0, kSigIgn = 1;
 constexpr int kSaSiginfo = 4, kSaNodefer = 0x40000000;
 constexpr uint32_t kSaResethand = 0x80000000u;
@@ -293,6 +296,9 @@ int SendFromSelf(int sig, int code, uint64_t value, bool to_process) {
 }
 
 // --- the entry points ----------------------------------------------------------
+
+int BIONIC_SYSV CurrentSigrtmin() { return kSigrtMin; }
+int BIONIC_SYSV CurrentSigrtmax() { return kNsig - 1; }
 
 int BIONIC_SYSV Sigaction(int sig, const BionicSigaction* act, BionicSigaction* old) {
   if (!Valid(sig) || (act != nullptr && (sig == kSigkill || sig == kSigstop))) {
@@ -743,6 +749,8 @@ void DeliverPendingSignals() {
 
 void RegisterSignal(SymbolTable& t) {
 #define E(name, fn) t[name] = reinterpret_cast<void*>(&fn)
+  E("__libc_current_sigrtmin", CurrentSigrtmin);
+  E("__libc_current_sigrtmax", CurrentSigrtmax);
   E("sigaction", Sigaction);
   E("sigaction64", Sigaction);
   E("signal", Signal);
