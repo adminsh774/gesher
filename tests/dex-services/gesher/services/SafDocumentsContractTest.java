@@ -1,416 +1,703 @@
-/*
- * Copyright (C) 2026 The Gesher Authors
- * SPDX-License-Identifier: Apache-2.0
- */
+/* Copyright (C) 2026 The Gesher Authors; SPDX-License-Identifier: Apache-2.0 */
 package gesher.services;
 
-import android.app.ApplicationPackageManager;
-import android.content.ClipData;
-import android.content.ContentResolver;
-import android.content.Context;
-import android.content.ContextWrapper;
-import android.content.Intent;
-import android.content.UriPermission;
-import android.content.pm.PackageManager;
-import android.content.pm.ParceledListSlice;
-import android.content.pm.ResolveInfo;
+import android.app.*;
+import android.app.servertransaction.*;
+import android.content.*;
+import android.content.pm.*;
 import android.database.Cursor;
 import android.net.Uri;
-import android.os.Bundle;
-import android.os.IBinder;
+import android.os.*;
+import android.permission.PermissionCheckerManager;
 import android.provider.DocumentsContract;
 import android.provider.DocumentsContract.Document;
-import android.provider.DocumentsContract.Root;
+import android.provider.DocumentsProvider;
+import com.android.internal.app.IAppOpsService;
 import com.android.internal.pm.parsing.pkg.PackageImpl;
-import com.gesher.server.ActivityManagerService;
-import com.gesher.server.ActivityTaskManagerService;
-import com.gesher.server.ApkPackage;
-import com.gesher.server.DocumentsStorageProvider;
-import com.gesher.server.PackageManagerService;
-import com.gesher.server.SharedLibraryGraph;
-
-import java.io.File;
-import java.io.FileOutputStream;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.nio.charset.StandardCharsets;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import com.android.internal.pm.pkg.component.ParsedActivityImpl;
+import com.gesher.server.*;
+import java.io.*;
+import java.lang.reflect.*;
+import java.nio.file.Files;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.BooleanSupplier;
 import sun.misc.Unsafe;
 
-/**
- * Contract tests for F13: Storage Access Framework (SAF) & Tree URI Provider.
- */
+/** Actual registry, AOSP transport, filesystem, grant store and ATM callbacks. */
 public final class SafDocumentsContractTest {
-    private static int checks = 0;
-    private static Unsafe unsafe;
-
-    private static void check(boolean condition, String message) {
-        if (!condition) throw new AssertionError(message);
-        checks++;
+    static final String CLIENT="org.gesher.fixture.saf.client", OTHER="org.gesher.fixture.saf.other";
+    static final String AUTH=DocumentsStorageProvider.AUTHORITY;
+    static final int UID=10601, PID=911201, OTHER_UID=10602, OTHER_PID=911202;
+    static final int READ=Intent.FLAG_GRANT_READ_URI_PERMISSION, WRITE=Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+    static final int PERSIST=Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION, PREFIX=Intent.FLAG_GRANT_PREFIX_URI_PERMISSION;
+    static final Unsafe U;
+    static int checks; static boolean nativeFiles;
+    static { try { Field f=Unsafe.class.getDeclaredField("theUnsafe"); f.setAccessible(true); U=(Unsafe)f.get(null); }
+        catch(Exception e){throw new ExceptionInInitializerError(e);} }
+    interface Work { void run() throws Exception; }
+    static void check(boolean value,String why){if(!value)throw new AssertionError(why); checks++;}
+    static Field field(Class<?> c,String name)throws Exception {
+        for(;c!=null;c=c.getSuperclass())try{Field f=c.getDeclaredField(name); f.setAccessible(true); return f;}
+        catch(NoSuchFieldException ignored){} throw new NoSuchFieldException(name);
+    }
+    static Object get(Object o,String n)throws Exception{return field(o.getClass(),n).get(o);}
+    static void set(Object o,String n,Object v)throws Exception{field(o.getClass(),n).set(o,v);}
+    static Class<?> type(String n)throws Exception{return Class.forName("com.gesher.server."+n);}
+    static Object raise(Throwable e)throws Exception{if(e instanceof Error t)throw t;if(e instanceof Exception t)throw t;throw new AssertionError(e);}
+    static Object make(Class<?> c,Class<?>[] p,Object...a)throws Exception{
+        Constructor<?> k=c.getDeclaredConstructor(p); k.setAccessible(true);
+        try{return k.newInstance(a);}catch(InvocationTargetException e){return raise(e.getCause());}
+    }
+    static Object call(Object o,String n,Class<?>[] p,Object...a)throws Exception{
+        Class<?> c=o instanceof Class?(Class<?>)o:o.getClass(); Method m=c.getDeclaredMethod(n,p);m.setAccessible(true);
+        try{return m.invoke(o instanceof Class?null:o,a);}catch(InvocationTargetException e){return raise(e.getCause());}
+    }
+    static void rejects(Class<? extends Throwable> expected,Work action)throws Exception{
+        try{action.run();}catch(Throwable e){if(!expected.isInstance(e))throw new AssertionError("Expected "+expected+", received "+e,e);checks++;return;}
+        throw new AssertionError("Expected "+expected.getSimpleName());
+    }
+    static void as(int uid,int pid,Work work)throws Exception{
+        long old=Binder.clearCallingIdentity();try{Binder.restoreCallingIdentity(((long)uid<<32)|pid);work.run();}
+        finally{Binder.restoreCallingIdentity(old);}
+    }
+    @SuppressWarnings({"unchecked","rawtypes"}) static Object state(String n)throws Exception{return Enum.valueOf((Class)type("ActivityTaskManagerService$State"),n);}
+    static ApkPackage code(String name,int uid)throws Exception{
+        PackageImpl p=(PackageImpl)PackageImpl.forTesting(name,"/fixture/"+name+"/base.apk");p.setEnabled(true);p.setTargetSdkVersion(36);
+        for(String n:List.of("Origin","Top")){ParsedActivityImpl a=new ParsedActivityImpl();a.setPackageName(name);a.setName(name+"."+n);a.setEnabled(true);p.addActivity(a);}
+        p.hideAsFinal();ApkPackage r=(ApkPackage)U.allocateInstance(ApkPackage.class);
+        set(r,"packageName",name);set(r,"parsed",p);set(r,"mUid",uid);set(r,"apkPath","/fixture/"+name+"/base.apk");
+        set(r,"mDataDir","/fixture/"+name+"/data");set(r,"sharedLibraries",SharedLibraryGraph.EMPTY);set(r,"mEnabledOwner","saf-fixture-install:"+name);return r;
+    }
+    static final class AppThread extends IApplicationThread.Default{
+        final IBinder binder=new Binder();final List<ClientTransactionItem> events=Collections.synchronizedList(new ArrayList<>());
+        IActivityClientController controller;boolean acknowledge=true;
+        @Override public IBinder asBinder(){return binder;}
+        @Override public void scheduleTransaction(ClientTransaction tx){for(ClientTransactionItem item:tx.getTransactionItems()){
+            events.add(item);if(!acknowledge)continue;
+            try{as(UID,PID,()->{if(item instanceof PauseActivityItem p)controller.activityPaused(p.getActivityToken());
+                else if(item instanceof ResumeActivityItem r)controller.activityResumed(r.getActivityToken(),false);});}
+            catch(Exception e){throw new AssertionError(e);}
+        }}
+        @SuppressWarnings("unchecked") List<ResultInfo> results()throws Exception{
+            List<ResultInfo> r=new ArrayList<>();synchronized(events){for(var e:events)if(e instanceof ActivityResultItem)r.addAll((List<ResultInfo>)get(e,"mResultInfoList"));}return r;
+        }
+    }
+    static final class Harness{
+        final ApkPackage client=code(CLIENT,UID),other=code(OTHER,OTHER_UID);
+        final PackageManagerService pm=new PackageManagerService(List.of(client,other,
+                code("org.gesher.fixture.saf.server",android.os.Process.myUid())));
+        final ActivityTaskManagerService atm;final ActivityManagerService am;final Object providers,process;
+        final DocumentsStorageProvider provider;final UriGrants grants;final UriGrantsManagerService ugm;
+        final AppThread thread=new AppThread();final TestContext context;final IContentProvider transport;
+        final AttributionSource attribution=new AttributionSource(UID,CLIENT,null);
+        @SuppressWarnings("unchecked") Harness(File stateFile)throws Exception{
+            atm=(ActivityTaskManagerService)make(ActivityTaskManagerService.class,new Class<?>[]{PackageManagerService.class},pm);
+            am=(ActivityManagerService)make(ActivityManagerService.class,new Class<?>[]{ActivityTaskManagerService.class,PackageManagerService.class,type("NotificationManagerService")},atm,pm,null);
+            providers=get(am,"mProviders");provider=(DocumentsStorageProvider)get(providers,"mDocumentsStorage");grants=(UriGrants)get(providers,"mUriGrants");set(grants,"mStateFile",stateFile);
+            Object[] holder=new Object[1];as(UID,PID,()->holder[0]=make(type("ActivityTaskManagerService$ProcessRecord"),new Class<?>[]{ActivityTaskManagerService.class,int.class,IApplicationThread.class},atm,PID,thread));
+            process=holder[0];set(process,"packageName",CLIENT);set(process,"processName",CLIENT);set(process,"packageCode",client);set(process,"ready",true);
+            ((List<Object>)get(atm,"mProcesses")).add(process);
+            as(OTHER_UID,OTHER_PID,()->holder[0]=make(type("ActivityTaskManagerService$ProcessRecord"),new Class<?>[]{ActivityTaskManagerService.class,int.class,IApplicationThread.class},atm,OTHER_PID,new AppThread()));
+            set(holder[0],"packageName",OTHER);set(holder[0],"processName",OTHER);set(holder[0],"packageCode",other);set(holder[0],"ready",true);((List<Object>)get(atm,"mProcesses")).add(holder[0]);
+            thread.controller=(IActivityClientController)get(atm,"mClientImpl");
+            Object created=make(type("Services$Created"),new Class<?>[]{PackageManagerService.class,ActivityTaskManagerService.class,ActivityManagerService.class},pm,atm,am);
+            field(Services.class,"sLast").set(null,created);
+            field(ActivityThread.class,"sPackageManager").set(null,pm);
+            ((Map<String,IBinder>)field(ServiceManager.class,"sCache").get(null)).put("mount",
+                    StandIn.of(android.os.storage.IStorageManager.class,new Services.StorageService()).asBinder());
+            context=new TestContext(this);call(provider,"attachTo",new Class<?>[]{Context.class},context);
+            IContentProvider local=((ContentProviderHolder)call(provider,"holder",new Class<?>[0])).provider;
+            if(nativeFiles){
+                IBinder target=local.asBinder();
+                IBinder remote=new Binder(){
+                    @Override protected boolean onTransact(int code,Parcel data,Parcel reply,int flags)throws RemoteException{
+                        return target.transact(code,data,reply,flags);
+                    }
+                };
+                transport=ContentProviderNative.asInterface(remote);
+            }else transport=local;
+            ugm=new UriGrantsManagerService(pm,atm,am);
+        }
+        @SuppressWarnings("unchecked") Object activity(String name,String lifecycle)throws Exception{
+            ActivityInfo i=new ActivityInfo();i.packageName=CLIENT;i.name=CLIENT+"."+name;i.applicationInfo=client.applicationInfo(0);i.taskAffinity=CLIENT;i.screenOrientation=ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+            Class<?> t=type("ActivityTaskManagerService$ActivityRecord");Object r=make(t,new Class<?>[]{ActivityTaskManagerService.class,ActivityInfo.class,Intent.class,int.class,int.class,String.class,t,String.class,int.class},atm,i,new Intent(),1,PID,CLIENT,null,null,-1);
+            set(r,"app",process);set(r,"state",state(lifecycle));((List<Object>)get(atm,"mActivities")).add(r);((List<Object>)get(process,"activities")).add(r);
+            List<Integer> order=(List<Integer>)get(atm,"mTaskOrder");if(!order.contains(1))order.add(1);return r;
+        }
+        void owned(IBinder owner,Uri uri,int modes)throws Exception{call(grants,"grantFromProvider",new Class<?>[]{type("ContentProviders$RegisteredProvider"),IBinder.class,String.class,Uri.class,int.class},get(provider,"registration"),owner,CLIENT,uri,modes);}
+        void retire(IBinder owner)throws Exception{call(grants,"revokeByOwner",new Class<?>[]{IBinder.class},owner);}
+        Cursor query(Uri uri,String[] projection)throws Exception{Cursor[] r=new Cursor[1];as(UID,PID,()->r[0]=transport.query(attribution,uri,projection,new Bundle(),null));return r[0];}
+        Bundle operation(String method,Uri uri,String name)throws Exception{
+            Bundle extras=new Bundle();extras.putParcelable(DocumentsContract.EXTRA_URI,uri);extras.putString(Document.COLUMN_DISPLAY_NAME,name);extras.putString(Document.COLUMN_MIME_TYPE,"text/plain");
+            Bundle[] r=new Bundle[1];as(UID,PID,()->r[0]=transport.call(attribution,AUTH,method,null,extras));return r[0];
+        }
+        int start(Intent request,Object origin)throws Exception{return start(request,origin,41);}
+        int start(Intent request,Object origin,int requestCode)throws Exception{
+            int[] r=new int[1];as(UID,PID,()->r[0]=atm.startActivity(thread,CLIENT,null,request,request.getType(),
+                    origin==null?null:(IBinder)get(origin,"token"),"fixture-result",requestCode,0,null,null));return r[0];
+        }
+        long idleSince()throws Exception{return (Long)call(atm,"idleSince",new Class<?>[0]);}
+        void settled()throws Exception{long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);while(System.nanoTime()<until){
+            boolean pending;synchronized(atm){pending=!((Map<?,?>)get(atm,"mDocumentPickers")).isEmpty();}
+            boolean worker=Thread.getAllStackTraces().keySet().stream().anyMatch(t->t.isAlive()&&t.getName().equals("document-picker"));
+            if(!pending&&!worker)return;Thread.sleep(10);}throw new AssertionError("Document request did not retire");}
+    }
+    /** Service locator boundary: policy, AppOps and URI grant checks use production classes. */
+    static final class TestContext extends ContextWrapper{
+        final Harness h;final AppOpsManager appOps;final PermissionCheckerManager checker;final PackageManager packages;
+        TestContext(Harness h)throws Exception{super(null);this.h=h;
+            IAppOpsService service=(IAppOpsService)make(type("DeviceServices$AppOpsService"),new Class<?>[0]);
+            field(AppOpsManager.class,"sService").set(null,service);
+            appOps=(AppOpsManager)make(AppOpsManager.class,new Class<?>[]{Context.class,IAppOpsService.class},this,service);
+            checker=(PermissionCheckerManager)U.allocateInstance(PermissionCheckerManager.class);set(checker,"mService",new Services.PermissionChecker());set(checker,"mContext",this);
+            packages=new ApplicationPackageManager(null,h.pm){@Override public List<ResolveInfo> queryIntentContentProviders(Intent i,int f){return h.pm.queryIntentContentProviders(i,null,f,0).getList();}};
+        }
+        @Override public String getPackageName(){return "android";}
+        @Override public String getOpPackageName(){return "android";}
+        @Override public String getAttributionTag(){return null;}
+        @Override public AttributionSource getAttributionSource(){return new AttributionSource(1000,"android",null);}
+        @Override public int getUserId(){return 0;}
+        @Override public ApplicationInfo getApplicationInfo(){return new ApplicationInfo();}
+        @Override public PackageManager getPackageManager(){return packages;}
+        @Override public String getSystemServiceName(Class<?> c){return c==PermissionCheckerManager.class?Context.PERMISSION_CHECKER_SERVICE:c==AppOpsManager.class?Context.APP_OPS_SERVICE:null;}
+        @Override public Object getSystemService(String n){return Context.APP_OPS_SERVICE.equals(n)?appOps:Context.PERMISSION_CHECKER_SERVICE.equals(n)?checker:null;}
+        @Override public int checkPermission(String p,int pid,int uid){return h.pm.checkUidPermission(p,uid);}
+    }
+    static final class Dialog{
+        final CountDownLatch opened=new CountDownLatch(1),finish=new CountDownLatch(1);
+        String[] selected;Throwable failure;Object request;int ownerPid;
+        boolean available=true,holdAfterRetirement;
+        volatile BooleanSupplier active;
+        void install(Harness h)throws Exception{Class<?> backend=type("DocumentPicker$Backend");Object proxy=Proxy.newProxyInstance(backend.getClassLoader(),new Class<?>[]{backend},(o,m,a)->{
+            if(m.getName().equals("available"))return available;if(!m.getName().equals("pick"))throw new AssertionError(m);
+            request=a[0];ownerPid=(int)a[1];active=(BooleanSupplier)a[2];opened.countDown();long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);
+            while(!finish.await(10,TimeUnit.MILLISECONDS)){
+                if(!holdAfterRetirement&&!active.getAsBoolean())return null;
+                if(System.nanoTime()>until)throw new AssertionError("Fixture dialog timed out");
+            }
+            if(!active.getAsBoolean())return null;if(failure!=null)throw failure;return selected;});set(h.atm,"mDocumentDialog",proxy);
+        }
     }
 
-    private static void set(Object target, String name, Object value) throws Exception {
-        Class<?> current = target.getClass();
-        while (current != null) {
+    /** Scripted native choice input only; the actual IntentChooser/ATM owns its session. */
+    static final class ChoiceDialog {
+        final CountDownLatch opened = new CountDownLatch(1), finish = new CountDownLatch(1);
+        volatile BooleanSupplier active;
+        void install(Harness h) throws Exception {
+            Class<?> api = type("IntentChooser$Dialog");
+            Object dialog = Proxy.newProxyInstance(api.getClassLoader(), new Class<?>[]{api}, (o, m, a) -> {
+                if (m.getName().equals("available")) return true;
+                if (!m.getName().equals("choose")) throw new AssertionError(m);
+                active = (BooleanSupplier)a[4]; opened.countDown();
+                if (!finish.await(8, TimeUnit.SECONDS)) throw new AssertionError("Choice fixture was not closed");
+                return -1;
+            });
+            set(h.atm, "mIntentChooserDialog", dialog);
+        }
+    }
+    static Uri document(File f)throws IOException{return DocumentsContract.buildDocumentUri(AUTH,f.getCanonicalPath());}
+    static Uri tree(File f)throws IOException{return DocumentsContract.buildTreeDocumentUri(AUTH,f.getCanonicalPath());}
+    static Intent open(){return new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("text/plain").addCategory(Intent.CATEGORY_OPENABLE);}
+    static void provider(File dir)throws Exception{
+        Harness h=new Harness(new File(dir,"provider.xml"));File data=Files.createDirectory(new File(dir,"documents").toPath()).toFile();
+        File f=new File(data,"one.txt");Files.writeString(f.toPath(),"original");Uri doc=document(f),root=tree(data),parent=DocumentsContract.buildDocumentUriUsingTree(root,data.getCanonicalPath());
+        check(DocumentsProvider.class.isAssignableFrom(h.provider.getClass()),"AOSP DocumentsProvider superclass");check(h.provider.getContext()!=null,"Attached before holder publication");
+        ProviderInfo info=h.pm.resolveContentProvider(AUTH,0,0);
+        check(info!=null&&info.exported&&info.grantUriPermissions&&info.applicationInfo.uid==1000,"Registered real provider identity");
+        check(android.Manifest.permission.MANAGE_DOCUMENTS.equals(info.readPermission)&&info.readPermission.equals(info.writePermission),"MANAGE_DOCUMENTS protects both operations");
+        check(DocumentsContract.isDocumentUri(h.context,doc),"Framework provider-aware verification");
+        check(!DocumentsContract.isDocumentUri(h.context,DocumentsContract.buildDocumentUri("not.registered",f.getPath())),"Unregistered authority is not a document provider");
+        rejects(SecurityException.class,()->h.query(doc,null));rejects(SecurityException.class,()->h.operation(DocumentsContract.METHOD_CREATE_DOCUMENT,parent,"denied.txt"));
+        IBinder owner=new Binder();h.owned(owner,doc,READ);
+        try(Cursor c=h.query(doc,new String[]{Document.COLUMN_DISPLAY_NAME,Document.COLUMN_MIME_TYPE,Document.COLUMN_SIZE})){check(c.moveToFirst()&&c.getCount()==1&&"one.txt".equals(c.getString(0)),"Transport returns real file row");check("text/plain".equals(c.getString(1))&&c.getLong(2)==8,"Real MIME and size");}
+        rejects(SecurityException.class,()->h.operation(DocumentsContract.METHOD_RENAME_DOCUMENT,doc,"denied.txt"));
+        as(UID,PID,()->rejects(SecurityException.class,()->h.transport.openFile(h.attribution,doc,"w",null)));
+        check("original".equals(Files.readString(f.toPath())),"Denied write leaves bytes unchanged");
+        as(OTHER_UID,OTHER_PID,()->rejects(SecurityException.class,()->h.transport.query(new AttributionSource(OTHER_UID,OTHER,null),doc,null,new Bundle(),null)));
+        as(UID,PID,()->rejects(SecurityException.class,()->h.transport.query(new AttributionSource(OTHER_UID,OTHER,null),doc,null,new Bundle(),null)));
+        h.owned(owner,root,READ|WRITE|PERSIST|PREFIX);Uri child=DocumentsContract.buildDocumentUriUsingTree(root,f.getCanonicalPath());
+        try(Cursor c=h.query(child,null)){check(c.moveToFirst(),"Tree grant authorizes actual descendant");}
+        File outside=new File(dir,"outside.txt");Files.writeString(outside.toPath(),"outside");Uri unrelated=DocumentsContract.buildDocumentUriUsingTree(root,outside.getCanonicalPath());
+        rejects(SecurityException.class,()->h.query(unrelated,null));rejects(SecurityException.class,()->h.operation(DocumentsContract.METHOD_DELETE_DOCUMENT,unrelated,null));
+        Uri made=h.operation(DocumentsContract.METHOD_CREATE_DOCUMENT,parent,"one.txt").getParcelable(DocumentsContract.EXTRA_URI,Uri.class);
+        check(made!=null&&DocumentsContract.isTreeUri(made)&&!made.equals(child),"Framework create returns distinct tree-backed URI");
+        check(Files.readString(f.toPath()).equals("original")&&new File(DocumentsContract.getDocumentId(made)).isFile(),"Create preserves old data and creates real new file");
+        if(nativeFiles)as(UID,PID,()->{
+            try(ParcelFileDescriptor fd=h.transport.openFile(h.attribution,made,"rw",null);
+                    OutputStream output=new ParcelFileDescriptor.AutoCloseOutputStream(fd)){
+                check(fd.getStatSize()==0,"Actual native descriptor opens new document");
+                output.write("native document bytes".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            try(ParcelFileDescriptor fd=h.transport.openFile(h.attribution,made,"r",null);
+                    InputStream input=new ParcelFileDescriptor.AutoCloseInputStream(fd)){
+                check(new String(input.readAllBytes(),java.nio.charset.StandardCharsets.UTF_8).equals("native document bytes"),
+                        "Actual Parcel-delivered descriptor reads written document bytes");
+            }
+        });
+        Uri renamed=h.operation(DocumentsContract.METHOD_RENAME_DOCUMENT,made,"renamed.txt").getParcelable(DocumentsContract.EXTRA_URI,Uri.class);
+        check(renamed!=null&&new File(DocumentsContract.getDocumentId(renamed)).isFile(),"Actual rename and framework envelope");h.operation(DocumentsContract.METHOD_DELETE_DOCUMENT,renamed,null);
+        check(!new File(DocumentsContract.getDocumentId(renamed)).exists(),"Actual delete removes document");
+        File absent=new File(data,"absent.txt");Uri missing=document(absent);h.owned(owner,missing,READ|WRITE);
+        as(UID,PID,()->rejects(FileNotFoundException.class,()->h.transport.openFile(h.attribution,missing,"w",null)));check(!absent.exists(),"Missing document is not recreated by open");
+        try(Cursor c=h.query(parent,new String[]{Document.COLUMN_FLAGS,Document.COLUMN_SIZE})){check(c.moveToFirst()&&(c.getInt(0)&Document.FLAG_DIR_SUPPORTS_CREATE)!=0,"Writable directory advertises create");check((c.getInt(0)&Document.FLAG_SUPPORTS_WRITE)==0&&c.isNull(1),"Directory has no regular-file write capability or invented size");}
+        h.retire(owner);rejects(SecurityException.class,()->h.query(doc,null));h.grants.flush();
+    }
+    static void persistence(File dir)throws Exception{
+        File f=new File(dir,"durable.txt");Files.writeString(f.toPath(),"durable");File state=new File(dir,"durable-grants.xml");Uri uri=document(f);IBinder owner=new Binder();
+        Harness first=new Harness(state);first.owned(owner,uri,READ|WRITE|PERSIST);as(UID,PID,()->first.ugm.takePersistableUriPermission(uri,READ,null,0));first.grants.flush();first.retire(owner);
+        Harness second=new Harness(state);try(Cursor c=second.query(uri,null)){check(c.moveToFirst(),"Persisted read survives reconstructed provider and manager");}
+        as(UID,PID,()->rejects(SecurityException.class,()->second.transport.openFile(second.attribution,uri,"w",null)));check(!second.grants.canAccess(second.client,uri,WRITE,0),"Untaken write does not survive restart");
+        as(UID,PID,()->second.ugm.releasePersistableUriPermission(uri,READ,null,0));second.grants.flush();Harness third=new Harness(state);rejects(SecurityException.class,()->third.query(uri,null));check(state.isFile(),"Persistence uses real state file");
+    }
+
+    static void retain(Harness h, IBinder owner, Uri uri, int modes) throws Exception {
+        h.owned(owner, uri, modes | PERSIST | (DocumentsContract.isTreeUri(uri) ? PREFIX : 0));
+        as(UID, PID, () -> h.ugm.takePersistableUriPermission(uri, modes, null, 0));
+    }
+
+    static Set<Uri> permissionUris(Harness h, boolean persisted) {
+        Set<Uri> result = new HashSet<>();
+        for (android.content.UriPermission permission : h.grants.list(CLIENT, true, persisted)) {
+            result.add(permission.getUri());
+        }
+        return result;
+    }
+
+    static void deletionLifecycle(File dir) throws Exception {
+        for (String mode : List.of("complete", "parent-failure", "child-failure")) {
+            File fixture = Files.createDirectory(new File(dir, "deletion-" + mode).toPath()).toFile();
+            File selected = Files.createDirectory(new File(fixture, "selected").toPath()).toFile();
+            File branch = mode.equals("parent-failure") ? selected
+                    : Files.createDirectory(new File(selected, "nested").toPath()).toFile();
+            File deleted = new File(branch, "deleted.txt"), survivor = new File(branch, "survivor.txt");
+            File unrelated = new File(fixture, "unrelated.txt"), stateFile = new File(fixture, "grants.xml");
+            Files.writeString(deleted.toPath(), "owned document selected for deletion");
+            Files.writeString(unrelated.toPath(), "unrelated owned document");
+            Harness h = new Harness(stateFile);
+            IBinder owner = new Binder();
+            Uri selectedUri = document(selected), deletedUri = document(deleted);
+            Uri unrelatedUri = document(unrelated), survivorUri = document(survivor);
+            retain(h, owner, selectedUri, READ | WRITE);
+            if (!branch.equals(selected)) retain(h, owner, document(branch), READ | WRITE);
+            retain(h, owner, tree(branch), READ | WRITE);
+            retain(h, owner, deletedUri, READ | WRITE);
+            retain(h, owner, unrelatedUri, READ);
+            Set<Uri> before = permissionUris(h, true);
+            check(before.containsAll(Set.of(selectedUri, deletedUri, tree(branch), unrelatedUri)),
+                    "Deletion fixture holds legitimate persisted parent, child, tree and unrelated grants");
+            h.grants.flush();
+
+            boolean partial = !mode.equals("complete");
+            boolean[] inserted = {false};
+            Context originalContext = h.provider.getContext();
+            if (partial) {
+                // After actual child removal/revocation, a concurrent creator makes
+                // the already enumerated directory nonempty. All file operations,
+                // grants and the resulting DirectoryNotEmptyException are real;
+                // only their timing is controlled at the provider context boundary.
+                set(h.provider, "mContext", new ContextWrapper(originalContext) {
+                    @Override public void revokeUriPermission(Uri uri, int modes) {
+                        super.revokeUriPermission(uri, modes);
+                        if (!inserted[0] && deletedUri.equals(uri)) {
+                            inserted[0] = true;
+                            try {
+                                Files.writeString(survivor.toPath(), "concurrently created owned document");
+                                retain(h, owner, survivorUri, READ | WRITE);
+                            } catch (Exception failure) { throw new AssertionError(failure); }
+                        }
+                    }
+                });
+            }
             try {
-                Field f = current.getDeclaredField(name);
-                f.setAccessible(true);
-                f.set(target, value);
-                return;
-            } catch (NoSuchFieldException ignored) {
-                current = current.getSuperclass();
+                if (partial) {
+                    try {
+                        h.operation(DocumentsContract.METHOD_DELETE_DOCUMENT, selectedUri, null);
+                        throw new AssertionError("Nonempty directory deletion must fail");
+                    } catch (ParcelableException failure) {
+                        check(failure.getCause() instanceof FileNotFoundException,
+                                "AOSP transport reports the real partial deletion failure");
+                    }
+                } else h.operation(DocumentsContract.METHOD_DELETE_DOCUMENT, selectedUri, null);
+            } finally { set(h.provider, "mContext", originalContext); }
+
+            check(!deleted.exists() && unrelated.isFile(), "Deleted child is gone and unrelated file survives");
+            Set<Uri> expected = new HashSet<>();
+            if (partial) {
+                check(inserted[0] && selected.isDirectory() && branch.isDirectory() && survivor.isFile(),
+                        "A later directory failure preserves its parent and surviving child: " + mode);
+                expected.addAll(before); expected.remove(deletedUri); expected.add(survivorUri);
+            } else {
+                check(!selected.exists() && !branch.exists(), "Successful deletion removes the requested tree");
+                expected.add(unrelatedUri);
+            }
+            check(permissionUris(h, false).equals(expected),
+                    "Only successfully deleted documents lose active grant records: " + mode);
+            check(permissionUris(h, true).equals(expected),
+                    "Only successfully deleted documents lose persisted grant records: " + mode);
+            h.grants.flush();
+            Harness reloaded = new Harness(stateFile);
+            check(permissionUris(reloaded, true).equals(expected),
+                    "Deletion retirement and surviving permissions reload from the real durable store: " + mode);
+            reloaded.grants.flush();
+            System.out.println("SAF_DELETE " + mode + " deletedChildPermissions=0 survivingPermissions="
+                    + expected.size() + " durableReload=true");
+        }
+    }
+
+    static void selection(File dir)throws Exception{
+        Harness h=new Harness(new File(dir,"selection.xml"));Object origin=h.activity("Origin","RESUMED");
+        File a=new File(dir,"selected-one.txt"),b=new File(dir,"selected-two.txt");Files.writeString(a.toPath(),"one");Files.writeString(b.toPath(),"two");
+        Dialog dialog=new Dialog();dialog.install(h);Intent request=open().putExtra(Intent.EXTRA_ALLOW_MULTIPLE,true)
+            .putExtra(Intent.EXTRA_MIME_TYPES,new String[]{"text/plain","application/pdf"}).putExtra(DocumentsContract.EXTRA_INITIAL_URI,document(a));
+        long before=System.nanoTime();check(h.start(request,origin)==ActivityManager.START_SUCCESS,"Production start accepts request");
+        check(System.nanoTime()-before<TimeUnit.SECONDS.toNanos(2),"startActivity returns while dialog stays pending");check(dialog.opened.await(3,TimeUnit.SECONDS),"Production worker opens dialog");
+        check(dialog.ownerPid==PID&&(boolean)get(dialog.request,"multiple"),"Native request has actual owner and multiple flag");
+        check(((String)get(dialog.request,"filter")).contains("*.txt")&&get(dialog.request,"initialDirectory")!=null,"MIME filters and initial URI reach backend");
+        check(get(origin,"state")==state("PAUSED"),"Origin pauses before native UI");dialog.selected=new String[]{a.getPath(),b.getPath()};dialog.finish.countDown();h.settled();
+        List<ResultInfo> results=h.thread.results();check(results.size()==1&&results.get(0).mResultCode==Activity.RESULT_OK,"ATM returns one real successful callback");
+        Intent result=results.get(0).mData;check(result.getData()==null&&result.getClipData().getItemCount()==2,"Multiple selection uses ClipData");
+        check(h.grants.canAccess(h.client,document(a),READ,0)&&h.grants.canAccess(h.client,document(b),READ,0),"All grants available before callback");
+        check(get(origin,"state")==state("RESUMED"),"Origin resumes after result");int resultAt=-1,resumeAt=-1;
+        for(int i=0;i<h.thread.events.size();i++){if(h.thread.events.get(i)instanceof ActivityResultItem)resultAt=i;if(h.thread.events.get(i)instanceof ResumeActivityItem)resumeAt=i;}
+        check(resultAt>=0&&resumeAt>resultAt,"Result precedes onResume");h.retire((IBinder)get(origin,"token"));check(!h.grants.canAccess(h.client,document(a),READ,0),"Untaken grants retire with activity owner");h.grants.flush();
+    }
+    static void failures(File dir)throws Exception{
+        for(String scenario:List.of("cancel","backend","missing","mime","create","retire","process","superseded","disabled-process","package","grant")){
+            Harness h=new Harness(new File(dir,scenario+"-grants.xml"));Object origin=h.activity("Origin","RESUMED");Dialog dialog=new Dialog();dialog.install(h);
+            File f=new File(dir,"error-"+scenario+".txt");if(!scenario.equals("missing")&&!scenario.equals("create"))Files.writeString(f.toPath(),"existing");
+            Intent intent=scenario.equals("create")?new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("text/plain").putExtra(Intent.EXTRA_TITLE,"suggested.txt"):
+                scenario.equals("mime")?open().setType("image/png"):open();
+            check(h.start(intent,origin)==ActivityManager.START_SUCCESS&&dialog.opened.await(3,TimeUnit.SECONDS),"Request opened: "+scenario);
+            if(scenario.equals("backend"))dialog.failure=new IOException("Explicit fixture backend failure");else if(!scenario.equals("cancel"))dialog.selected=new String[]{scenario.equals("create")?new File(f,"no-parent.txt").getPath():f.getPath()};
+            if(scenario.equals("retire"))set(origin,"finishing",true);if(scenario.equals("process"))set(h.process,"exiting",true);
+            if(scenario.equals("superseded"))set(h.process,"pidSuperseded",true);
+            if(scenario.equals("disabled-process"))set(h.process,"enabledProcessLifetime",(BooleanSupplier)()->false);
+            if(scenario.equals("package")){@SuppressWarnings("unchecked")Map<String,ApkPackage> packages=(Map<String,ApkPackage>)get(h.pm,"mPackages");synchronized(h.pm){packages.put(CLIENT,code(CLIENT,UID));}}
+            if(scenario.equals("grant"))set(h.providers,"mRegisteredProviders",Map.of());dialog.finish.countDown();h.settled();List<ResultInfo> results=h.thread.results();
+            if(List.of("retire","process","superseded","disabled-process","package").contains(scenario)){
+                check(results.isEmpty(),"No late callback after retirement: "+scenario);
+                check(h.thread.events.stream().noneMatch(e->e instanceof ResumeActivityItem),
+                        "Retired owner process is not resumed: "+scenario);
+            }
+            else check(results.size()==1&&results.get(0).mResultCode==Activity.RESULT_CANCELED&&results.get(0).mData==null,"Failure cannot report URI success: "+scenario);
+            check(!h.grants.canAccess(h.client,document(f),READ,0),"No grants on failed request: "+scenario);if(scenario.equals("create"))check(!f.exists(),"Failed create never invents parent directories");h.grants.flush();
+        }
+    }
+
+    static ResultInfo finishSelection(Harness h, Dialog dialog, String... paths) throws Exception {
+        check(dialog.opened.await(3, TimeUnit.SECONDS), "Native boundary opens before fixture selection");
+        dialog.selected = paths;
+        dialog.finish.countDown();
+        h.settled();
+        List<ResultInfo> results = h.thread.results();
+        check(results.size() == 1, "Selection has exactly one result");
+        return results.get(0);
+    }
+
+    static void actions(File dir) throws Exception {
+        File existing = new File(dir, "save-existing.txt");
+        Files.writeString(existing.toPath(), "keep existing bytes");
+        Harness create = new Harness(new File(dir, "create-action.xml"));
+        Object owner = create.activity("Origin", "RESUMED");
+        Dialog save = new Dialog(); save.install(create);
+        check(create.start(new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("text/plain")
+                .putExtra(Intent.EXTRA_TITLE, "suggested.txt")
+                .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true), owner) == ActivityManager.START_SUCCESS,
+                "CREATE_DOCUMENT starts a real save request");
+        ResultInfo saved = finishSelection(create, save, existing.getPath());
+        check((int)get(save.request, "mode") == 1 && !(boolean)get(save.request, "multiple")
+                && "suggested.txt".equals(get(save.request, "suggestedName"))
+                && "text/plain".equals(libcore.content.type.MimeMap.getDefault()
+                    .guessMimeTypeFromExtension((String)get(save.request, "extension"))),
+                "Save mode, name and MIME extension reach native boundary");
+        check(saved.mResultCode == Activity.RESULT_OK, "Actual create succeeds");
+        Uri made = saved.mData.getData();
+        File madeFile = new File(DocumentsContract.getDocumentId(made));
+        check(!made.equals(document(existing)) && madeFile.isFile() && madeFile.length() == 0
+                && Files.readString(existing.toPath()).equals("keep existing bytes"),
+                "Save selection never overwrites an existing file");
+        check(create.grants.canAccess(create.client, made, READ | WRITE, 0)
+                && (saved.mData.getFlags() & PERSIST) != 0, "Created document has real read/write persistable grant");
+        create.grants.flush();
+
+        Harness content = new Harness(new File(dir, "content-action.xml"));
+        Object source = content.activity("Origin", "RESUMED");
+        Dialog get = new Dialog(); get.install(content);
+        content.start(new Intent(Intent.ACTION_GET_CONTENT).setType("text/plain"), source);
+        ResultInfo got = finishSelection(content, get, existing.getPath());
+        check(got.mResultCode == Activity.RESULT_OK && got.mData.getData().equals(document(existing)),
+                "GET_CONTENT returns selected real document");
+        check((got.mData.getFlags() & (READ | WRITE | PERSIST | PREFIX)) == READ
+                && !content.grants.canAccess(content.client, document(existing), WRITE, 0),
+                "GET_CONTENT delegates read access only");
+        as(UID, PID, () -> rejects(SecurityException.class,
+                () -> content.ugm.takePersistableUriPermission(got.mData.getData(), READ, null, 0)));
+        content.grants.flush();
+
+        Harness tree = new Harness(new File(dir, "tree-action.xml"));
+        Object treeSource = tree.activity("Origin", "RESUMED");
+        Dialog folder = new Dialog(); folder.install(tree);
+        tree.start(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), treeSource);
+        ResultInfo picked = finishSelection(tree, folder, dir.getPath());
+        check(picked.mResultCode == Activity.RESULT_OK && DocumentsContract.isTreeUri(picked.mData.getData())
+                && (picked.mData.getFlags() & PREFIX) != 0, "Tree selection returns actual prefix grant");
+        Uri child = DocumentsContract.buildDocumentUriUsingTree(picked.mData.getData(), existing.getCanonicalPath());
+        try (Cursor cursor = tree.query(child, null)) { check(cursor.moveToFirst(), "Selected tree opens existing descendant through AOSP transport"); }
+        tree.grants.flush();
+
+        for (String scenario : List.of("count", "directory", "root", "create-grant")) {
+            Harness h = new Harness(new File(dir, "invalid-" + scenario + ".xml"));
+            Object origin = h.activity("Origin", "RESUMED");
+            Dialog dialog = new Dialog(); dialog.install(h);
+            Intent request = scenario.equals("root") ? new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                    : scenario.equals("create-grant") ? new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("text/plain") : open();
+            h.start(request, origin);
+            check(dialog.opened.await(3, TimeUnit.SECONDS), "Invalid selection request opens: " + scenario);
+            File newFile = new File(dir, "grant-failed-create.txt");
+            if (scenario.equals("create-grant")) set(h.providers, "mRegisteredProviders", Map.of());
+            ResultInfo result = finishSelection(h, dialog, scenario.equals("count")
+                    ? new String[]{existing.getPath(), madeFile.getPath()}
+                    : new String[]{scenario.equals("root") ? "/" : scenario.equals("directory") ? dir.getPath() : newFile.getPath()});
+            check(result.mResultCode == Activity.RESULT_CANCELED && result.mData == null,
+                    "Invalid selection cannot report success: " + scenario);
+            if (scenario.equals("create-grant")) check(!newFile.exists(), "Failed grant removes its unused newly created file");
+            h.grants.flush();
+        }
+    }
+
+    static void lifecycle(File dir) throws Exception {
+        Harness h = new Harness(new File(dir, "covered.xml"));
+        Object origin = h.activity("Origin", "PAUSED"), top = h.activity("Top", "RESUMED");
+        Dialog dialog = new Dialog(); dialog.install(h);
+        h.start(open().addFlags(Intent.FLAG_ACTIVITY_NO_USER_ACTION), origin);
+        check(dialog.opened.await(3, TimeUnit.SECONDS), "Request from paused source opens above actual top");
+        PauseActivityItem pause = (PauseActivityItem)h.thread.events.stream().filter(e -> e instanceof PauseActivityItem).findFirst().orElseThrow();
+        check(pause.getActivityToken().equals(get(top, "token")) && !(boolean)get(pause, "mUserLeaving"),
+                "Picker pauses covered top and honors NO_USER_ACTION");
+        check(h.start(open(), origin) == ActivityManager.START_CANCELED, "Duplicate owner request is bounded");
+        dialog.finish.countDown(); h.settled();
+        check(get(top, "state") == state("RESUMED") && get(origin, "state") == state("PAUSED"),
+                "Picker resumes covered top without promoting paused result recipient");
+        check(h.thread.results().isEmpty() && ((List<?>)get(origin, "pendingResults")).size() == 1,
+                "Paused recipient retains its pending cancellation until normal resume");
+        h.grants.flush();
+
+        Harness delayed = new Harness(new File(dir, "delayed-pause.xml"));
+        Object delayedOrigin = delayed.activity("Origin", "RESUMED");
+        delayed.thread.acknowledge = false;
+        Dialog delayedDialog = new Dialog(); delayedDialog.install(delayed);
+        delayed.start(open(), delayedOrigin);
+        check(delayedDialog.opened.await(3, TimeUnit.SECONDS), "Pause acknowledgment wait is bounded");
+        delayedDialog.finish.countDown(); delayed.settled();
+        check(get(delayedOrigin, "state") == state("PAUSING") && delayed.thread.results().isEmpty(),
+                "Completion does not resume before outstanding pause acknowledgment");
+        delayed.thread.acknowledge = true;
+        as(UID, PID, () -> delayed.thread.controller.activityPaused((IBinder)get(delayedOrigin, "token")));
+        check(get(delayedOrigin, "state") == state("RESUMED") && delayed.thread.results().size() == 1,
+                "Late pause acknowledgment delivers pending result and resumes once");
+        delayed.grants.flush();
+
+        Harness newTask = new Harness(new File(dir, "new-task.xml"));
+        Object newTaskOrigin = newTask.activity("Origin", "RESUMED");
+        Dialog newTaskDialog = new Dialog(); newTaskDialog.install(newTask);
+        newTask.start(open().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), newTaskOrigin);
+        check(newTaskDialog.opened.await(3, TimeUnit.SECONDS), "NEW_TASK request opens");
+        List<ResultInfo> cancellation = newTask.thread.results();
+        check(cancellation.size() == 1 && cancellation.get(0).mResultCode == Activity.RESULT_CANCELED,
+                "NEW_TASK immediately cancels activity-for-result relationship");
+        newTaskDialog.finish.countDown(); newTask.settled();
+        check(newTask.thread.results().size() == 1, "NEW_TASK completion does not deliver a second result");
+        newTask.grants.flush();
+    }
+
+    static void workersRetired(String name) throws Exception {
+        for (Thread thread : Thread.getAllStackTraces().keySet()) {
+            if (thread.isAlive() && thread.getName().equals(name)) {
+                thread.join(3000);
+                check(!thread.isAlive(), "Native UI worker did not retire: " + name);
             }
         }
-        throw new NoSuchFieldException(name);
     }
 
-    private static ApkPackage createPackage(String name, int uid) throws Exception {
-        PackageImpl parsed = (PackageImpl) PackageImpl.forTesting(name, "/fixture/" + name + "/base.apk");
-        parsed.hideAsFinal();
-        ApkPackage code = (ApkPackage) unsafe.allocateInstance(ApkPackage.class);
-        set(code, "packageName", name);
-        set(code, "parsed", parsed);
-        set(code, "mUid", uid);
-        set(code, "apkPath", "/fixture/" + name + "/base.apk");
-        set(code, "mDataDir", "/fixture/" + name + "/data");
-        set(code, "sharedLibraries", SharedLibraryGraph.EMPTY);
-        return code;
+    static int pending(Harness h, String name) throws Exception {
+        synchronized (h.atm) { return ((Map<?,?>)get(h.atm, name)).size(); }
     }
 
-    public static void main(String[] args) throws Exception {
+    static void awaitPending(Harness h, int documents, int choices) throws Exception {
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (System.nanoTime() < until) {
+            if (pending(h, "mDocumentPickers") == documents && pending(h, "mIntentChoosers") == choices) return;
+            Thread.sleep(5);
+        }
+        throw new AssertionError("Native UI reservations did not retire");
+    }
+
+    static Intent chooser() {
+        return Intent.createChooser(new Intent().setComponent(new ComponentName(CLIENT, CLIENT + ".Top")),
+                "Native UI fixture").putExtra(Intent.EXTRA_AUTO_LAUNCH_SINGLE_CHOICE, false);
+    }
+
+    static void idleOwnership(File dir) throws Exception {
+        File selected = new File(dir, "headless-selected.txt");
+        Files.writeString(selected.toPath(), "actual selected document");
+        for (String mode : List.of("cancel", "no-poll", "backend", "runtime", "linkage", "missing", "process", "package", "selected")) {
+            Harness h = new Harness(new File(dir, "idle-" + mode + ".xml"));
+            set(h.atm, "mIdleSince", 1L);
+            check(h.idleSince() == 1, "Activity-free caller starts with an existing idle interval");
+            Dialog dialog = new Dialog(); dialog.holdAfterRetirement = true; dialog.install(h);
+            check(h.start(open().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null, -1) == ActivityManager.START_SUCCESS,
+                    "Headless picker starts: " + mode);
+            check(dialog.opened.await(3, TimeUnit.SECONDS), "Headless picker opens: " + mode);
+            check(((List<?>)get(h.atm, "mActivities")).isEmpty() && pending(h, "mDocumentPickers") == 1
+                    && dialog.active.getAsBoolean(), "Real native session owns the headless request without an invented activity");
+            check((Long)get(h.atm, "mIdleSince") == 0, "Picker admission resets idle without a monitor poll: " + mode);
+            if (!mode.equals("no-poll")) check(h.idleSince() == 0, "Open picker keeps the device busy: " + mode);
+            if (mode.equals("backend")) dialog.failure = new IOException("Fixture native dialog unavailable");
+            if (mode.equals("runtime")) dialog.failure = new IllegalStateException("Fixture native dialog failed");
+            if (mode.equals("linkage")) dialog.failure = new UnsatisfiedLinkError("Fixture native backend disappeared");
+            if (mode.equals("missing")) dialog.selected = new String[]{new File(dir, "not-selected.txt").getPath()};
+            if (mode.equals("selected")) dialog.selected = new String[]{selected.getPath()};
+            if (mode.equals("process")) call(h.atm, "processDied", new Class<?>[]{h.process.getClass()}, h.process);
+            if (mode.equals("package")) {
+                @SuppressWarnings("unchecked") Map<String,ApkPackage> packages = (Map<String,ApkPackage>)get(h.pm, "mPackages");
+                synchronized (h.pm) { packages.put(CLIENT, code(CLIENT, UID)); }
+            }
+            if (mode.equals("process") || mode.equals("package")) {
+                check(!dialog.active.getAsBoolean() && pending(h, "mDocumentPickers") == 1 && h.idleSince() == 0,
+                        "Retired owner keeps busy ownership until its actual native worker returns: " + mode);
+            }
+            long closedAfter = SystemClock.uptimeMillis();
+            dialog.finish.countDown(); h.settled();
+            long finishedIdle = (Long)get(h.atm, "mIdleSince");
+            check(pending(h, "mDocumentPickers") == 0 && finishedIdle >= closedAfter && finishedIdle > 1,
+                    "Final picker cleanup starts a fresh idle interval: " + mode);
+            check(h.idleSince() == finishedIdle && h.thread.results().isEmpty()
+                    && ((List<?>)get(h.atm, "mActivities")).isEmpty(),
+                    "Completion is stable and does not invent a result recipient: " + mode);
+            h.grants.flush();
+        }
+        Harness unavailable = new Harness(new File(dir, "idle-unavailable.xml"));
+        Dialog noBackend = new Dialog(); noBackend.available = false; noBackend.install(unavailable);
+        set(unavailable.atm, "mIdleSince", 1L);
+        check(unavailable.start(open().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null, -1)
+                == ActivityManager.START_INTENT_NOT_RESOLVED && pending(unavailable, "mDocumentPickers") == 0
+                && unavailable.idleSince() == 1, "Unavailable picker never acquires busy ownership");
+        unavailable.grants.flush();
+    }
+
+    static void combinedNativeUi(File dir) throws Exception {
+        for (String order : List.of("document-first", "chooser-first")) {
+            for (String mode : List.of("headless", "resumed", "late-pause", "partial-pause")) {
+                boolean headless = mode.equals("headless");
+                boolean delayed = mode.endsWith("pause");
+                Harness h = new Harness(new File(dir, "combined-" + order + "-" + mode + ".xml"));
+                Object origin = headless ? null : h.activity("Origin", "RESUMED");
+                if (headless) set(h.atm, "mIdleSince", 1L);
+                if (delayed) h.thread.acknowledge = false;
+                Dialog documents = new Dialog(); documents.install(h);
+                ChoiceDialog choices = new ChoiceDialog(); choices.install(h);
+                Intent documentRequest = open(), choiceRequest = chooser();
+                if (headless) {
+                    documentRequest.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    choiceRequest.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                }
+                if (order.equals("document-first")) {
+                    check(h.start(documentRequest, origin, headless ? -1 : 41) == ActivityManager.START_SUCCESS,
+                            "Document request admitted before chooser");
+                    check(documents.opened.await(3, TimeUnit.SECONDS), "First document UI opens");
+                    check(h.start(choiceRequest, origin, headless ? -1 : 42) == ActivityManager.START_SUCCESS,
+                            "Chooser admitted above document request");
+                } else {
+                    check(h.start(choiceRequest, origin, headless ? -1 : 42) == ActivityManager.START_SUCCESS,
+                            "Chooser admitted before document request");
+                    check(choices.opened.await(3, TimeUnit.SECONDS), "First choice UI opens");
+                    check(h.start(documentRequest, origin, headless ? -1 : 41) == ActivityManager.START_SUCCESS,
+                            "Document request admitted above chooser");
+                }
+                check(documents.opened.await(3, TimeUnit.SECONDS) && choices.opened.await(3, TimeUnit.SECONDS)
+                        && pending(h, "mDocumentPickers") == 1 && pending(h, "mIntentChoosers") == 1
+                        && h.idleSince() == 0, "Both native sessions retain their independent reservations");
+                if (!headless) check(get(origin, "state") == state(delayed ? "PAUSING" : "PAUSED"),
+                        "Shared covered activity remains under its actual pause lifecycle");
+                // Close the first admitted session; the other must retain the device
+                // and its coverage until its own native worker has actually returned.
+                if (order.equals("document-first")) {
+                    documents.finish.countDown(); awaitPending(h, 0, 1); workersRetired("document-picker");
+                    check(choices.active.getAsBoolean(), "Document cleanup preserves live chooser");
+                } else {
+                    choices.finish.countDown(); awaitPending(h, 1, 0); workersRetired("intent-chooser");
+                    check(documents.active.getAsBoolean(), "Chooser cleanup preserves live document picker");
+                }
+                check(h.idleSince() == 0 && h.thread.results().isEmpty(), "Remaining native UI retains busy lifetime and pending results");
+                if (!headless) check(get(origin, "state") == state(delayed ? "PAUSING" : "PAUSED")
+                        && h.thread.events.stream().noneMatch(e -> e instanceof ResumeActivityItem),
+                        "Closing one native session cannot resume the activity under the other");
+                if (mode.equals("partial-pause")) {
+                    h.thread.acknowledge = true;
+                    as(UID, PID, () -> h.thread.controller.activityPaused((IBinder)get(origin, "token")));
+                    check(get(origin, "state") == state("PAUSED") && h.thread.results().isEmpty()
+                            && h.thread.events.stream().noneMatch(e -> e instanceof ResumeActivityItem),
+                            "Late pause acknowledgment preserves the remaining native coverage");
+                }
+                long closedAfter = SystemClock.uptimeMillis();
+                documents.finish.countDown(); choices.finish.countDown();
+                h.settled(); workersRetired("intent-chooser"); awaitPending(h, 0, 0);
+                if (mode.equals("late-pause")) {
+                    check(get(origin, "state") == state("PAUSING") && h.thread.results().isEmpty()
+                            && h.thread.events.stream().noneMatch(e -> e instanceof ResumeActivityItem),
+                            "Both completed dialogs wait for the outstanding real pause acknowledgment");
+                    h.thread.acknowledge = true;
+                    as(UID, PID, () -> h.thread.controller.activityPaused((IBinder)get(origin, "token")));
+                }
+                if (headless) {
+                    check(h.idleSince() >= closedAfter && h.thread.results().isEmpty()
+                            && ((List<?>)get(h.atm, "mActivities")).isEmpty(), "Last native UI starts headless idle without creating an activity");
+                } else {
+                    check(get(origin, "state") == state("RESUMED") && h.thread.results().size() == 2,
+                            "Last native UI resumes once with both real cancellations");
+                    check(h.thread.events.stream().filter(e -> e instanceof ResumeActivityItem).count() == 1,
+                            "Combined completion schedules one resume");
+                }
+                h.grants.flush();
+            }
+        }
+    }
+
+    /** Invoked in three separate JVM/ART processes; only the real XML store is shared. */
+    public static void restartPhase(String phase, File directory) throws Exception {
+        field(Class.forName("com.gesher.app.locale.SystemLocale"),"sIs24Hour").set(null,Boolean.TRUE);
+        File data = new File(directory, "persisted.txt"), state = new File(directory, "grants.xml");
+        if (phase.equals("write")) Files.writeString(data.toPath(), "survives process exit");
+        Harness h = new Harness(state); Uri uri = document(data);
+        if (phase.equals("write")) {
+            h.owned(new Binder(), uri, READ | WRITE | PERSIST);
+            as(UID, PID, () -> h.ugm.takePersistableUriPermission(uri, READ | WRITE, null, 0));
+            as(UID, PID, () -> h.ugm.releasePersistableUriPermission(uri, WRITE, null, 0));
+            h.grants.flush();
+            check(state.isFile(), "First process writes durable state");
+        } else if (phase.equals("read")) {
+            try (Cursor cursor = h.query(uri, null)) { check(cursor.moveToFirst(), "Second process reloads persisted read through provider transport"); }
+            check(!h.grants.canAccess(h.client, uri, WRITE, 0), "Released write does not return after process restart");
+            as(UID, PID, () -> rejects(SecurityException.class,
+                    () -> h.ugm.takePersistableUriPermission(uri, WRITE, null, 0)));
+            as(UID, PID, () -> h.ugm.releasePersistableUriPermission(uri, READ, null, 0));
+            h.grants.flush();
+        } else if (phase.equals("released")) {
+            rejects(SecurityException.class, () -> h.query(uri, null));
+            check(!h.grants.canAccess(h.client, uri, READ | WRITE, 0), "Third process preserves release");
+        } else throw new IllegalArgumentException("Unknown restart phase");
+        System.out.println("SafDocumentsContractTest restart " + phase + " passed");
+    }
+    public static void contracts(boolean descriptors)throws Exception{
+        nativeFiles=descriptors;field(Class.forName("com.gesher.app.locale.SystemLocale"),"sIs24Hour").set(null,Boolean.TRUE);
+        File dir=Files.createTempDirectory("gesher-saf-production-").toFile().getCanonicalFile();
+        try{provider(dir);persistence(dir);deletionLifecycle(dir);selection(dir);failures(dir);actions(dir);lifecycle(dir);idleOwnership(dir);combinedNativeUi(dir);System.out.println("SafDocumentsContractTest passed: "+checks+" checks; nativeFiles="+nativeFiles);}
+        finally{try(var paths=Files.walk(dir.toPath())){for(var p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);}}
+    }
+    public static void main(String[] args)throws Exception{
         System.loadLibrary("android_runtime");
-        Field singleton = Unsafe.class.getDeclaredField("theUnsafe");
-        singleton.setAccessible(true);
-        unsafe = (Unsafe) singleton.get(null);
-
-        // -----------------------------------------------------------------------------------------
-        // 1. Audit SAF Picker Result Logic: content:// URIs with DocumentsContract contracts
-        // -----------------------------------------------------------------------------------------
-        Class<?> atmsClass = Class.forName("com.gesher.server.ActivityTaskManagerService");
-        Method buildResultMethod = atmsClass.getDeclaredMethod("buildDocumentPickerResult", String.class, String.class);
-        buildResultMethod.setAccessible(true);
-
-        // ACTION_OPEN_DOCUMENT: must return content://com.gesher.documents/document/... with grant flags
-        Intent openDocResult = (Intent) buildResultMethod.invoke(null, Intent.ACTION_OPEN_DOCUMENT, "C:\\test\\document.pdf");
-        check(openDocResult != null, "ACTION_OPEN_DOCUMENT result must not be null");
-        Uri openDocUri = openDocResult.getData();
-        check(openDocUri != null, "ACTION_OPEN_DOCUMENT URI must not be null");
-        check("content".equals(openDocUri.getScheme()), "SAF Intent result must carry content:// URI, not file://");
-        check(DocumentsStorageProvider.AUTHORITY.equals(openDocUri.getAuthority()), "URI authority must be " + DocumentsStorageProvider.AUTHORITY);
-        check(openDocUri.toString().startsWith("content://com.gesher.documents/document/"), "Must be a document URI: " + openDocUri);
-        check((openDocResult.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0, "FLAG_GRANT_READ_URI_PERMISSION must be attached");
-        check((openDocResult.getFlags() & Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0, "FLAG_GRANT_WRITE_URI_PERMISSION must be attached");
-        check((openDocResult.getFlags() & Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) != 0, "FLAG_GRANT_PERSISTABLE_URI_PERMISSION must be attached");
-        check((openDocResult.getFlags() & Intent.FLAG_GRANT_PREFIX_URI_PERMISSION) == 0, "FLAG_GRANT_PREFIX_URI_PERMISSION must not be on single doc");
-        check(openDocResult.getClipData() != null, "ClipData must be set");
-        check(openDocUri.equals(openDocResult.getClipData().getItemAt(0).getUri()), "ClipData URI must match data URI");
-
-        // ACTION_CREATE_DOCUMENT: must return content://com.gesher.documents/document/...
-        Intent createDocResult = (Intent) buildResultMethod.invoke(null, Intent.ACTION_CREATE_DOCUMENT, "C:\\test\\new_file.txt");
-        check(createDocResult != null, "ACTION_CREATE_DOCUMENT result must not be null");
-        Uri createDocUri = createDocResult.getData();
-        check(createDocUri != null, "ACTION_CREATE_DOCUMENT URI must not be null");
-        check("content".equals(createDocUri.getScheme()), "ACTION_CREATE_DOCUMENT must carry content:// URI");
-        check(createDocUri.toString().startsWith("content://com.gesher.documents/document/"), "Must be a document URI: " + createDocUri);
-        check((createDocResult.getFlags() & Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) != 0, "FLAG_GRANT_PERSISTABLE_URI_PERMISSION on create document");
-
-        // ACTION_OPEN_DOCUMENT_TREE: must return content://com.gesher.documents/tree/... with prefix flag
-        Intent treeDocResult = (Intent) buildResultMethod.invoke(null, Intent.ACTION_OPEN_DOCUMENT_TREE, "C:\\test\\workspace");
-        check(treeDocResult != null, "ACTION_OPEN_DOCUMENT_TREE result must not be null");
-        Uri treeDocUri = treeDocResult.getData();
-        check(treeDocUri != null, "ACTION_OPEN_DOCUMENT_TREE URI must not be null");
-        check("content".equals(treeDocUri.getScheme()), "ACTION_OPEN_DOCUMENT_TREE must carry content:// URI");
-        check(treeDocUri.toString().startsWith("content://com.gesher.documents/tree/"), "Must be a tree URI: " + treeDocUri);
-        check((treeDocResult.getFlags() & Intent.FLAG_GRANT_PREFIX_URI_PERMISSION) != 0, "FLAG_GRANT_PREFIX_URI_PERMISSION must be on tree URI");
-        check((treeDocResult.getFlags() & Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) != 0, "FLAG_GRANT_PERSISTABLE_URI_PERMISSION on tree URI");
-
-        // Null / empty path returns null
-        check(buildResultMethod.invoke(null, Intent.ACTION_OPEN_DOCUMENT, null) == null, "Null path returns null");
-        check(buildResultMethod.invoke(null, Intent.ACTION_OPEN_DOCUMENT, "") == null, "Empty path returns null");
-
-        // -----------------------------------------------------------------------------------------
-        // 2. DocumentsContract: URI Builders & Parsers
-        // -----------------------------------------------------------------------------------------
-        PackageManagerService pm = new PackageManagerService(Collections.emptyList());
-        Map<String, ApkPackage> pkgMap = new LinkedHashMap<>();
-        set(pm, "mPackages", pkgMap);
-
-        PackageManager testPm = new ApplicationPackageManager(null, pm) {
-            @Override
-            public List<ResolveInfo> queryIntentContentProviders(Intent intent, int flags) {
-                ParceledListSlice<ResolveInfo> slice = pm.queryIntentContentProviders(intent, null, flags, 0);
-                return slice != null ? slice.getList() : Collections.emptyList();
-            }
-        };
-        Context testContext = new ContextWrapper(null) {
-            @Override
-            public PackageManager getPackageManager() {
-                return testPm;
-            }
-        };
-
-        String auth = DocumentsStorageProvider.AUTHORITY;
-        String docPath = "/mnt/c/data/sample.pdf";
-        Uri builtDoc = DocumentsContract.buildDocumentUri(auth, docPath);
-        check(DocumentsContract.isDocumentUri(testContext, builtDoc), "isDocumentUri must be true for built document URI");
-        check(!DocumentsContract.isTreeUri(builtDoc), "isTreeUri must be false for document URI");
-        check(docPath.equals(DocumentsContract.getDocumentId(builtDoc)), "getDocumentId must match input document ID");
-
-        String treePath = "/mnt/c/data/folder";
-        Uri builtTree = DocumentsContract.buildTreeDocumentUri(auth, treePath);
-        check(DocumentsContract.isTreeUri(builtTree), "isTreeUri must be true for built tree URI");
-        check(treePath.equals(DocumentsContract.getTreeDocumentId(builtTree)), "getTreeDocumentId must match input tree ID");
-
-        // Tree document traversal: DocumentsContract.buildDocumentUriUsingTree
-        String childDocPath = "/mnt/c/data/folder/nested.txt";
-        Uri docUnderTree = DocumentsContract.buildDocumentUriUsingTree(builtTree, childDocPath);
-        check(DocumentsContract.isDocumentUri(testContext, docUnderTree), "isDocumentUri must be true for document under tree");
-        check(childDocPath.equals(DocumentsContract.getDocumentId(docUnderTree)), "getDocumentId must return child doc ID");
-        check(treePath.equals(DocumentsContract.getTreeDocumentId(docUnderTree)), "getTreeDocumentId must return tree ID from docUnderTree");
-
-        // Child documents query URI under tree
-        Uri childrenUnderTree = DocumentsContract.buildChildDocumentsUriUsingTree(builtTree, treePath);
-        check(childrenUnderTree.toString().endsWith("/children"), "buildChildDocumentsUriUsingTree must append /children");
-        check(childrenUnderTree.toString().startsWith(builtTree.toString()), "Child documents URI must be prefixed by tree URI");
-
-        // Root URIs
-        Uri rootsUri = DocumentsContract.buildRootsUri(auth);
-        check("content://com.gesher.documents/root".equals(rootsUri.toString()), "buildRootsUri match: " + rootsUri);
-        Uri singleRootUri = DocumentsContract.buildRootUri(auth, "primary");
-        check(DocumentsContract.isRootUri(testContext, singleRootUri), "isRootUri must be true for root URI");
-        check("primary".equals(DocumentsContract.getRootId(singleRootUri)), "getRootId must return root ID");
-
-        // -----------------------------------------------------------------------------------------
-        // 3. Provider Query Contract: Cursor columns (COLUMN_DOCUMENT_ID, COLUMN_DISPLAY_NAME, etc.)
-        // -----------------------------------------------------------------------------------------
-        File tmpDir = new File(System.getProperty("java.io.tmpdir"), "saf_test_" + System.currentTimeMillis());
-        tmpDir.mkdirs();
-        File sampleFile = new File(tmpDir, "hello_saf.txt");
-        try (FileOutputStream fos = new FileOutputStream(sampleFile)) {
-            fos.write("Hello SAF DocumentsContract!".getBytes(StandardCharsets.UTF_8));
-        }
-
-        DocumentsStorageProvider provider = new DocumentsStorageProvider(null, null);
-
-        // Reading a deleted/missing document must fail without inventing file contents.
-        File missingFile = new File(tmpDir, "missing_read_only.txt");
-        Uri missingUri = DocumentsContract.buildDocumentUri(auth, missingFile.getAbsolutePath());
-        boolean missingReadFailed = false;
-        try (android.os.ParcelFileDescriptor unexpected = provider.openFile(missingUri, "r")) {
-            // A successful read would violate the missing-document contract.
-        } catch (java.io.FileNotFoundException expected) {
-            missingReadFailed = true;
-        }
-        check(missingReadFailed, "Read-only open of a missing document must fail");
-        check(!missingFile.exists(), "Read-only open must not create a missing document");
-
-        // Query Document URI
-        Uri sampleDocUri = DocumentsContract.buildDocumentUri(auth, sampleFile.getAbsolutePath());
-        Cursor docCursor = provider.query(sampleDocUri, null, null, null, null);
-        check(docCursor != null, "Document query cursor must not be null");
-        check(docCursor.moveToFirst(), "Document query cursor must have a row");
-        int colDocId = docCursor.getColumnIndex(Document.COLUMN_DOCUMENT_ID);
-        int colName = docCursor.getColumnIndex(Document.COLUMN_DISPLAY_NAME);
-        int colMime = docCursor.getColumnIndex(Document.COLUMN_MIME_TYPE);
-        int colSize = docCursor.getColumnIndex(Document.COLUMN_SIZE);
-        int colFlags = docCursor.getColumnIndex(Document.COLUMN_FLAGS);
-        int colMod = docCursor.getColumnIndex(Document.COLUMN_LAST_MODIFIED);
-        check(colDocId >= 0, "COLUMN_DOCUMENT_ID must be present in projection");
-        check(colName >= 0, "COLUMN_DISPLAY_NAME must be present in projection");
-        check(colMime >= 0, "COLUMN_MIME_TYPE must be present in projection");
-        check(colSize >= 0, "COLUMN_SIZE must be present in projection");
-        check(colFlags >= 0, "COLUMN_FLAGS must be present in projection");
-        check(colMod >= 0, "COLUMN_LAST_MODIFIED must be present in projection");
-
-        check(sampleFile.getAbsolutePath().equals(docCursor.getString(colDocId)), "Document ID must be file absolute path");
-        check("hello_saf.txt".equals(docCursor.getString(colName)), "Display name must match file name");
-        check("text/plain".equals(docCursor.getString(colMime)), "MIME type must be text/plain for .txt");
-        check(sampleFile.length() == docCursor.getLong(colSize), "Size must match file length");
-        check((docCursor.getInt(colFlags) & Document.FLAG_SUPPORTS_WRITE) != 0, "FLAG_SUPPORTS_WRITE must be set");
-        check((docCursor.getInt(colFlags) & Document.FLAG_SUPPORTS_DELETE) != 0, "FLAG_SUPPORTS_DELETE must be set");
-        check((docCursor.getInt(colFlags) & Document.FLAG_SUPPORTS_RENAME) != 0, "FLAG_SUPPORTS_RENAME must be set");
-        docCursor.close();
-
-        // Query Children URI
-        Uri dirChildrenUri = DocumentsContract.buildChildDocumentsUri(auth, tmpDir.getAbsolutePath());
-        Cursor childrenCursor = provider.query(dirChildrenUri, null, null, null, null);
-        check(childrenCursor != null, "Children query cursor must not be null");
-        check(childrenCursor.getCount() == 1, "Children count must be 1");
-        check(childrenCursor.moveToFirst(), "Children cursor must move to first");
-        check("hello_saf.txt".equals(childrenCursor.getString(childrenCursor.getColumnIndex(Document.COLUMN_DISPLAY_NAME))),
-                "Child item display name must match");
-        childrenCursor.close();
-
-        // Query Roots URI
-        Cursor rootsCursor = provider.query(rootsUri, null, null, null, null);
-        check(rootsCursor != null, "Roots cursor must not be null");
-        check(rootsCursor.moveToFirst(), "Roots cursor must have a row");
-        check(rootsCursor.getColumnIndex(Root.COLUMN_ROOT_ID) >= 0, "Root COLUMN_ROOT_ID must be present");
-        check(rootsCursor.getColumnIndex(Root.COLUMN_DOCUMENT_ID) >= 0, "Root COLUMN_DOCUMENT_ID must be present");
-        check(rootsCursor.getColumnIndex(Root.COLUMN_TITLE) >= 0, "Root COLUMN_TITLE must be present");
-        check(rootsCursor.getColumnIndex(Root.COLUMN_FLAGS) >= 0, "Root COLUMN_FLAGS must be present");
-        check("primary".equals(rootsCursor.getString(rootsCursor.getColumnIndex(Root.COLUMN_ROOT_ID))), "Root ID primary");
-        rootsCursor.close();
-
-        // Provider Call: createDocument, renameDocument, deleteDocument
-        Bundle createArgs = new Bundle();
-        createArgs.putParcelable(DocumentsContract.EXTRA_URI, DocumentsContract.buildDocumentUri(auth, tmpDir.getAbsolutePath()));
-        createArgs.putString(Document.COLUMN_MIME_TYPE, "text/plain");
-        createArgs.putString(Document.COLUMN_DISPLAY_NAME, "created_via_call.txt");
-        Bundle createOut = provider.call(DocumentsContract.METHOD_CREATE_DOCUMENT, null, createArgs);
-        check(createOut != null, "createDocument call must return result bundle");
-        Uri createdDocUri = createOut.getParcelable(DocumentsContract.EXTRA_URI, Uri.class);
-        check(createdDocUri != null, "Created document URI must not be null");
-        File createdFile = new File(tmpDir, "created_via_call.txt");
-        check(createdFile.exists(), "Created file must exist on disk");
-
-        // Rename
-        Bundle renameArgs = new Bundle();
-        renameArgs.putParcelable(DocumentsContract.EXTRA_URI, createdDocUri);
-        renameArgs.putString(Document.COLUMN_DISPLAY_NAME, "renamed_via_call.txt");
-        Bundle renameOut = provider.call(DocumentsContract.METHOD_RENAME_DOCUMENT, null, renameArgs);
-        check(renameOut != null, "renameDocument call must return result bundle");
-        Uri renamedDocUri = renameOut.getParcelable(DocumentsContract.EXTRA_URI, Uri.class);
-        check(renamedDocUri != null, "Renamed document URI must not be null");
-        File renamedFile = new File(tmpDir, "renamed_via_call.txt");
-        check(renamedFile.exists(), "Renamed file must exist on disk");
-        check(!createdFile.exists(), "Old file must not exist after rename");
-
-        // Delete
-        Bundle deleteArgs = new Bundle();
-        deleteArgs.putParcelable(DocumentsContract.EXTRA_URI, renamedDocUri);
-        provider.call(DocumentsContract.METHOD_DELETE_DOCUMENT, null, deleteArgs);
-        check(!renamedFile.exists(), "Deleted file must no longer exist");
-
-        // Provider Call using Tree URI as parentUri directly
-        Uri parentTreeUri = DocumentsContract.buildTreeDocumentUri(auth, tmpDir.getAbsolutePath());
-        Bundle createTreeArgs = new Bundle();
-        createTreeArgs.putParcelable(DocumentsContract.EXTRA_URI, parentTreeUri);
-        createTreeArgs.putString(Document.COLUMN_MIME_TYPE, "text/plain");
-        createTreeArgs.putString(Document.COLUMN_DISPLAY_NAME, "created_under_tree.txt");
-        Bundle createTreeOut = provider.call(DocumentsContract.METHOD_CREATE_DOCUMENT, null, createTreeArgs);
-        check(createTreeOut != null, "createDocument under tree must return result bundle");
-        Uri createdUnderTreeUri = createTreeOut.getParcelable(DocumentsContract.EXTRA_URI, Uri.class);
-        check(createdUnderTreeUri != null, "Created document URI under tree must not be null");
-        check(DocumentsContract.isDocumentUri(testContext, createdUnderTreeUri), "Must be document URI");
-        check(DocumentsContract.isTreeUri(createdUnderTreeUri), "Must be tree-backed document URI");
-        File createdUnderTreeFile = new File(tmpDir, "created_under_tree.txt");
-        check(createdUnderTreeFile.exists(), "File created under tree must exist");
-
-        // Verify openFile on tree-backed doc URI
-        android.os.ParcelFileDescriptor pfd = provider.openFile(createdUnderTreeUri, "rw");
-        check(pfd != null, "openFile on tree-backed doc URI must succeed");
-        pfd.close();
-
-        // Delete file created under tree
-        Bundle deleteTreeArgs = new Bundle();
-        deleteTreeArgs.putParcelable(DocumentsContract.EXTRA_URI, createdUnderTreeUri);
-        provider.call(DocumentsContract.METHOD_DELETE_DOCUMENT, null, deleteTreeArgs);
-        check(!createdUnderTreeFile.exists(), "Deleted tree-backed file must no longer exist");
-
-        // -----------------------------------------------------------------------------------------
-        // 4. URI Permissions & takePersistableUriPermission
-        // -----------------------------------------------------------------------------------------
-        String testAppPkg = "com.test.safapp";
-        int testAppUid = 10555;
-        ApkPackage appPkg = createPackage(testAppPkg, testAppUid);
-
-        pkgMap.put(testAppPkg, appPkg);
-
-        ActivityTaskManagerService atm = (ActivityTaskManagerService) unsafe.allocateInstance(ActivityTaskManagerService.class);
-        set(atm, "mPm", pm);
-
-        ActivityManagerService am = (ActivityManagerService) unsafe.allocateInstance(ActivityManagerService.class);
-        Constructor<?> cpCtor = Class.forName("com.gesher.server.ContentProviders")
-                .getDeclaredConstructor(PackageManagerService.class, ActivityTaskManagerService.class);
-        cpCtor.setAccessible(true);
-        Object contentProviders = cpCtor.newInstance(pm, atm);
-        set(am, "mProviders", contentProviders);
-
-        Method uriGrantsMethod = contentProviders.getClass().getDeclaredMethod("uriGrants");
-        uriGrantsMethod.setAccessible(true);
-        Object grants = uriGrantsMethod.invoke(contentProviders);
-        Class<?> grantsClass = grants.getClass();
-        Method grantMethod = grantsClass.getDeclaredMethod("grant", String.class, Uri.class, int.class, int.class);
-        grantMethod.setAccessible(true);
-        Method canAccessMethod = grantsClass.getDeclaredMethod("canAccess", ApkPackage.class, Uri.class, int.class, int.class);
-        canAccessMethod.setAccessible(true);
-        Method listMethod = grantsClass.getDeclaredMethod("list", String.class, boolean.class, boolean.class);
-        listMethod.setAccessible(true);
-
-        int read = Intent.FLAG_GRANT_READ_URI_PERMISSION;
-        int write = Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
-        int persistable = Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION;
-        int prefix = Intent.FLAG_GRANT_PREFIX_URI_PERMISSION;
-
-        // Grant Tree URI to test package
-        Uri grantTreeUri = DocumentsContract.buildTreeDocumentUri(auth, tmpDir.getAbsolutePath());
-        grantMethod.invoke(grants, testAppPkg, grantTreeUri, read | write | persistable | prefix, 0);
-
-        // Verify direct access to tree URI
-        check((Boolean) canAccessMethod.invoke(grants, appPkg, grantTreeUri, read, 0), "Package must have read access to granted tree URI");
-        check((Boolean) canAccessMethod.invoke(grants, appPkg, grantTreeUri, write, 0), "Package must have write access to granted tree URI");
-
-        // Verify document traversal under tree: child document URI is authorized via tree prefix grant
-        Uri childDocUri = DocumentsContract.buildDocumentUriUsingTree(grantTreeUri, sampleFile.getAbsolutePath());
-        check((Boolean) canAccessMethod.invoke(grants, appPkg, childDocUri, read, 0), "Child document URI under tree must be authorized via prefix grant");
-        check((Boolean) canAccessMethod.invoke(grants, appPkg, childDocUri, write, 0), "Child document URI under tree write access authorized");
-
-        // Test takePersistableUriPermission & getUriPermissions
-        Class<?> ugmClass = Class.forName("com.gesher.server.UriGrantsManagerService");
-        Constructor<?> ugmCtor = ugmClass.getDeclaredConstructor(PackageManagerService.class, ActivityTaskManagerService.class, ActivityManagerService.class);
-        ugmCtor.setAccessible(true);
-        Object ugm = ugmCtor.newInstance(pm, atm, am);
-        Method takeMethod = ugmClass.getDeclaredMethod("takePersistableUriPermission", Uri.class, int.class, String.class, int.class);
-        takeMethod.setAccessible(true);
-        Method releaseMethod = ugmClass.getDeclaredMethod("releasePersistableUriPermission", Uri.class, int.class, String.class, int.class);
-        releaseMethod.setAccessible(true);
-
-        // Before taking persistable permission: list(persistedOnly=true) is empty
-        @SuppressWarnings("unchecked")
-        List<UriPermission> preList = (List<UriPermission>) listMethod.invoke(grants, testAppPkg, true, true);
-        check(preList.isEmpty(), "Persisted permissions must be empty before taking");
-
-        // Call takePersistableUriPermission
-        takeMethod.invoke(ugm, grantTreeUri, read | write, testAppPkg, 0);
-
-        // After taking: list(persistedOnly=true) contains the granted tree URI
-        @SuppressWarnings("unchecked")
-        List<UriPermission> postList = (List<UriPermission>) listMethod.invoke(grants, testAppPkg, true, true);
-        check(postList.size() == 1, "Persisted permissions must contain 1 grant after take");
-        UriPermission perm = postList.get(0);
-        check(grantTreeUri.equals(perm.getUri()), "Persisted URI must match tree URI");
-        check(perm.isReadPermission(), "Persisted read flag must match");
-        check(perm.isWritePermission(), "Persisted write flag must match");
-        check(perm.getPersistedTime() > 0, "Persisted timestamp must be positive");
-
-        // Release persistable URI permission
-        releaseMethod.invoke(ugm, grantTreeUri, read | write, testAppPkg, 0);
-        @SuppressWarnings("unchecked")
-        List<UriPermission> releasedList = (List<UriPermission>) listMethod.invoke(grants, testAppPkg, true, true);
-        check(releasedList.isEmpty(), "Persisted permissions must be empty after release");
-
-        // Unrelated/ungranted URI takePersistableUriPermission must throw UnsupportedOperationException
-        Uri bogusUri = Uri.parse("content://fixture.unregistered/doc");
-        boolean threw = false;
-        try {
-            takeMethod.invoke(ugm, bogusUri, read, testAppPkg, 0);
-        } catch (InvocationTargetException ite) {
-            if (ite.getCause() instanceof UnsupportedOperationException) {
-                threw = true;
-            }
-        }
-        check(threw, "takePersistableUriPermission on ungranted URI must throw UnsupportedOperationException");
-
-        // Cleanup temporary files
-        sampleFile.delete();
-        tmpDir.delete();
-
-        System.out.println("SafDocumentsContractTest passed: " + checks + " checks");
+        nativeFiles=true;
+        if(args.length==2)restartPhase(args[0],new File(args[1]));else contracts(true);
     }
 }

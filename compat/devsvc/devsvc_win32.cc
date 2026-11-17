@@ -12,10 +12,12 @@
 #include <netlistmgr.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <shlobj.h>
 
 #include "devsvc_toast.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -254,6 +256,163 @@ bool PopActivation(std::u16string* app_id, std::u16string* tag, std::u16string* 
   }
   ReleaseSRWLockExclusive(&g_lock);
   return any;
+}
+
+namespace {
+
+struct DocumentLifetime {
+  IFileDialog* dialog;
+  bool (*active)(void*);
+  void* context;
+};
+
+LRESULT CALLBACK DocumentLifetimeProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+  if (message == WM_NCCREATE) {
+    SetWindowLongPtrW(window, GWLP_USERDATA,
+        reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
+  } else if (message == WM_TIMER) {
+    auto* state = reinterpret_cast<DocumentLifetime*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (state && !state->active(state->context)) {
+      state->dialog->Close(HRESULT_FROM_WIN32(ERROR_CANCELLED));
+    }
+  }
+  return DefWindowProcW(window, message, wp, lp);
+}
+
+BOOL CALLBACK RegisterDocumentLifetime(PINIT_ONCE, PVOID, PVOID*) {
+  WNDCLASSW cls{};
+  cls.lpfnWndProc = DocumentLifetimeProc;
+  cls.hInstance = GetModuleHandleW(nullptr);
+  cls.lpszClassName = L"GesherDocumentPickerLifetime";
+  return RegisterClassW(&cls) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+struct DocumentOwner { DWORD pid; HWND window; };
+BOOL CALLBACK FindDocumentOwner(HWND window, LPARAM parameter) {
+  auto* owner = reinterpret_cast<DocumentOwner*>(parameter);
+  DWORD pid = 0;
+  GetWindowThreadProcessId(window, &pid);
+  if (pid == owner->pid && IsWindowVisible(window) && GetWindow(window, GW_OWNER) == nullptr) {
+    owner->window = window;
+    return FALSE;
+  }
+  return TRUE;
+}
+
+HRESULT DocumentPath(IShellItem* item, std::vector<std::u16string>* paths) {
+  PWSTR value = nullptr;
+  HRESULT status = item->GetDisplayName(SIGDN_FILESYSPATH, &value);
+  if (SUCCEEDED(status)) {
+    if (!value || !*value || wcslen(value) > 32768) status = E_INVALIDARG;
+    else paths->push_back(U16(value));
+  }
+  CoTaskMemFree(value);
+  return status;
+}
+
+}  // namespace
+
+DocumentSelection PickDocuments(int mode, const std::u16string& title,
+    const std::u16string& suggested_name, const std::u16string& initial_directory,
+    const std::u16string& filter, const std::u16string& extension, bool multiple,
+    uint32_t owner_pid, bool (*active)(void*), void* context) {
+  DocumentSelection selection;
+  if (mode < 0 || mode > 2 || !active || (mode != 0 && multiple)) {
+    selection.error = E_INVALIDARG; return selection;
+  }
+  if (!active(context)) return selection;
+  HRESULT status = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+  if (FAILED(status)) { selection.error = status; return selection; }
+  IFileDialog* dialog = nullptr;
+  status = CoCreateInstance(mode == 1 ? CLSID_FileSaveDialog : CLSID_FileOpenDialog,
+      nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+  HWND lifetime_window = nullptr;
+  DocumentLifetime lifetime{dialog, active, context};
+  if (SUCCEEDED(status)) {
+    FILEOPENDIALOGOPTIONS options = 0;
+    status = dialog->GetOptions(&options);
+    if (SUCCEEDED(status)) {
+      options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+      // ACTION_CREATE_DOCUMENT creates a new document, including when a chosen
+      // display name already exists. Uniqueness and atomic creation are in Java.
+      options &= ~(FOS_FILEMUSTEXIST | FOS_OVERWRITEPROMPT | FOS_ALLOWMULTISELECT | FOS_PICKFOLDERS);
+      if (mode != 1) options |= FOS_FILEMUSTEXIST;
+      if (mode == 2) options |= FOS_PICKFOLDERS;
+      if (multiple) options |= FOS_ALLOWMULTISELECT;
+      status = dialog->SetOptions(options);
+    }
+    if (SUCCEEDED(status) && !title.empty()) status = dialog->SetTitle(W(title));
+    if (SUCCEEDED(status) && mode == 1 && !suggested_name.empty()) {
+      status = dialog->SetFileName(W(suggested_name));
+    }
+    if (SUCCEEDED(status) && mode != 2 && !filter.empty()) {
+      COMDLG_FILTERSPEC spec{L"Requested document types", W(filter)};
+      status = dialog->SetFileTypes(1, &spec);
+    }
+    if (SUCCEEDED(status) && mode == 1 && !extension.empty()) {
+      status = dialog->SetDefaultExtension(W(extension));
+    }
+    if (SUCCEEDED(status) && !initial_directory.empty()) {
+      IShellItem* initial = nullptr;
+      if (SUCCEEDED(SHCreateItemFromParsingName(W(initial_directory), nullptr, IID_PPV_ARGS(&initial)))) {
+        dialog->SetFolder(initial); // EXTRA_INITIAL_URI is an advisory hint.
+        initial->Release();
+      }
+    }
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    if (SUCCEEDED(status) && !InitOnceExecuteOnce(&once, RegisterDocumentLifetime, nullptr, nullptr)) {
+      status = HRESULT_FROM_WIN32(GetLastError());
+      if (SUCCEEDED(status)) status = E_FAIL;
+    }
+    if (SUCCEEDED(status)) {
+      lifetime_window = CreateWindowExW(0, L"GesherDocumentPickerLifetime", L"", 0,
+          0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), &lifetime);
+      if (!lifetime_window || !SetTimer(lifetime_window, 1, 100, nullptr)) {
+        status = HRESULT_FROM_WIN32(GetLastError());
+        if (SUCCEEDED(status)) status = E_FAIL;
+      }
+    }
+    if (SUCCEEDED(status) && active(context)) {
+      DocumentOwner owner{owner_pid, nullptr};
+      if (owner_pid) EnumWindows(FindDocumentOwner, reinterpret_cast<LPARAM>(&owner));
+      status = dialog->Show(owner.window);
+      if (SUCCEEDED(status) && active(context)) {
+        if (mode == 1) {
+          IShellItem* item = nullptr;
+          status = dialog->GetResult(&item);
+          if (SUCCEEDED(status)) { status = DocumentPath(item, &selection.paths); item->Release(); }
+        } else {
+          IFileOpenDialog* open = nullptr;
+          status = dialog->QueryInterface(IID_PPV_ARGS(&open));
+          if (SUCCEEDED(status)) {
+            IShellItemArray* items = nullptr;
+            status = open->GetResults(&items);
+            if (SUCCEEDED(status)) {
+              DWORD count = 0;
+              status = items->GetCount(&count);
+              if (SUCCEEDED(status) && (count == 0 || count > 256 || (!multiple && count != 1))) status = E_INVALIDARG;
+              for (DWORD i = 0; SUCCEEDED(status) && i < count; ++i) {
+                IShellItem* item = nullptr;
+                status = items->GetItemAt(i, &item);
+                if (SUCCEEDED(status)) { status = DocumentPath(item, &selection.paths); item->Release(); }
+              }
+              items->Release();
+            }
+            open->Release();
+          }
+        }
+      }
+    }
+  }
+  if (lifetime_window) { KillTimer(lifetime_window, 1); DestroyWindow(lifetime_window); }
+  if (dialog) dialog->Release();
+  CoUninitialize();
+  if (!active(context)) selection.paths.clear();
+  if (FAILED(status)) {
+    selection.paths.clear();
+    if (status != HRESULT_FROM_WIN32(ERROR_CANCELLED)) selection.error = status;
+  }
+  return selection;
 }
 
 }  // namespace devsvc

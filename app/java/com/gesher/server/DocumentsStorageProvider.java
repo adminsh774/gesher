@@ -1,443 +1,338 @@
-/*
- * Copyright (C) 2026 The Gesher Authors
- * SPDX-License-Identifier: Apache-2.0
- */
+/* Copyright (C) 2026 The Gesher Authors; SPDX-License-Identifier: Apache-2.0 */
 package com.gesher.server;
 
+import android.Manifest;
 import android.app.ContentProviderHolder;
-import android.content.ContentProvider;
-import android.content.ContentValues;
+import android.content.Context;
+import android.content.ContextWrapper;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.ProviderInfo;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
-import android.os.Bundle;
+import android.os.CancellationSignal;
+import android.os.FileUtils;
 import android.os.ParcelFileDescriptor;
+import android.os.Process;
 import android.provider.DocumentsContract;
 import android.provider.DocumentsContract.Document;
 import android.provider.DocumentsContract.Root;
+import android.provider.DocumentsProvider;
 
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
- * Storage Access Framework DocumentsProvider implementation for Gesher.
- * Backs {@code content://com.gesher.documents/} URIs for SAF document and tree selections.
+ * The local filesystem behind the Windows document picker. The framework's
+ * DocumentsProvider owns URI dispatch, tree enforcement and operation permissions;
+ * ContentProvider.Transport owns Binder access. IDs are canonical guest paths.
  */
-public final class DocumentsStorageProvider extends ContentProvider {
+public final class DocumentsStorageProvider extends DocumentsProvider {
     public static final String AUTHORITY = "com.gesher.documents";
-    public static final String ROOT_ID_PRIMARY = "primary";
+    private static final String ROOT_ID = "local";
+    private static final String[] ROOT_COLUMNS = {Root.COLUMN_ROOT_ID, Root.COLUMN_FLAGS,
+            Root.COLUMN_TITLE, Root.COLUMN_DOCUMENT_ID, Root.COLUMN_AVAILABLE_BYTES,
+            Root.COLUMN_CAPACITY_BYTES, Root.COLUMN_MIME_TYPES};
+    private static final String[] DOCUMENT_COLUMNS = {Document.COLUMN_DOCUMENT_ID,
+            Document.COLUMN_DISPLAY_NAME, Document.COLUMN_MIME_TYPE, Document.COLUMN_FLAGS,
+            Document.COLUMN_SIZE, Document.COLUMN_LAST_MODIFIED};
 
-    private static final String[] DEFAULT_ROOT_PROJECTION = new String[] {
-            Root.COLUMN_ROOT_ID,
-            Root.COLUMN_FLAGS,
-            Root.COLUMN_ICON,
-            Root.COLUMN_TITLE,
-            Root.COLUMN_DOCUMENT_ID,
-            Root.COLUMN_AVAILABLE_BYTES,
-            Root.COLUMN_CAPACITY_BYTES,
-            Root.COLUMN_MIME_TYPES
-    };
+    private final ProviderInfo mInfo;
+    private final UriGrants mGrants;
+    private final CallerIdentity mCallers;
+    final ContentProviders.RegisteredProvider registration;
 
-    private static final String[] DEFAULT_DOCUMENT_PROJECTION = new String[] {
-            Document.COLUMN_DOCUMENT_ID,
-            Document.COLUMN_MIME_TYPE,
-            Document.COLUMN_DISPLAY_NAME,
-            Document.COLUMN_LAST_MODIFIED,
-            Document.COLUMN_FLAGS,
-            Document.COLUMN_SIZE
-    };
-
-    private final ProviderInfo mInfo = new ProviderInfo();
-    private final PackageManagerService mPm;
-    private final ActivityTaskManagerService mAtm;
-
-    public DocumentsStorageProvider() {
-        this(null, null);
-    }
-
-    public DocumentsStorageProvider(PackageManagerService pm, ActivityTaskManagerService atm) {
-        mPm = pm;
-        mAtm = atm;
-        mInfo.packageName = "android";
+    DocumentsStorageProvider(ContentProviders providers, UriGrants grants) {
+        mGrants = java.util.Objects.requireNonNull(grants);
+        mCallers = providers.callers();
+        mInfo = new ProviderInfo();
+        ApplicationInfo app = new ApplicationInfo();
+        app.packageName = "android";
+        app.processName = "system";
+        app.uid = Process.SYSTEM_UID;
+        app.flags = ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_PERSISTENT;
+        app.enabled = true;
+        mInfo.applicationInfo = app;
+        mInfo.packageName = app.packageName;
+        mInfo.processName = app.processName;
         mInfo.name = getClass().getName();
         mInfo.authority = AUTHORITY;
+        mInfo.enabled = true;
         mInfo.exported = true;
         mInfo.grantUriPermissions = true;
+        mInfo.readPermission = Manifest.permission.MANAGE_DOCUMENTS;
+        mInfo.writePermission = Manifest.permission.MANAGE_DOCUMENTS;
+        mInfo.flags = ProviderInfo.FLAG_SINGLE_USER;
+        // Register the actual instance before durable grants load at boot. Clients
+        // only receive the transport through holder(), after real attachInfo.
+        registration = new ContentProviders.RegisteredProvider(mInfo, getIContentProvider());
+        providers.registerProvider(registration);
     }
 
-    public ProviderInfo providerInfo() {
-        return mInfo;
+    public ProviderInfo providerInfo() { return new ProviderInfo(mInfo); }
+
+    synchronized ContentProviderHolder holder() {
+        if (getContext() == null) attachTo(android.app.GesherSettingsContext.get());
+        ContentProviderHolder result = new ContentProviderHolder(providerInfo());
+        result.provider = getIContentProvider();
+        result.noReleaseNeeded = true;
+        return result;
     }
 
-    public synchronized ContentProviderHolder holder() {
-        ContentProviderHolder h = new ContentProviderHolder(mInfo);
-        h.provider = getIContentProvider();
-        h.noReleaseNeeded = true;
-        return h;
+    /** Tests use this same attachInfo path with an explicit fixture context. */
+    synchronized void attachTo(Context base) {
+        if (getContext() != null) return;
+        attachInfo(new ContextWrapper(java.util.Objects.requireNonNull(base)) {
+            @Override public int checkUriPermission(Uri uri, int pid, int uid, int modes) {
+                return mGrants.check(uri, pid, uid, modes, 0);
+            }
+            @Override public void grantUriPermission(String target, Uri uri, int modes) {
+                mGrants.grantFromProvider(registration, target, uri, modes);
+            }
+            @Override public void revokeUriPermission(Uri uri, int modes) {
+                mGrants.revokeFromProvider(registration, uri, modes);
+            }
+            @Override public void revokeUriPermission(String target, Uri uri, int modes) {
+                mGrants.revokeFromProvider(registration, target, uri, modes);
+            }
+        }, mInfo);
     }
 
-    @Override
-    public boolean onCreate() {
-        return true;
-    }
+    @Override public boolean onCreate() { return true; }
 
-    private static File getFileForDocId(String docId) {
-        if (docId == null || docId.isEmpty() || "/".equals(docId) || "root".equals(docId)) {
-            return new File("/");
+    private void authenticate(android.content.AttributionSource source) {
+        if (mCallers.isSystem()) return;
+        if (source == null || source.getUid() != mCallers.callerUid()) {
+            throw new SecurityException("Document attribution must identify its Binder caller");
         }
-        String p = docId;
-        if (p.startsWith("/") || p.startsWith("\\\\") || (p.length() >= 2 && p.charAt(1) == ':')) {
-            p = Zygote.fromWindowsPath(p);
-        }
-        return new File(p);
+        mCallers.requirePackage(source.getPackageName());
     }
 
-    private static String getMimeType(File file) {
-        if (file.isDirectory()) {
-            return Document.MIME_TYPE_DIR;
+    @Override protected int enforceReadPermissionInner(Uri uri, android.content.AttributionSource source) {
+        authenticate(source);
+        return super.enforceReadPermissionInner(uri, source);
+    }
+
+    @Override protected int enforceWritePermissionInner(Uri uri, android.content.AttributionSource source) {
+        authenticate(source);
+        return super.enforceWritePermissionInner(uri, source);
+    }
+
+    static File file(String documentId) throws FileNotFoundException {
+        if (documentId == null || !documentId.startsWith("/")) {
+            throw new FileNotFoundException("Document ID is not an absolute guest path");
         }
+        File file = new File(documentId);
+        try {
+            // A grant must not start naming another object after a symlink or
+            // reparse-point substitution. Canonicalize before issuing a grant.
+            if (!documentId.equals(file.getCanonicalPath())
+                    || !(file.isFile() || file.isDirectory())) {
+                throw new FileNotFoundException("Document is absent or is not a canonical file");
+            }
+            return file;
+        } catch (IOException error) { throw missing("Cannot resolve document", error); }
+    }
+
+    static File selectedFile(String nativePath) throws FileNotFoundException {
+        if (nativePath == null || nativePath.isEmpty()) throw new FileNotFoundException("No selection");
+        try {
+            String path = Zygote.fromWindowsPath(nativePath);
+            if (!new File(path).isAbsolute()) throw new FileNotFoundException("Relative selection");
+            return file(new File(path).getCanonicalPath());
+        } catch (IOException | IllegalArgumentException error) { throw missing("Invalid selection", error); }
+    }
+
+    static String mimeType(File file) {
+        if (file.isDirectory()) return Document.MIME_TYPE_DIR;
         String name = file.getName();
         int dot = name.lastIndexOf('.');
-        if (dot >= 0) {
-            String ext = name.substring(dot + 1).toLowerCase();
-            switch (ext) {
-                case "txt": return "text/plain";
-                case "html": case "htm": return "text/html";
-                case "xml": return "text/xml";
-                case "json": return "application/json";
-                case "pdf": return "application/pdf";
-                case "zip": return "application/zip";
-                case "apk": return "application/vnd.android.package-archive";
-                case "jpg": case "jpeg": return "image/jpeg";
-                case "png": return "image/png";
-                case "gif": return "image/gif";
-                case "webp": return "image/webp";
-                case "mp3": return "audio/mpeg";
-                case "mp4": return "video/mp4";
-                case "wav": return "audio/wav";
-            }
-        }
-        return "application/octet-stream";
+        String type = dot < 0 ? null : libcore.content.type.MimeMap.getDefault()
+                .guessMimeTypeFromExtension(name.substring(dot + 1).toLowerCase(Locale.ROOT));
+        return type != null ? type : "application/octet-stream";
     }
 
-    private static void includeFile(MatrixCursor cursor, File file, String[] projection) {
-        String docId = file.getAbsolutePath();
+    static int documentFlags(File file) {
+        if (!(file.isFile() || file.isDirectory())) return 0;
         int flags = 0;
         if (file.isDirectory()) {
-            flags |= Document.FLAG_DIR_SUPPORTS_CREATE | Document.FLAG_SUPPORTS_WRITE
-                    | Document.FLAG_SUPPORTS_DELETE | Document.FLAG_SUPPORTS_RENAME;
-        } else {
-            flags |= Document.FLAG_SUPPORTS_WRITE | Document.FLAG_SUPPORTS_DELETE
-                    | Document.FLAG_SUPPORTS_RENAME;
+            if (file.canWrite()) flags |= Document.FLAG_DIR_SUPPORTS_CREATE;
+            if (DocumentPicker.isBlockedTreeRoot(file)) flags |= Document.FLAG_DIR_BLOCKS_OPEN_DOCUMENT_TREE;
+        } else if (file.canWrite()) flags |= Document.FLAG_SUPPORTS_WRITE;
+        File parent = file.getParentFile();
+        if (!isFilesystemRoot(file) && file.canWrite()
+                && parent != null && parent.isDirectory() && parent.canWrite()) {
+            flags |= Document.FLAG_SUPPORTS_DELETE | Document.FLAG_SUPPORTS_RENAME;
         }
-        String displayName = file.getName();
-        if (displayName == null || displayName.isEmpty()) {
-            displayName = "/";
-        }
-        String mimeType = getMimeType(file);
-        long size = file.isDirectory() ? 0L : file.length();
-        long lastModified = file.lastModified();
+        return flags;
+    }
 
-        MatrixCursor.RowBuilder row = cursor.newRow();
-        for (String col : projection) {
-            switch (col) {
-                case Document.COLUMN_DOCUMENT_ID:
-                    row.add(docId);
-                    break;
-                case Document.COLUMN_MIME_TYPE:
-                    row.add(mimeType);
-                    break;
+    private static boolean isFilesystemRoot(File file) {
+        return file.getParentFile() == null || file.getPath().matches("/mnt/[A-Za-z]")
+                || file.getPath().matches("/mnt/unc/[^/]+/[^/]+");
+    }
+
+    private static void row(MatrixCursor result, File file) {
+        MatrixCursor.RowBuilder row = result.newRow();
+        for (String column : result.getColumnNames()) {
+            switch (column) {
+                case Document.COLUMN_DOCUMENT_ID: row.add(file.getPath()); break;
                 case Document.COLUMN_DISPLAY_NAME:
-                    row.add(displayName);
-                    break;
-                case Document.COLUMN_LAST_MODIFIED:
-                    row.add(lastModified);
-                    break;
-                case Document.COLUMN_FLAGS:
-                    row.add(flags);
-                    break;
-                case Document.COLUMN_SIZE:
-                    row.add(size);
-                    break;
-                default:
-                    row.add(null);
-                    break;
+                    row.add(file.getName().isEmpty() ? file.getPath() : file.getName()); break;
+                case Document.COLUMN_MIME_TYPE: row.add(mimeType(file)); break;
+                case Document.COLUMN_FLAGS: row.add(documentFlags(file)); break;
+                case Document.COLUMN_SIZE: row.add(file.isFile() ? file.length() : null); break;
+                case Document.COLUMN_LAST_MODIFIED: row.add(file.lastModified()); break;
+                default: row.add(null);
             }
         }
     }
 
-    @Override
-    public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
-        if (projection == null) {
-            List<String> paths = uri.getPathSegments();
-            if (!paths.isEmpty() && DocumentsContract.PATH_ROOT.equals(paths.get(0))) {
-                projection = DEFAULT_ROOT_PROJECTION;
-            } else {
-                projection = DEFAULT_DOCUMENT_PROJECTION;
+    @Override public Cursor queryRoots(String[] projection) throws FileNotFoundException {
+        MatrixCursor result = new MatrixCursor(projection == null ? ROOT_COLUMNS : projection);
+        File root = file("/");
+        if (!root.isDirectory() || !root.canRead()) return result;
+        MatrixCursor.RowBuilder row = result.newRow();
+        for (String column : result.getColumnNames()) {
+            switch (column) {
+                case Root.COLUMN_ROOT_ID: row.add(ROOT_ID); break;
+                case Root.COLUMN_FLAGS: row.add(Root.FLAG_LOCAL_ONLY | Root.FLAG_SUPPORTS_IS_CHILD
+                        | (root.canWrite() ? Root.FLAG_SUPPORTS_CREATE : 0)); break;
+                case Root.COLUMN_TITLE: row.add("Windows files"); break;
+                case Root.COLUMN_DOCUMENT_ID: row.add(root.getPath()); break;
+                // The guest root also contains mounts; it is not a single volume.
+                case Root.COLUMN_AVAILABLE_BYTES: case Root.COLUMN_CAPACITY_BYTES: row.add(null); break;
+                case Root.COLUMN_MIME_TYPES: row.add("*/*"); break;
+                default: row.add(null);
             }
         }
-        List<String> paths = uri.getPathSegments();
-        if (paths.isEmpty()) {
-            return new MatrixCursor(projection);
-        }
-        String first = paths.get(0);
-        if (DocumentsContract.PATH_ROOT.equals(first)) {
-            MatrixCursor cursor = new MatrixCursor(projection);
-            MatrixCursor.RowBuilder row = cursor.newRow();
-            for (String col : projection) {
-                switch (col) {
-                    case Root.COLUMN_ROOT_ID:
-                        row.add(ROOT_ID_PRIMARY);
-                        break;
-                    case Root.COLUMN_FLAGS:
-                        row.add(Root.FLAG_SUPPORTS_CREATE | Root.FLAG_LOCAL_ONLY);
-                        break;
-                    case Root.COLUMN_ICON:
-                        row.add(0);
-                        break;
-                    case Root.COLUMN_TITLE:
-                        row.add("Gesher Storage");
-                        break;
-                    case Root.COLUMN_DOCUMENT_ID:
-                        row.add("/");
-                        break;
-                    case Root.COLUMN_AVAILABLE_BYTES:
-                        row.add(null); // The virtual root has no single backing-volume capacity.
-                        break;
-                    case Root.COLUMN_CAPACITY_BYTES:
-                        row.add(null);
-                        break;
-                    case Root.COLUMN_MIME_TYPES:
-                        row.add("*/*");
-                        break;
-                    default:
-                        row.add(null);
-                        break;
-                }
-            }
-            return cursor;
-        }
-
-        boolean isChildren = paths.size() >= 3 && DocumentsContract.PATH_CHILDREN.equals(paths.get(paths.size() - 1));
-        if (isChildren) {
-            String parentDocId;
-            if (paths.size() >= 5 && DocumentsContract.PATH_TREE.equals(paths.get(0))) {
-                parentDocId = paths.get(3);
-            } else {
-                parentDocId = paths.get(1);
-            }
-            File parent = getFileForDocId(parentDocId);
-            MatrixCursor cursor = new MatrixCursor(projection);
-            File[] files = parent.listFiles();
-            if (files != null) {
-                for (File f : files) {
-                    includeFile(cursor, f, projection);
-                }
-            }
-            return cursor;
-        }
-
-        if (isDocumentUri(uri)) {
-            String docId = DocumentsContract.getDocumentId(uri);
-            File file = getFileForDocId(docId);
-            MatrixCursor cursor = new MatrixCursor(projection);
-            includeFile(cursor, file, projection);
-            return cursor;
-        }
-
-        if (DocumentsContract.isTreeUri(uri)) {
-            String treeId = DocumentsContract.getTreeDocumentId(uri);
-            File file = getFileForDocId(treeId);
-            MatrixCursor cursor = new MatrixCursor(projection);
-            includeFile(cursor, file, projection);
-            return cursor;
-        }
-
-        MatrixCursor cursor = new MatrixCursor(projection);
-        return cursor;
+        return result;
     }
 
-    private static boolean isDocumentUri(Uri uri) {
-        if (uri == null) return false;
-        List<String> paths = uri.getPathSegments();
-        if (paths.size() == 2) {
-            return DocumentsContract.PATH_DOCUMENT.equals(paths.get(0));
-        }
-        if (paths.size() == 4) {
-            return DocumentsContract.PATH_TREE.equals(paths.get(0))
-                    && DocumentsContract.PATH_DOCUMENT.equals(paths.get(2));
-        }
-        return false;
+    @Override public Cursor queryDocument(String documentId, String[] projection)
+            throws FileNotFoundException {
+        MatrixCursor result = new MatrixCursor(projection == null ? DOCUMENT_COLUMNS : projection);
+        row(result, file(documentId));
+        return result;
     }
 
-    @Override
-    public String getType(Uri uri) {
+    @Override public Cursor queryChildDocuments(String parentId, String[] projection, String sortOrder)
+            throws FileNotFoundException {
+        File parent = file(parentId);
+        if (!parent.isDirectory()) throw new FileNotFoundException("Document is not a directory");
+        File[] children = parent.listFiles();
+        if (children == null) throw new FileNotFoundException("Cannot list document children");
+        MatrixCursor result = new MatrixCursor(projection == null ? DOCUMENT_COLUMNS : projection);
+        if (DocumentPicker.blockedAndroidDirectory(parent)) return result;
+        for (File child : children) {
+            if (DocumentPicker.blockedAndroidDirectory(child)) continue;
+            try { row(result, file(child.getAbsolutePath())); }
+            catch (FileNotFoundException absentOrLink) { /* Never fabricate a disappearing child. */ }
+        }
+        return result;
+    }
+
+    @Override public boolean isChildDocument(String parentId, String childId) {
         try {
-            if (isDocumentUri(uri)) {
-                String docId = DocumentsContract.getDocumentId(uri);
-                return getMimeType(getFileForDocId(docId));
-            } else if (DocumentsContract.isTreeUri(uri)) {
-                return Document.MIME_TYPE_DIR;
-            }
-        } catch (Exception ignored) {}
-        return null;
+            Path parent = file(parentId).toPath(), child = file(childId).toPath();
+            return !parent.equals(child) && child.startsWith(parent);
+        } catch (FileNotFoundException absent) { return false; }
     }
 
-    @Override
-    public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
-        String docId;
-        if (isDocumentUri(uri)) {
-            docId = DocumentsContract.getDocumentId(uri);
-        } else if (DocumentsContract.isTreeUri(uri)) {
-            docId = DocumentsContract.getTreeDocumentId(uri);
-        } else {
-            docId = DocumentsContract.getDocumentId(uri);
+    @Override public DocumentsContract.Path findDocumentPath(String parentId, String childId)
+            throws FileNotFoundException {
+        File child = file(childId), parent = file(parentId == null ? "/" : parentId);
+        if (!child.equals(parent) && !isChildDocument(parent.getPath(), child.getPath())) {
+            throw new FileNotFoundException("Document is outside the requested root");
         }
-        File file = getFileForDocId(docId);
-        int modeBits = ParcelFileDescriptor.parseMode(mode);
-        if (!file.exists()) {
-            if ((modeBits & ParcelFileDescriptor.MODE_CREATE) != 0) {
-                File parent = file.getParentFile();
-                if (parent != null) parent.mkdirs();
-                try {
-                    file.createNewFile();
-                } catch (IOException e) {
-                    throw new FileNotFoundException("Cannot create file: " + file);
-                }
-            } else {
-                throw new FileNotFoundException("File not found: " + file);
-            }
+        List<String> path = new ArrayList<>();
+        for (File current = child; current != null; current = current.getParentFile()) {
+            path.add(0, current.getPath());
+            if (current.equals(parent)) break;
         }
-        return ParcelFileDescriptor.open(file, modeBits);
+        return new DocumentsContract.Path(parentId == null ? ROOT_ID : null, path);
     }
 
-    @Override
-    public Bundle call(String method, String arg, Bundle extras) {
-        if (DocumentsContract.METHOD_CREATE_DOCUMENT.equals(method)) {
-            Uri parentUri = extras != null ? extras.getParcelable(DocumentsContract.EXTRA_URI, Uri.class) : null;
-            if (parentUri == null && extras != null) {
-                parentUri = extras.getParcelable(DocumentsContract.EXTRA_PARENT_URI, Uri.class);
-            }
-            if (parentUri == null) {
-                throw new IllegalArgumentException("Missing parent URI");
-            }
-            String mimeType = extras.getString(Document.COLUMN_MIME_TYPE);
-            String displayName = extras.getString(Document.COLUMN_DISPLAY_NAME);
-            String parentDocId;
-            if (isDocumentUri(parentUri)) {
-                parentDocId = DocumentsContract.getDocumentId(parentUri);
-            } else if (DocumentsContract.isTreeUri(parentUri)) {
-                parentDocId = DocumentsContract.getTreeDocumentId(parentUri);
-            } else {
-                parentDocId = DocumentsContract.getDocumentId(parentUri);
-            }
-            File parent = getFileForDocId(parentDocId);
-            File newFile = new File(parent, displayName != null ? displayName : "new_document");
+    @Override public ParcelFileDescriptor openDocument(String documentId, String mode,
+            CancellationSignal signal) throws FileNotFoundException {
+        if (signal != null) signal.throwIfCanceled();
+        File file = file(documentId);
+        if (!file.isFile()) throw new FileNotFoundException("Only regular documents can be opened");
+        int parsed = ParcelFileDescriptor.parseMode(mode);
+        // A document disappearing after lookup must not be silently recreated.
+        return ParcelFileDescriptor.open(file, parsed & ~ParcelFileDescriptor.MODE_CREATE);
+    }
+
+    private static void displayName(String name) {
+        if (name == null || name.isEmpty() || name.equals(".") || name.equals("..")
+                || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("Invalid document display name");
+        }
+    }
+
+    @Override public String createDocument(String parentId, String mimeType, String name)
+            throws FileNotFoundException {
+        displayName(name);
+        if (mimeType == null || mimeType.isEmpty()) throw new IllegalArgumentException("Missing MIME type");
+        File parent = file(parentId);
+        if (!parent.isDirectory() || !parent.canWrite()) throw new FileNotFoundException("Parent is not writable");
+        // Android chooses MIME extensions and collision names. Atomic creation
+        // closes the final name-allocation race and never truncates an existing file.
+        for (int attempt = 0; attempt < 32; attempt++) {
+            File target = FileUtils.buildUniqueFile(parent, mimeType, FileUtils.buildValidFatFilename(name));
             try {
-                if (Document.MIME_TYPE_DIR.equals(mimeType)) {
-                    newFile.mkdirs();
-                } else {
-                    File p = newFile.getParentFile();
-                    if (p != null) p.mkdirs();
-                    newFile.createNewFile();
-                }
-            } catch (IOException e) {
-                throw new IllegalStateException("Failed to create document: " + e.getMessage(), e);
-            }
-            Uri newDocUri;
-            if (DocumentsContract.isTreeUri(parentUri)) {
-                newDocUri = DocumentsContract.buildDocumentUriUsingTree(parentUri, newFile.getAbsolutePath());
-            } else {
-                newDocUri = DocumentsContract.buildDocumentUri(AUTHORITY, newFile.getAbsolutePath());
-            }
-            Bundle result = new Bundle();
-            result.putParcelable(DocumentsContract.EXTRA_URI, newDocUri);
-            return result;
+                if (Document.MIME_TYPE_DIR.equals(mimeType)) Files.createDirectory(target.toPath());
+                else Files.createFile(target.toPath());
+                return file(target.getCanonicalPath()).getPath();
+            } catch (java.nio.file.FileAlreadyExistsException collision) {
+                // Another creator won; choose another Android unique name.
+            } catch (IOException error) { throw missing("Cannot create document", error); }
         }
-
-        if (DocumentsContract.METHOD_DELETE_DOCUMENT.equals(method)) {
-            Uri docUri = extras != null ? extras.getParcelable(DocumentsContract.EXTRA_URI, Uri.class) : null;
-            if (docUri == null) {
-                throw new IllegalArgumentException("Missing document URI");
-            }
-            String docId;
-            if (isDocumentUri(docUri)) {
-                docId = DocumentsContract.getDocumentId(docUri);
-            } else if (DocumentsContract.isTreeUri(docUri)) {
-                docId = DocumentsContract.getTreeDocumentId(docUri);
-            } else {
-                docId = DocumentsContract.getDocumentId(docUri);
-            }
-            File file = getFileForDocId(docId);
-            if (file.exists() && !file.delete()) {
-                throw new IllegalStateException("Failed to delete document: " + file);
-            }
-            return new Bundle();
-        }
-
-        if (DocumentsContract.METHOD_RENAME_DOCUMENT.equals(method)) {
-            Uri docUri = extras != null ? extras.getParcelable(DocumentsContract.EXTRA_URI, Uri.class) : null;
-            String displayName = extras != null ? extras.getString(Document.COLUMN_DISPLAY_NAME) : null;
-            if (docUri == null || displayName == null) {
-                throw new IllegalArgumentException("Missing URI or display name");
-            }
-            String docId;
-            if (isDocumentUri(docUri)) {
-                docId = DocumentsContract.getDocumentId(docUri);
-            } else if (DocumentsContract.isTreeUri(docUri)) {
-                docId = DocumentsContract.getTreeDocumentId(docUri);
-            } else {
-                docId = DocumentsContract.getDocumentId(docUri);
-            }
-            File file = getFileForDocId(docId);
-            File target = new File(file.getParentFile(), displayName);
-            if (!file.renameTo(target)) {
-                throw new IllegalStateException("Failed to rename document to " + displayName);
-            }
-            Uri newUri;
-            if (isDocumentUri(docUri) && DocumentsContract.isTreeUri(docUri)) {
-                newUri = DocumentsContract.buildDocumentUriUsingTree(docUri, target.getAbsolutePath());
-            } else if (DocumentsContract.isTreeUri(docUri)) {
-                newUri = DocumentsContract.buildTreeDocumentUri(AUTHORITY, target.getAbsolutePath());
-            } else {
-                newUri = DocumentsContract.buildDocumentUri(AUTHORITY, target.getAbsolutePath());
-            }
-            Bundle result = new Bundle();
-            result.putParcelable(DocumentsContract.EXTRA_URI, newUri);
-            return result;
-        }
-
-        return super.call(method, arg, extras);
+        throw new FileNotFoundException("Cannot allocate an unused document name");
     }
 
-    @Override
-    public Uri insert(Uri uri, ContentValues values) {
-        throw new UnsupportedOperationException("Insert not supported; use createDocument");
-    }
-
-    @Override
-    public int delete(Uri uri, String selection, String[] selectionArgs) {
+    @Override public String renameDocument(String documentId, String name) throws FileNotFoundException {
+        displayName(name);
+        File source = file(documentId), parent = source.getParentFile();
+        if (isFilesystemRoot(source)) throw new FileNotFoundException("Cannot rename a volume root");
+        File target = new File(parent, FileUtils.buildValidFatFilename(name));
+        if (source.equals(target)) return null;
         try {
-            String docId;
-            if (isDocumentUri(uri)) {
-                docId = DocumentsContract.getDocumentId(uri);
-            } else if (DocumentsContract.isTreeUri(uri)) {
-                docId = DocumentsContract.getTreeDocumentId(uri);
-            } else {
-                docId = DocumentsContract.getDocumentId(uri);
-            }
-            File file = getFileForDocId(docId);
-            return file.delete() ? 1 : 0;
-        } catch (Exception e) {
-            return 0;
-        }
+            Files.move(source.toPath(), target.toPath()); // No REPLACE_EXISTING.
+            return file(target.getCanonicalPath()).getPath();
+        } catch (IOException error) { throw missing("Cannot rename document", error); }
     }
 
-    @Override
-    public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
-        throw new UnsupportedOperationException("Update not supported");
+    @Override public void deleteDocument(String documentId) throws FileNotFoundException {
+        File file = file(documentId);
+        if (isFilesystemRoot(file)) throw new FileNotFoundException("Cannot delete a volume root");
+        try { deleteTree(file); }
+        catch (IOException error) { throw missing("Cannot delete document", error); }
+    }
+
+    private void deleteTree(File file) throws IOException {
+        file = file(file.getPath()); // Refuse symlinks/reparse aliases outside the tree.
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children == null) throw new IOException("Cannot list directory for deletion");
+            for (File child : children) {
+                deleteTree(child);
+                // DocumentsProvider retires the requested document after return;
+                // retire each side-effect deletion now, even if a later delete fails.
+                revokeDocumentPermission(child.getPath());
+            }
+        }
+        Files.delete(file.toPath());
+    }
+
+    private static FileNotFoundException missing(String message, Exception error) {
+        FileNotFoundException failure = new FileNotFoundException(message + ": " + error.getMessage());
+        failure.initCause(error); return failure;
     }
 }

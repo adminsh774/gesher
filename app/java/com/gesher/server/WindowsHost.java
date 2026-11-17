@@ -345,6 +345,23 @@ public final class WindowsHost {
         }
     }
 
+    /** Cancellable open/save/tree dialogs. A failed backend is an error, not a URI. */
+    static String[] pickDocuments(int mode, String title, String suggestedName,
+            String initialDirectory, String filter, String extension, boolean multiple,
+            int ownerPid, java.util.function.BooleanSupplier active) throws java.io.IOException {
+        if (!available()) throw new java.io.IOException("Windows document picker unavailable");
+        try {
+            return nativePickDocuments(mode, title, suggestedName, initialDirectory, filter,
+                    extension, multiple, ownerPid, active);
+        } catch (UnsatisfiedLinkError unavailable) {
+            throw new java.io.IOException("Windows document picker unavailable", unavailable);
+        }
+    }
+
+    private static native String[] nativePickDocuments(int mode, String title, String suggestedName,
+            String initialDirectory, String filter, String extension, boolean multiple,
+            int ownerPid, java.util.function.BooleanSupplier active) throws java.io.IOException;
+
     private static native long nativeStartEvents();
     private static native int nativeWaitEvents(int timeoutMs);
     private static native String[] nativeNextActivation();

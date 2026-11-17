@@ -47,6 +47,61 @@ app). `GESHER_BINDER_TRACE=1` makes binderd trace every transaction on stderr;
 device starts stream an ART method trace to `<dir>/<package>-<pid>.trace`,
 which survives an abort (it found the HealthConnectManager placeholder's need).
 
+## Storage Access Framework documents
+
+`DocumentsStorageProvider` publishes `com.gesher.documents` through the platform's
+`DocumentsProvider` and `ContentProvider.Transport`. Its registered metadata is
+available before persisted URI grants load; clients receive the transport only
+after `attachInfo` initializes its context, authority and URI matcher. The
+provider requires `MANAGE_DOCUMENTS`, while per-document read/write grants and
+AOSP tree containment authorize normal app operations. The boot framework's
+complete `DocumentsContract` remains the client API.
+
+`DocumentPicker` translates implicit open, create, tree and get-content requests
+into Windows filesystem dialogs. MIME filters, supported multiple selection,
+suggested save names and local initial-URI hints reach the native dialog.
+`ACTION_CREATE_DOCUMENT` uses `IFileSaveDialog`; the selected location is created
+atomically with Android's unique-name rules, preserving existing contents.
+`ACTION_GET_CONTENT` offers temporary read access. SAF results offer persistable
+read/write access; trees also carry a prefix grant. Persisting and releasing each
+mode uses the shared durable URI-grant store.
+
+Each request belongs to its authenticated activity/process and current package
+installation. The actual covered activity pauses while the native UI runs; a
+paused result recipient retains its pending result until normal resume.
+Cancellation, owner retirement, native errors, unavailable selections and failed
+creation/grant publication produce no successful URI result. Native STA timers
+close retired dialogs, and every request retires its COM objects and window.
+The outstanding picker session keeps the device busy through native cleanup,
+including requests from a process without an activity. Concurrent native document
+and intent dialogs retain their own busy and pause coverage; the covered activity
+resumes after the last dialog closes and any outstanding pause is acknowledged.
+Capabilities reflect existing backing files and writable operations. Android
+shared-storage private subtrees are hidden, and restricted tree roots carry the
+framework blocking flag.
+Recursive deletion retires each successfully deleted child's document and tree
+grants immediately through the framework helper. If a later deletion fails,
+already deleted children remain retired while surviving documents keep their
+permissions; the existing durable grant writer batches the resulting updates.
+
+The behavior follows Android 16 r4
+[DocumentsProvider](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/core/java/android/provider/DocumentsProvider.java),
+[ContentProvider](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/core/java/android/content/ContentProvider.java),
+[DocumentsContract](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/core/java/android/provider/DocumentsContract.java),
+[ExternalStorageProvider](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/packages/ExternalStorageProvider/src/com/android/externalstorage/ExternalStorageProvider.java),
+and the [Android documents guide](https://developer.android.com/training/data-storage/shared/documents-files).
+
+Validation: `tools/test_saf_documents.py` runs the production Java provider
+transport, activity-manager lifecycle and real filesystem/grant store, including
+recursive deletion and partial-failure grant retirement, headless idle ownership,
+overlapping native dialogs, delayed pause acknowledgment,
+and three separate JVMs for retained-mode reload and release. It declares its host
+Binder/native initialization boundaries. Windows track 94 runs the same service
+fixture through actual provider Binder parcels and file descriptors, then
+`DocumentPickerTest` opens and cancels real open/save/tree dialogs repeatedly.
+Unavailable native dialogs fail that check. Neither suite substitutes document
+operations or reports a selected path when an operation fails.
+
 ## Device services (devsvc track)
 
 Design: [0038](decisions/0038-devsvc-windows-backed-services.md). Tests:

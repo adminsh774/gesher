@@ -59,6 +59,46 @@ final class ContentProviders {
     private final CallerIdentity mCallers;
     private final UriGrants mUriGrants;
 
+    /** Real server-hosted provider registrations, independent of installed APKs. */
+    static final class RegisteredProvider {
+        final ProviderInfo info;
+        final android.content.IContentProvider provider;
+        RegisteredProvider(ProviderInfo info, android.content.IContentProvider provider) {
+            this.info = new ProviderInfo(java.util.Objects.requireNonNull(info));
+            this.provider = java.util.Objects.requireNonNull(provider);
+        }
+    }
+    private volatile Map<String, RegisteredProvider> mRegisteredProviders = Map.of();
+
+    RegisteredProvider registeredProvider(String authority) {
+        return mRegisteredProviders.get(authority);
+    }
+
+    boolean isCurrentRegistration(RegisteredProvider registration) {
+        if (registration == null || registration.info.authority == null) return false;
+        for (String authority : registration.info.authority.split(";")) {
+            if (registeredProvider(authority) != registration) return false;
+        }
+        return true;
+    }
+
+    /** Called only by construction of an actual server provider and its transport. */
+    void registerProvider(RegisteredProvider registration) {
+        if (registration.info.authority == null || registration.info.authority.isEmpty()) {
+            throw new IllegalArgumentException("Provider has no authority");
+        }
+        synchronized (mPm) {
+            Map<String, RegisteredProvider> next = new HashMap<>(mRegisteredProviders);
+            for (String authority : registration.info.authority.split(";")) {
+                if (next.containsKey(authority) || declaredProvider(mPm, authority) != null) {
+                    throw new IllegalArgumentException("Provider authority is already registered");
+                }
+                next.put(authority, registration);
+            }
+            mRegisteredProviders = Map.copyOf(next);
+        }
+    }
+
     // Guarded by this. Published providers, by authority.
     private final Map<String, ContentProviderHolder> mPublished = new HashMap<>();
     private final Map<String, ActivityTaskManagerService.ProcessRecord> mPublishedBy =
@@ -133,12 +173,15 @@ final class ContentProviders {
         mPm = pm;
         mAtm = atm;
         mCallers = new CallerIdentity(pm, atm);
-        mUriGrants = new UriGrants(pm, atm);
+        mUriGrants = new UriGrants(pm, atm, this);
         mSettings = new SettingsProvider(pm, atm);
-        mDocumentsStorage = new DocumentsStorageProvider(pm, atm);
+        mDocumentsStorage = new DocumentsStorageProvider(this, mUriGrants);
+        pm.setHostedProviders(this);
     }
 
     UriGrants uriGrants() { return mUriGrants; }
+    DocumentsStorageProvider documents() { return mDocumentsStorage; }
+    CallerIdentity callers() { return mCallers; }
 
     static boolean hasAuthority(ProviderInfo info, String authority) {
         if (info == null || info.authority == null || authority == null) return false;
@@ -148,15 +191,6 @@ final class ContentProviders {
 
     /** Ambiguous declarations never select an attacker simply because it installed first. */
     static ProviderInfo declaredProvider(PackageManagerService pm, String authority) {
-        if (DocumentsStorageProvider.AUTHORITY.equals(authority)) {
-            ProviderInfo info = new ProviderInfo();
-            info.packageName = "android";
-            info.name = DocumentsStorageProvider.class.getName();
-            info.authority = DocumentsStorageProvider.AUTHORITY;
-            info.exported = true;
-            info.grantUriPermissions = true;
-            return info;
-        }
         ProviderInfo found = null;
         for (ApkPackage pkg : pm.packages()) {
             if (pm.isRemovalPending(pkg.packageName)) continue;
@@ -195,18 +229,28 @@ final class ContentProviders {
     }
 
     private void enforceAccess(String pkg, ProviderInfo info) {
-        if (pkg == null || pkg.equals(info.packageName)) return;
-        ApkPackage target = mPm.get(pkg);
-        boolean uriGrant = target != null && mUriGrants.hasAny(target, info);
-        if (!info.exported && !uriGrant) throw new SecurityException("Content provider is not exported");
-        if (uriGrant || holds(pkg, info.readPermission) || holds(pkg, info.writePermission)) return;
-        if (info.pathPermissions != null) {
-            for (android.content.pm.PathPermission path : info.pathPermissions) {
-                if ((path.getReadPermission() != null && holds(pkg, path.getReadPermission()))
-                        || (path.getWritePermission() != null && holds(pkg, path.getWritePermission()))) return;
+        if (pkg == null) return;
+        synchronized (mPm) {
+            ApkPackage target = mPm.get(pkg);
+            if (target == null || target.uidPending() || target.uid() < 0
+                    || mPm.isRemovalPending(pkg)) throw new SecurityException("Unknown content caller");
+            ApkPackage owner = mPm.get(info.packageName);
+            // Android provider ownership is per UID, including admitted shared-UID
+            // packages. Invalid or retired metadata cannot establish that identity.
+            if (info.applicationInfo != null && info.applicationInfo.uid >= 0
+                    && owner != null && !owner.uidPending() && !mPm.isRemovalPending(owner.packageName)
+                    && owner.uid() == info.applicationInfo.uid && target.uid() == owner.uid()) return;
+            boolean uriGrant = mUriGrants.hasAny(target, info);
+            if (!info.exported && !uriGrant) throw new SecurityException("Content provider is not exported");
+            if (uriGrant || holds(pkg, info.readPermission) || holds(pkg, info.writePermission)) return;
+            if (info.pathPermissions != null) {
+                for (android.content.pm.PathPermission path : info.pathPermissions) {
+                    if ((path.getReadPermission() != null && holds(pkg, path.getReadPermission()))
+                            || (path.getWritePermission() != null && holds(pkg, path.getWritePermission()))) return;
+                }
             }
+            throw new SecurityException("Content provider permissions denied");
         }
-        throw new SecurityException("Content provider permissions denied");
     }
 
     /** The providers a process of {@code ai}'s package installs at bindApplication. */
@@ -265,10 +309,11 @@ final class ContentProviders {
             return mSettings.holder();
         }
         if (DocumentsStorageProvider.AUTHORITY.equals(name)) {
-            ProviderInfo declared = declaredProvider(mPm, name);
-            if (declared != null) {
-                enforceAccess(actualPackage, declared);
+            RegisteredProvider registration = registeredProvider(name);
+            if (registration == null || declaredProvider(mPm, name) != null) {
+                throw new SecurityException("Documents authority is not uniquely registered");
             }
+            enforceAccess(actualPackage, registration.info);
             return mDocumentsStorage.holder();
         }
         final ProviderInfo declared;
