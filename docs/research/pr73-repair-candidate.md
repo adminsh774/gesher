@@ -6,6 +6,42 @@ merge-queue workflow repair is the approved `.github/workflows` sparse-checkout
 input. It is an intermediate repair, not an approval or evidence that Windows
 or Android execution succeeded.
 
+## Follow-up to published head f6121d0c
+
+Current-head run `44174755368` stopped before the relevant Windows runtime
+contracts. Two failures belong to this PR: the launcher still referenced
+`ExitIfVforkChild`, and the Linux formatter envelope leaked its 10-byte
+`vasprintf` allocation when the blocked output test canceled its thread.
+
+The exit integration problem was not merely a missing declaration. PR73 had
+removed both the declaration and implementation of the old synthetic-child
+mechanism, but left two calls in the launcher. Those obsolete interceptions
+are now removed. Normal `exit` still runs `__cxa_finalize` once, flushes stdio
+and terminates the actual process with the low eight status bits. `_exit` and
+`_Exit` still terminate directly, without finalization or flushing. Successful
+exec/spawn paths retain their existing process transport. `fork`/`vfork` remain
+unimplemented and return `ENOSYS`; this is a remaining runtime capability gap,
+not a successful Android fork implementation. The documented exec process-id
+limitation also remains.
+
+The formatter envelope now owns its temporary narrow and wide buffers across
+cancellation, and its scanner proxy owns its temporary FILE. Existing
+cancellation inputs and all 125 adapter assertions remain unchanged. An
+external allocation observer runs the same test against published and repaired
+envelopes: the former leaves the actual formatted allocation outstanding, while
+the latter calls its real deallocator after cancellation. The observer does
+not replace LeakSanitizer. Local LeakSanitizer still cannot run under the
+workspace's tracer, and CI keeps its normal sanitizer settings.
+
+The complete launcher translation unit compiles on x64 and ARM64. The exact
+owned exit function bodies also link in native probes and pass seven real
+Linux subprocess cases covering finalization, buffered output, immediate exit,
+status truncation and recursive exit. Full launcher linking and Windows/ART
+execution remain CI requirements. Unrelated shared-tree build failures remain
+an external dependency; this follow-up changes no shared-tree workaround or
+test deadline. The pipe blockers below remain open, with their native probes
+and assertions intact.
+
 ## Repairs established locally
 
 The wide stream implementation now owns its symbols without MinGW macro or

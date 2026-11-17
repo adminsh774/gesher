@@ -148,19 +148,23 @@ extern "C" int __mingw_pformat(int, void* destination, int, const char* format, 
   char* text = nullptr;
   int length = HostVasprintf(&text, format, ap);
   if (length < 0) return length;
+  // The real stream callback can block and cancel this caller. Retain the
+  // formatter's allocation through unwinding, not only the normal return.
+  std::unique_ptr<char, decltype(&std::free)> allocation(text, std::free);
   for (int i = 0; i < length; ++i) adapter_fputc(static_cast<unsigned char>(text[i]), static_cast<FILE*>(destination));
-  std::free(text);
   return length;
 }
 extern "C" int __mingw_wpformat(int, void* destination, int, const wchar_t* format, va_list ap) {
   wchar_t* text = nullptr;
+  gesher::CancellationCleanup allocation([](void* raw) {
+    std::free(*static_cast<wchar_t**>(raw));
+  }, &text);
   size_t count = 0;
-  FILE* memory = open_wmemstream(&text, &count);
+  std::unique_ptr<FILE, decltype(&HostFclose)> memory(open_wmemstream(&text, &count), HostFclose);
   if (!memory) return -1;
-  int result = HostVfwprintf(memory, format, ap);
-  HostFclose(memory);
+  int result = HostVfwprintf(memory.get(), format, ap);
+  memory.reset();  // Finalize text before transferring it or freeing it.
   if (result >= 0) for (size_t i = 0; i < count; ++i) adapter_fputwc(text[i], static_cast<FILE*>(destination));
-  std::free(text);
   return result;
 }
 static ssize_t HostScanRead(void* cookie, char* bytes, size_t count) {
@@ -173,17 +177,17 @@ static ssize_t HostScanRead(void* cookie, char* bytes, size_t count) {
 extern "C" int __real___mingw_vfscanf(FILE* stream, const char* format, va_list ap) {
   cookie_io_functions_t io{};
   io.read = HostScanRead;
-  FILE* proxy = fopencookie(stream, "r", io);
+  std::unique_ptr<FILE, decltype(&HostFclose)> proxy(fopencookie(stream, "r", io), HostFclose);
   if (!proxy) return EOF;
-  HostSetvbuf(proxy, nullptr, _IONBF, 0);
-  int result = HostVfscanf(proxy, format, ap);
+  HostSetvbuf(proxy.get(), nullptr, _IONBF, 0);
+  int result = HostVfscanf(proxy.get(), format, ap);
   const int saved = errno;
   // This is an explicitly glibc-only envelope. Preserve scanner look-ahead
   // held by its proxy stream before the native allocation is released.
   while (proxy->_IO_read_ptr < proxy->_IO_read_end) {
     adapter_ungetc(static_cast<unsigned char>(*--proxy->_IO_read_end), stream);
   }
-  HostFclose(proxy);
+  proxy.reset();
   errno = saved;
   return result;
 }

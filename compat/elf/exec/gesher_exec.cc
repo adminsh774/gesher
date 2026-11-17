@@ -125,7 +125,6 @@ GetauxvalFn g_shim_getauxval = nullptr;
 // .fini_array) in reverse order, stdio flushed, then the low 8 bits as the
 // process's exit code, as on Linux.
 [[noreturn]] void SYSV Exit(int status) {
-  gesher::bionic::ExitIfVforkChild(status);  // a fork child exiting without exec
   if (!g_exiting.exchange(true)) {
     if (auto finalize = reinterpret_cast<FinalizeFn>(gesher::bionic::LookupBionicSymbol("__cxa_finalize"))) {
       finalize(nullptr);
@@ -137,7 +136,6 @@ GetauxvalFn g_shim_getauxval = nullptr;
 
 // _exit()/_Exit(): no handlers and no stdio flush, as on Linux.
 [[noreturn]] void SYSV UnderscoreExit(int status) {
-  gesher::bionic::ExitIfVforkChild(status);
   ExitProcess(static_cast<UINT>(status) & 0xff);
 }
 
