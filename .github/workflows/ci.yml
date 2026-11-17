@@ -45,6 +45,7 @@ jobs:
         with:
           sparse-checkout: |
             .github/scripts
+            .github/workflows
             .github/actions/runner-route
       - uses: actions/setup-node@v4
         with:
