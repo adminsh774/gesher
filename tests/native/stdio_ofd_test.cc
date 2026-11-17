@@ -9,6 +9,8 @@ static void check(const char* name, int ok) {
   if (!ok) { ++failures; fprintf(stderr, "FAIL stdio: %s\n", name); }
 }
 #include "stdio_ofd_contract.inc"
+#include "stdio_virtual_contract.inc"
+#include "stdio_cancel_contract.inc"
 static FILE* exit_stream;
 static void ExitOutput() { fputs("late", exit_stream); }
 int main(int argc, char** argv) {
@@ -19,6 +21,8 @@ int main(int argc, char** argv) {
     return 0;
   }
   test_stdio_ofd_contracts();
+  test_stdio_virtual_contracts();
+  test_stdio_cancel_contracts();
   printf("stdio OFD contracts: %d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;
 }

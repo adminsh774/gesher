@@ -5,6 +5,9 @@
 #undef __USE_MINGW_ANSI_STDIO
 #endif
 #define __USE_MINGW_ANSI_STDIO 0
+// This translation unit supplies the public stream symbols. MinGW's C++
+// header inlines must not also define getwchar/putwchar in this owner.
+#define __CRT__NO_INLINE 1
 
 #include "stdio_internal.h"
 #include "stdio_stream_buffer.h"
@@ -29,6 +32,11 @@
 #include <mutex>
 #include <new>
 #include <vector>
+
+#undef getwc
+#undef putwc
+#undef getwchar
+#undef putwchar
 
 // These formatter cores are part of the pinned MinGW runtime already used for
 // C99 printf. They emit through public fputc/fputwc, routed below. Formatting
@@ -59,10 +67,13 @@ using StatePtr = std::shared_ptr<State>;
 thread_local State* formatting_stream = nullptr;
 class FormatScope {
  public:
-  explicit FormatScope(State* state) : previous_(formatting_stream) { formatting_stream = state; }
-  ~FormatScope() { formatting_stream = previous_; }
+  explicit FormatScope(State* state) : previous_(formatting_stream), cleanup_(Restore, this) {
+    formatting_stream = state;
+  }
  private:
+  static void Restore(void* raw) { formatting_stream = static_cast<FormatScope*>(raw)->previous_; }
   State* previous_;
+  CancellationCleanup cleanup_;
 };
 using Streams = std::map<FILE*, StatePtr>;
 struct Registry {
@@ -149,22 +160,28 @@ StatePtr Find(FILE* stream, bool create) {
 }
 class AccessStream {
  public:
-  AccessStream(FILE* stream, bool unlocked, bool create = true) : state_(Find(stream, create)) {
+  AccessStream(FILE* stream, bool unlocked, bool create = true)
+      : state_(Find(stream, create)), cleanup_(Release, this) {
     if (state_ && !unlocked) lock_ = std::unique_lock<std::recursive_mutex>(state_->mutex);
     live_ = state_ && state_->live;
     if (state_ && !live_) errno = EBADF;
-  }
-  ~AccessStream() {
-    if (live_) state_->line_output.store(state_->buffer.Writing() &&
-        state_->buffer.Buffering() == StreamBuffer::Mode::kLine, std::memory_order_release);
   }
   explicit operator bool() const { return live_; }
   State* Get() const { return state_.get(); }
   State* operator->() const { return state_.get(); }
  private:
+  static void Release(void* raw) {
+    auto& access = *static_cast<AccessStream*>(raw);
+    if (access.live_) access.state_->line_output.store(access.state_->buffer.Writing() &&
+        access.state_->buffer.Buffering() == StreamBuffer::Mode::kLine, std::memory_order_release);
+    access.live_ = false;
+    if (access.lock_.owns_lock()) access.lock_.unlock();
+    access.state_.reset();
+  }
   StatePtr state_;
   std::unique_lock<std::recursive_mutex> lock_;
   bool live_ = false;
+  CancellationCleanup cleanup_;
 };
 std::shared_ptr<void> AcquireLocal(FILE* stream) {
   auto state = Find(stream, true);
@@ -291,10 +308,18 @@ int WalkFlush(bool line_only, State* skip) {
   } catch (const std::bad_alloc&) {
     return errno = ENOMEM, EOF;
   }
+  CancellationCleanup pins([](void* raw) {
+    std::vector<StatePtr> released;
+    released.swap(*static_cast<std::vector<StatePtr>*>(raw));
+  }, &streams);
   int result = 0;
   for (const auto& state : streams) {
     if (state.get() == skip || (line_only && !state->line_output.load(std::memory_order_acquire))) continue;
-    std::lock_guard<std::recursive_mutex> lock(state->mutex);
+    std::unique_lock<std::recursive_mutex> lock(state->mutex);
+    CancellationCleanup unlock([](void* raw) {
+      auto& held = *static_cast<std::unique_lock<std::recursive_mutex>*>(raw);
+      if (held.owns_lock()) held.unlock();
+    }, &lock);
     if (state->live && (!line_only || (state->buffer.Writing() &&
         state->buffer.Buffering() == StreamBuffer::Mode::kLine)) &&
         state->buffer.FlushOutput(Writer(state->fd)) < 0) result = EOF;
@@ -478,8 +503,10 @@ __attribute__((constructor(101))) void RegisterFinalFlush() {
   if (!Initialize()) std::abort();
 }
 }
-StreamGuard::StreamGuard(FILE* stream) : token_(Owner()->acquire(stream)) {}
-StreamGuard::~StreamGuard() { Owner()->release(token_); }
+StreamGuard::StreamGuard(FILE* stream)
+    : token_(Owner()->acquire(stream)), cleanup_([](void* raw) { static_cast<StreamGuard*>(raw)->Release(); }, this) {}
+StreamGuard::~StreamGuard() = default;
+void StreamGuard::Release() { Owner()->release(token_); token_.reset(); }
 void Lock(FILE* stream) { Owner()->lock(stream); }
 void Unlock(FILE* stream) { Owner()->unlock(stream); }
 int TryLock(FILE* stream) { return Owner()->try_lock(stream); }

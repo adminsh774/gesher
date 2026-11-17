@@ -27,6 +27,8 @@ foreach ($fixture in @(
      Label = 'file status flags, OFD sharing across dup, and independent FD_CLOEXEC' },
   @{ Exe = 'stdio_ofd_test.exe'; Markers = @('stdio OFD contracts:', ' checks, 0 failures');
      Label = 'shared stdio buffers, append flags, descriptor ownership and concurrent close' },
+  @{ Exe = 'pipe_kernel_test.exe'; Markers = @('pipe kernel contracts:', ' checks, 0 failures');
+     Label = 'kernel pipe admission, cancellation, aliases and independent procfs reopening' },
   @{ Exe = 'ofd_spawn_test.exe'; Markers = @('OFD Windows spawn:', ' checks, 0 failures');
      Label = 'actual importer discovery, shared file descriptions and native PE interoperability' },
   @{ Exe = 'media_input_surface_callback_test.exe'; Markers = @('input surface callback contracts:', ' checks, 0 failures');

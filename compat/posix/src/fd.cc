@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <poll.h>
+#include <pthread.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -25,8 +26,10 @@
 #include <vector>
 
 #include "binder_internal.h"
+#include "descriptor_resources.h"
 #include "event_internal.h"
 #include "internal.h"
+#include "pipe_io.h"
 #include "record_lock_descriptors.h"
 #include "socket_internal.h"
 
@@ -172,6 +175,9 @@ using gesher::Device;
 using gesher::SocketFd;
 
 namespace {
+void ReleaseCanceledSnapshot(void* raw) {
+  static_cast<gesher::DescriptorSnapshotPtr*>(raw)->reset();
+}
 // The caller owns an exact native object reference for the whole operation.
 // Append is one kernel write-to-end request; no seek/write race is possible
 // between independent opens or writers in another process.
@@ -316,6 +322,40 @@ int CloseUnpublishedDuplicate(int fd) {
   record_locks::DescriptorGuard descriptor_guard;
   return CloseFdBody(fd, true);
 }
+void RetiredDescriptor::Retire(int fd) {
+  // CRT has released the old handle while its fd number is still protected
+  // from participating reuse. Retire precisely the virtual owners belonging
+  // to that old slot, before a replacement is published.
+  ForgetEpollEntries(fd);
+  SocketFd socket;
+  bool last = false;
+  if (Remove(fd, &socket, &last)) {
+    if (last) {
+      std::lock_guard<std::mutex> lock(socket.description->error_mutex);
+      socket.description->native_closing = true;
+      socket_ = socket.socket;
+      description_ = std::move(socket.description);
+    }
+  } else {
+    ForgetDevice(fd);
+    ForgetEventObject(fd);
+    ForgetBinder(fd);
+  }
+  ForgetOfd(fd);
+  if (HasPollWaiters()) WakePollers();
+}
+int RetiredDescriptor::Finish() {
+  if (!description_) return 0;
+  auto description = std::move(description_);
+  // Linger/operation retirement may block. No descriptor or stdio registry
+  // transaction is held here. Failed close retains the existing quarantine.
+  return ws::Close(socket_, description, true);
+}
+RetiredDescriptor::~RetiredDescriptor() {
+  const int saved = errno;
+  Finish();
+  errno = saved;
+}
 int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count) {
   const int flags = FileDescriptionFlags(snapshot);
   if (flags < 0) return -1;
@@ -325,14 +365,9 @@ int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsi
   if (snapshot->kind == DescriptorKind::kZero || snapshot->kind == DescriptorKind::kRandom) {
     return ReadDevice(snapshot->kind == DescriptorKind::kZero ? Device::kZero : Device::kRandom, bytes, count);
   }
+  if (GetFileType(snapshot->handle) == FILE_TYPE_PIPE)
+    return TransferPipe(snapshot->handle, bytes, count, false);
   if (count == 0 && GetFileType(snapshot->handle) != FILE_TYPE_DISK) return 0;
-  if (count != 0 && GetFileType(snapshot->handle) == FILE_TYPE_PIPE && (flags & O_NONBLOCK) != 0) {
-    DWORD available = 0;
-    if (PeekNamedPipe(snapshot->handle, nullptr, 0, nullptr, &available, nullptr)) {
-      if (available == 0) return errno = EAGAIN, -1;
-      count = std::min<unsigned>(count, available);
-    }
-  }
   return TransferFileHandle(snapshot->handle, bytes, count, false, false);
 }
 int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* bytes, unsigned count) {
@@ -343,7 +378,9 @@ int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* byte
   count = std::min(count, 0x7ffff000u);
   if (snapshot->kind == DescriptorKind::kZero) return static_cast<int>(count);
   const bool append = (flags & O_APPEND) != 0 && GetFileType(snapshot->handle) == FILE_TYPE_DISK;
-  int result = TransferFileHandle(snapshot->handle, const_cast<void*>(bytes), count, true, append);
+  int result = GetFileType(snapshot->handle) == FILE_TYPE_PIPE
+      ? TransferPipe(snapshot->handle, const_cast<void*>(bytes), count, true)
+      : TransferFileHandle(snapshot->handle, const_cast<void*>(bytes), count, true, append);
   if (result > 0 && HasPollWaiters() && GetFileType(snapshot->handle) == FILE_TYPE_PIPE) WakePollers();
   return result;
 }
@@ -378,7 +415,11 @@ int read(int fd, void* buf, unsigned int count) {
     HANDLE h = gesher::HandleFromFd(fd);
     if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE) {
       auto snapshot = gesher::CaptureDescriptor(fd);
-      return snapshot ? gesher::ReadFileDescription(snapshot, buf, count) : -1;
+      if (!snapshot) return -1;
+      pthread_cleanup_push(ReleaseCanceledSnapshot, &snapshot);
+      result = gesher::ReadFileDescription(snapshot, buf, count);
+      pthread_cleanup_pop(0);
+      return result;
     }
     return gesher::CrtResult(_read(fd, buf, count));
   }
@@ -399,7 +440,11 @@ int write(int fd, const void* buf, unsigned int count) {
     HANDLE h = gesher::HandleFromFd(fd);
     if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE) {
       auto snapshot = gesher::CaptureDescriptor(fd);
-      return snapshot ? gesher::WriteFileDescription(snapshot, buf, count) : -1;
+      if (!snapshot) return -1;
+      pthread_cleanup_push(ReleaseCanceledSnapshot, &snapshot);
+      result = gesher::WriteFileDescription(snapshot, buf, count);
+      pthread_cleanup_pop(0);
+      return result;
     }
     result = gesher::CrtResult(_write(fd, buf, count));
     if (result > 0) gesher::InotifyNoteWrite(fd);
@@ -557,6 +602,7 @@ bool PollFile(pollfd* p) {
   // The NUL fd reserves a number, but an epoll is readable only when its
   // interest list has a reportable event. It is never a writable file.
   if (gesher::PollEpoll(p->fd, p->events, &p->revents)) return p->revents != 0;
+  gesher::record_locks::DescriptorGuard guard;
   HANDLE h = gesher::HandleFromFd(p->fd);
   if (h == INVALID_HANDLE_VALUE) {
     p->revents = POLLNVAL;
@@ -566,15 +612,9 @@ bool PollFile(pollfd* p) {
     p->revents = p->events & (kIn | kOut);
     return true;
   }
-  DWORD avail = 0;
-  if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
-    // The other end is closed: Linux reports POLLHUP, and POLLIN since read
-    // returns 0. (PeekNamedPipe fails the same way on a pipe's write end.)
-    p->revents = POLLHUP | (p->events & kIn) | (p->events & kOut);
-    return true;
-  }
-  p->revents = (avail > 0 ? p->events & kIn : 0) | (p->events & kOut);
-  return (p->events & kIn) == 0 || avail > 0;
+  const int flags = gesher::GetFileStatusFlags(p->fd);
+  p->revents = flags < 0 ? POLLNVAL : gesher::PollPipeHandle(h, flags, p->events);
+  return p->revents != 0;
 }
 
 // A thread's way to be woken in poll: an auto-reset event when it waits with

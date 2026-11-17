@@ -26,6 +26,7 @@ add_library(gesher_posix STATIC
   ${CMAKE_CURRENT_LIST_DIR}/src/network_dns.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/ofd.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/path.cc
+  ${CMAKE_CURRENT_LIST_DIR}/src/pipe_io.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/process.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/record_lock_descriptors.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/record_lock_duplicate.cc
@@ -105,4 +106,7 @@ set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/mman_alias_prepare.cc 
 # Stream/map allocation failures are reported as ENOMEM before fdopen takes
 # descriptor ownership. Exceptions do not cross the stdio ABI boundary.
 set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/stdio_output.cc PROPERTIES
+  COMPILE_OPTIONS "-fexceptions")
+# OFD/control-block allocations also report ENOMEM at their owner boundary.
+set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/ofd.cc PROPERTIES
   COMPILE_OPTIONS "-fexceptions")

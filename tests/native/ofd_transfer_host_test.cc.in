@@ -28,6 +28,16 @@
 #include <vector>
 #include "@PE_EXPORTS_HEADER@"
 
+static thread_local int allocation_failure = -1;
+void* operator new(size_t count) {
+  if (allocation_failure >= 0 && allocation_failure-- == 0) throw std::bad_alloc();
+  void* result = std::malloc(count ? count : 1);
+  if (!result) throw std::bad_alloc();
+  return result;
+}
+void operator delete(void* value) noexcept { std::free(value); }
+void operator delete(void* value, size_t) noexcept { std::free(value); }
+
 #define WINAPI
 #define CALLBACK
 #define __declspec(x)
@@ -317,6 +327,14 @@ static BOOL CreateProcessW(const wchar_t*, wchar_t*, void*, void*, BOOL, DWORD, 
                            STARTUPINFOW*, PROCESS_INFORMATION*);
 
 namespace gesher {
+int PipeStatusFlags(HANDLE handle, int flags) {
+  const int native = fcntl(host::Native(handle), F_GETFL);
+  return native < 0 ? -1 : (flags & ~O_NONBLOCK) | (native & O_NONBLOCK);
+}
+int SetPipeNonBlocking(HANDLE handle, bool nonblocking) {
+  const int fd = host::Native(handle), flags = fcntl(fd, F_GETFL);
+  return flags < 0 ? -1 : fcntl(fd, F_SETFL, nonblocking ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
+}
 static int ErrnoFromWin32(DWORD error) {
   switch (error) {
     case ERROR_NOT_ENOUGH_MEMORY: return ENOMEM;
@@ -517,6 +535,26 @@ int main(int argc, char** argv) {
   auto alias = gesher::CaptureDescriptor(38);
   Check("snapshot aliases share one description", snapshot && alias && snapshot->description == alias->description);
   if (!snapshot || !alias) return 1;
+  const size_t allocation_handles = host::owned.size();
+  allocation_failure = 0;
+  const int registered = gesher::RegisterOfd(37, O_RDONLY);
+  const int register_error = errno;
+  allocation_failure = -1;
+  Check("OFD allocation reports ENOMEM and retains old description", registered == -1 && register_error == ENOMEM &&
+      gesher::CaptureDescriptor(37)->description == snapshot->description);
+  allocation_failure = 0;
+  auto failed_snapshot = gesher::CaptureDescriptor(37);
+  const int snapshot_error = errno;
+  allocation_failure = -1;
+  Check("snapshot allocation reports ENOMEM without leaking a kernel pin", !failed_snapshot && snapshot_error == ENOMEM &&
+      host::owned.size() == allocation_handles);
+  std::vector<std::pair<int, gesher::DescriptorSnapshotPtr>> failed_capture;
+  allocation_failure = 0;
+  const int captured = gesher::CaptureDescriptors(&failed_capture, true);
+  const int capture_error = errno;
+  allocation_failure = -1;
+  Check("descriptor enumeration allocation returns an empty failure snapshot", captured == -1 && capture_error == ENOMEM &&
+      failed_capture.empty() && host::owned.size() == allocation_handles);
   DWORD native_flags = 9;
   Check("snapshot handle is private", GetHandleInformation(snapshot->handle, &native_flags) && native_flags == 0);
   auto raw = gesher::CaptureFileHandle(snapshot->handle);

@@ -5,6 +5,7 @@
 #include "internal.h"
 #include "record_lock_descriptors.h"
 #include "record_lock_liveness.h"
+#include "pipe_io.h"
 
 #include <gesher/file_description.h>
 #include <errno.h>
@@ -138,10 +139,10 @@ int NativeFlags(HANDLE file) {
     if ((mode.Mode & FILE_WRITE_THROUGH) != 0) flags |= O_SYNC;
     if ((mode.Mode & FILE_NO_INTERMEDIATE_BUFFERING) != 0) flags |= O_DIRECT;
   }
-  return flags;
+  return type == FILE_TYPE_PIPE ? PipeStatusFlags(file, flags) : flags;
 }
 
-int ImportStartup(Table* state) {
+int ImportStartup(Table* state) try {
   STARTUPINFOW startup{};
   GetStartupInfoW(&startup);
   if (!startup.lpReserved2 || startup.cbReserved2 < sizeof(int) + sizeof(ofd_transfer::Startup)) return 0;
@@ -161,6 +162,11 @@ int ImportStartup(Table* state) {
   auto* bytes = static_cast<const unsigned char*>(MapViewOfFile(manifest, FILE_MAP_READ, 0, 0,
                                                                static_cast<SIZE_T>(extension.manifest_size)));
   if (!bytes) return ErrnoFromWin32(GetLastError());
+  struct StartupView {
+    const void* bytes;
+    HANDLE manifest;
+    ~StartupView() { UnmapViewOfFile(bytes); CloseHandle(manifest); }
+  } cleanup{bytes, manifest};
   ofd_transfer::Header header{};
   std::memcpy(&header, bytes, sizeof(header));
   int error = 0;
@@ -222,9 +228,9 @@ int ImportStartup(Table* state) {
     SetStdHandle(fd == 0 ? STD_INPUT_HANDLE : fd == 1 ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE,
                  INVALID_HANDLE_VALUE);
   }
-  UnmapViewOfFile(bytes);
-  CloseHandle(manifest);
   return error;
+} catch (const std::bad_alloc&) {
+  return ENOMEM;
 }
 
 BOOL CALLBACK ImportTable(PINIT_ONCE, void* parameter, void**) {
@@ -239,7 +245,7 @@ int InitializeLocal() {
   return table->import_error ? (errno = table->import_error, -1) : 0;
 }
 
-std::shared_ptr<OpenFileDescription> GetOrCreateLocked(int fd, HANDLE file) {
+std::shared_ptr<OpenFileDescription> GetOrCreateLocked(int fd, HANDLE file) try {
   auto& entry = table->entries[fd];
   if (entry) return entry;
   int flags = NativeFlags(file);
@@ -248,9 +254,12 @@ std::shared_ptr<OpenFileDescription> GetOrCreateLocked(int fd, HANDLE file) {
   description->SetFlags(flags);
   entry = description;
   return description;
+} catch (const std::bad_alloc&) {
+  errno = ENOMEM;
+  return {};
 }
 
-int RegisterLocal(int fd, int flags) {
+int RegisterLocal(int fd, int flags) try {
   if (!ValidSlot(fd)) return errno = EBADF, -1;
   if (InitializeLocal() < 0) return -1;
   auto description = std::make_shared<OpenFileDescription>();
@@ -259,6 +268,8 @@ int RegisterLocal(int fd, int flags) {
   std::lock_guard<std::mutex> lock(table->mutex);
   table->entries[fd] = std::move(description);
   return 0;
+} catch (const std::bad_alloc&) {
+  return errno = ENOMEM, -1;
 }
 
 int DupLocal(int old_fd, int new_fd) {
@@ -295,7 +306,9 @@ int GetFlagsLocal(int fd) {
   if (file == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
   std::lock_guard<std::mutex> lock(table->mutex);
   auto description = GetOrCreateLocked(fd, file);
-  return description ? description->Flags() : -1;
+  if (!description) return -1;
+  const int flags = description->Flags();
+  return GetFileType(file) == FILE_TYPE_PIPE ? PipeStatusFlags(file, flags) : flags;
 }
 
 int SetFlagsLocal(int fd, int arg) {
@@ -332,22 +345,28 @@ int SetFlagsLocal(int fd, int arg) {
   int flags = (old_flags & ~kModifiableStatusFlags) | (arg & kModifiableStatusFlags);
   // A normal Linux file has no fasync callback: this bit stays unchanged.
   if (type == FILE_TYPE_DISK) flags = (flags & ~O_ASYNC) | (old_flags & O_ASYNC);
+  if (type == FILE_TYPE_PIPE && SetPipeNonBlocking(file, (flags & O_NONBLOCK) != 0) < 0) return -1;
   description->SetFlags(flags);
   return 0;
 }
 
-DescriptorSnapshotPtr Snapshot(HANDLE file, const std::shared_ptr<OpenFileDescription>& description) {
+DescriptorSnapshotPtr Snapshot(HANDLE file, const std::shared_ptr<OpenFileDescription>& description) try {
   DWORD native_flags = 0;
   if (!GetHandleInformation(file, &native_flags)) { FailWithLastError(); return {}; }
+  // Allocate the control block before acquiring a native duplicate, so an
+  // allocation failure cannot leak a hidden handle or prolong peer lifetime.
+  auto snapshot = std::make_shared<DescriptorSnapshot>();
   HANDLE duplicate = nullptr;
   if (!DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(), &duplicate,
                        0, FALSE, DUPLICATE_SAME_ACCESS)) { FailWithLastError(); return {}; }
-  auto snapshot = std::make_shared<DescriptorSnapshot>();
   snapshot->handle = duplicate;
   snapshot->descriptor_flags = (native_flags & HANDLE_FLAG_INHERIT) != 0 ? 0 : FD_CLOEXEC;
   snapshot->description = description;
   snapshot->kind = description->kind.load();
   return snapshot;
+} catch (const std::bad_alloc&) {
+  errno = ENOMEM;
+  return {};
 }
 
 DescriptorSnapshotPtr CaptureLocal(int fd) {
@@ -364,7 +383,7 @@ DescriptorSnapshotPtr CaptureLocal(int fd) {
   return description ? Snapshot(file, description) : DescriptorSnapshotPtr{};
 }
 
-DescriptorSnapshotPtr CaptureHandleLocal(HANDLE file) {
+DescriptorSnapshotPtr CaptureHandleLocal(HANDLE file) try {
   record_locks::DescriptorGuard guard;
   if (!file || file == INVALID_HANDLE_VALUE) { errno = EBADF; return {}; }
   if (InitializeLocal() < 0) return {};
@@ -390,6 +409,9 @@ DescriptorSnapshotPtr CaptureHandleLocal(HANDLE file) {
     }
   }
   return Snapshot(file, description);
+} catch (const std::bad_alloc&) {
+  errno = ENOMEM;
+  return {};
 }
 
 int AttachLocal(const DescriptorSnapshotPtr& snapshot, bool close_on_exec) {
@@ -446,7 +468,7 @@ HANDLE ShareLocal(const DescriptorSnapshotPtr& snapshot) {
   return snapshot->description->Share();
 }
 
-int CaptureAllLocal(std::vector<std::pair<int, DescriptorSnapshotPtr>>* out, bool include_close_on_exec) {
+int CaptureAllLocal(std::vector<std::pair<int, DescriptorSnapshotPtr>>* out, bool include_close_on_exec) try {
   if (!out) return errno = EINVAL, -1;
   const int saved = errno;
   record_locks::DescriptorGuard guard;
@@ -472,6 +494,9 @@ int CaptureAllLocal(std::vector<std::pair<int, DescriptorSnapshotPtr>>* out, boo
   }
   errno = saved;
   return 0;
+} catch (const std::bad_alloc&) {
+  out->clear();
+  return errno = ENOMEM, -1;
 }
 
 struct OwnerApi {
@@ -549,7 +574,8 @@ int AttachFileDescription(const DescriptorSnapshotPtr& snapshot, bool close_on_e
 }
 int FileDescriptionFlags(const DescriptorSnapshotPtr& snapshot) {
   if (!snapshot || !snapshot->description) return errno = EBADF, -1;
-  return snapshot->description->Flags();
+  const int flags = snapshot->description->Flags();
+  return GetFileType(snapshot->handle) == FILE_TYPE_PIPE ? PipeStatusFlags(snapshot->handle, flags) : flags;
 }
 int ValidateNativeFileDescription(const DescriptorSnapshotPtr& snapshot) {
   int flags = FileDescriptionFlags(snapshot);

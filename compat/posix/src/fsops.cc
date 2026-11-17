@@ -24,6 +24,7 @@
 #include <gesher/reserved_names.h>
 
 #include "internal.h"
+#include "descriptor_resources.h"
 #include "record_lock_descriptors.h"
 #include "stdio_internal.h"
 
@@ -664,21 +665,26 @@ int fclose(FILE* stream) {
   const int fd = _fileno(stream);
   const int flushed = gesher::stdio::FlushOutput(stream);
   const int flush_error = errno;
-  gesher::record_locks::ClosingDescriptor transaction(fd);
-  if (transaction.Error()) return errno = transaction.Error(), EOF;
-  // Use the CRT's documented unlocked entry under the shared stream lock,
-  // retiring the token before native close can release its allocation. This
-  // also prevents a concurrent flush-all from dereferencing a retired FILE.
-  gesher::stdio::Forget(stream);
-  // The native entry avoids recursion through this public fclose symbol.
-  int result = _fclose_nolock(stream);
-  int saved = result == EOF ? gesher_errno_from_crt(errno) : flushed < 0 ? flush_error : errno;
-  // A flush error can coexist with a completed close. Retire the fd entry
-  // while its descriptor transaction still excludes participating reuse.
-  if (result == 0 || gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) {
-    gesher::ForgetOfd(fd);
+  gesher::RetiredDescriptor retired;
+  int result, saved, error;
+  {
+    gesher::record_locks::ClosingDescriptor transaction(fd);
+    if (transaction.Error()) return errno = transaction.Error(), EOF;
+    // Use the CRT's documented unlocked entry under the shared stream lock,
+    // retiring the token before native close can release its allocation. This
+    // also prevents a concurrent flush-all from dereferencing a retired FILE.
+    gesher::stdio::Forget(stream);
+    // The native entry avoids recursion through this public fclose symbol.
+    result = _fclose_nolock(stream);
+    saved = result == EOF ? gesher_errno_from_crt(errno) : flushed < 0 ? flush_error : errno;
+    // A flush error can coexist with a completed close. Retire the fd entry
+    // while its descriptor transaction still excludes participating reuse.
+    if (result == 0 || gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) {
+      retired.Retire(fd);
+    }
+    error = transaction.Finish(result == 0);
   }
-  int error = transaction.Finish(result == 0);
+  if (retired.Finish() < 0 && result != EOF) { result = EOF; saved = errno; }
   if (error) return errno = error, EOF;
   errno = saved;
   return result == EOF || flushed < 0 ? EOF : 0;
@@ -692,67 +698,73 @@ FILE* freopen(const char* path, const char* mode, FILE* stream) {
   if (!stream_lock) return nullptr;
   const int old_fd = _fileno(stream);
   gesher::stdio::FlushOutput(stream);
-  gesher::record_locks::ClosingDescriptor transaction(old_fd);
-  if (transaction.Error()) return errno = transaction.Error(), nullptr;
-  auto fail_reopen = [&](int requested_error) -> FILE* {
-    // Even a destination rejected before the CRT reopen still closes the
-    // original stream. Use the already-held stream/descriptor transaction
-    // exactly once, including when flushing/closing itself reports an error.
-    gesher::stdio::Forget(stream);
-    int closed = _fclose_nolock(stream);
-    if (closed == 0 || gesher::HandleFromFd(old_fd) == INVALID_HANDLE_VALUE) {
-      gesher::ForgetOfd(old_fd);
+  gesher::RetiredDescriptor retired;
+  // Keep native socket close outside the descriptor guard on every return,
+  // including invalid modes and unsuccessful destination opens.
+  auto reopen = [&]() -> FILE* {
+    gesher::record_locks::ClosingDescriptor transaction(old_fd);
+    if (transaction.Error()) return errno = transaction.Error(), nullptr;
+    auto fail_reopen = [&](int requested_error) -> FILE* {
+      // Even a destination rejected before the CRT reopen still closes the
+      // original stream. Use the already-held stream/descriptor transaction
+      // exactly once, including when flushing/closing itself reports an error.
+      gesher::stdio::Forget(stream);
+      int closed = _fclose_nolock(stream);
+      if (closed == 0 || gesher::HandleFromFd(old_fd) == INVALID_HANDLE_VALUE) {
+        retired.Retire(old_fd);
+      }
+      int metadata_error = transaction.Finish(closed == 0);
+      errno = metadata_error ? metadata_error : requested_error;
+      return nullptr;
+    };
+    int flags;
+    char crt_mode[4];
+    if (!ParseMode(mode, &flags, crt_mode)) {
+      return fail_reopen(EINVAL);
     }
-    int metadata_error = transaction.Finish(closed == 0);
-    errno = metadata_error ? metadata_error : requested_error;
-    return nullptr;
+    if (path == nullptr) return fail_reopen(EOPNOTSUPP);
+    std::wstring windows;
+    switch (path[0] != '\0' ? gesher::MapPath(path, &windows) : PathKind::kMissing) {
+      case PathKind::kFile:
+        break;
+      case PathKind::kNull:
+        windows = L"NUL";
+        break;
+      case PathKind::kMissing:
+        return fail_reopen(ENOENT);
+      default:
+        return fail_reopen(EACCES);
+    }
+    std::wstring wmode(crt_mode, crt_mode + strlen(crt_mode));
+    // Keep creation/inheritance decisions in the CRT's atomic open. Dropping
+    // 'x' here turns an exclusive reopen into a destructive truncation; an
+    // existence check before reopening would still race another creator.
+    if (mode[0] == 'w' && (flags & O_EXCL) != 0) wmode += L'x';
+    if ((flags & O_CLOEXEC) != 0) wmode += L'N';
+    FILE* result = _wfreopen(windows.c_str(), wmode.c_str(), stream);
+    int saved = result == nullptr ? gesher_errno_from_crt(errno) : errno;
+    if (result == nullptr && saved == ENOENT && HasNonDirectoryParent(windows)) saved = ENOTDIR;
+    // The CRT closes the original file on both success and failure. A successful
+    // reopen creates a new description; dup aliases must retain the old one.
+    retired.Retire(old_fd);
+    if (result == nullptr || result != stream) gesher::stdio::Forget(stream);
+    if (result != nullptr &&
+        (gesher::RegisterOfd(_fileno(result), flags | O_LARGEFILE) < 0 ||
+         gesher::stdio::PrepareReopenedStream(result, flags) < 0)) {
+      saved = errno;
+      const int failed_fd = _fileno(result);
+      gesher::stdio::Forget(result);
+      _fclose_nolock(result);
+      gesher::ForgetOfd(failed_fd);
+      result = nullptr;
+    }
+    if (result != nullptr && (flags & O_APPEND) != 0) lseek(_fileno(result), 0, SEEK_END);
+    int error = transaction.Finish(result != nullptr);
+    if (error) return errno = error, nullptr;
+    errno = saved;
+    return result;
   };
-  int flags;
-  char crt_mode[4];
-  if (!ParseMode(mode, &flags, crt_mode)) {
-    return fail_reopen(EINVAL);
-  }
-  if (path == nullptr) return fail_reopen(EOPNOTSUPP);
-  std::wstring windows;
-  switch (path[0] != '\0' ? gesher::MapPath(path, &windows) : PathKind::kMissing) {
-    case PathKind::kFile:
-      break;
-    case PathKind::kNull:
-      windows = L"NUL";
-      break;
-    case PathKind::kMissing:
-      return fail_reopen(ENOENT);
-    default:
-      return fail_reopen(EACCES);
-  }
-  std::wstring wmode(crt_mode, crt_mode + strlen(crt_mode));
-  // Keep creation/inheritance decisions in the CRT's atomic open. Dropping
-  // 'x' here turns an exclusive reopen into a destructive truncation; an
-  // existence check before reopening would still race another creator.
-  if (mode[0] == 'w' && (flags & O_EXCL) != 0) wmode += L'x';
-  if ((flags & O_CLOEXEC) != 0) wmode += L'N';
-  FILE* result = _wfreopen(windows.c_str(), wmode.c_str(), stream);
-  int saved = result == nullptr ? gesher_errno_from_crt(errno) : errno;
-  if (result == nullptr && saved == ENOENT && HasNonDirectoryParent(windows)) saved = ENOTDIR;
-  // The CRT closes the original file on both success and failure. A successful
-  // reopen creates a new description; dup aliases must retain the old one.
-  gesher::ForgetOfd(old_fd);
-  if (result == nullptr || result != stream) gesher::stdio::Forget(stream);
-  if (result != nullptr &&
-      (gesher::RegisterOfd(_fileno(result), flags | O_LARGEFILE) < 0 ||
-       gesher::stdio::PrepareReopenedStream(result, flags) < 0)) {
-    saved = errno;
-    const int failed_fd = _fileno(result);
-    gesher::stdio::Forget(result);
-    _fclose_nolock(result);
-    gesher::ForgetOfd(failed_fd);
-    result = nullptr;
-  }
-  if (result != nullptr && (flags & O_APPEND) != 0) lseek(_fileno(result), 0, SEEK_END);
-  int error = transaction.Finish(result != nullptr);
-  if (error) return errno = error, nullptr;
-  errno = saved;
-  return result;
+  return reopen();
 }
 
 FILE* freopen64(const char* path, const char* mode, FILE* stream) {

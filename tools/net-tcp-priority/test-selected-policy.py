@@ -1,6 +1,6 @@
 """Pure selected-consumer source/DAG preservation checks; no native execution."""
 from pathlib import Path
-import ast,hashlib,json,subprocess
+import ast,hashlib,json,subprocess,tempfile
 ROOT=Path(__file__).resolve().parents[2]
 BASE='657fb27a63c8171d540d6890ad47aa5fba5d26b2'
 # fd.cc gained reviewed nested-epoll readiness and waiter wakeups. Keep those
@@ -148,8 +148,49 @@ RECEIPT_SOURCE_BLOCK=b'''  if ($null -ne $SourceIdentity) {
     $Expected['head_repository_id'] = $SourceIdentity.head_repository_id
   }
 '''
+# This exact transition is applied in reverse to the current fd/system bytes,
+# then EVERY earlier preservation assertion below still runs on its result.
+# Coupled OFD/stdio/pipe source files are pinned by the same qualification.
+# No supplier, socket core, fixture predicate, deadline or DAG is exempted.
+OFD_QUALIFICATION_SHA256='aa6b33f2ef5783924243e984c67938374d077399900c79f6203c7edb79463484'
+def preceding_ofd_sources():
+ folder=ROOT/'tools/net-tcp-priority/qualified'
+ raw=(folder/'ofd-stream-source.json').read_bytes()
+ assert hashlib.sha256(raw).hexdigest()==OFD_QUALIFICATION_SHA256,'OFD source qualification changed'
+ qualification=json.loads(raw)
+ patch=(folder/'ofd-stream-source.patch').read_bytes()
+ assert hashlib.sha256(patch).hexdigest()==qualification['patch_sha256'],'OFD transition patch changed'
+ paths=['compat/posix/src/fd.cc','compat/posix/src/system.cc']
+ assert qualification['paths']==paths
+ assert [line.decode().split(' b/',1)[1] for line in patch.splitlines() if line.startswith(b'diff --git ')]==paths
+ for path,digest in qualification['source_sha256'].items():
+  assert hashlib.sha256((ROOT/path).read_bytes()).hexdigest()==digest,path
+ with tempfile.TemporaryDirectory(prefix='gesher-ofd-qualification-') as temporary:
+  work=Path(temporary)
+  for path in paths:
+   (work/path).parent.mkdir(parents=True,exist_ok=True)
+   (work/path).write_bytes((ROOT/path).read_bytes())
+  subprocess.run(['git','apply','--reverse','--unidiff-zero','--check','-'],input=patch,cwd=work,check=True,capture_output=True)
+  subprocess.run(['git','apply','--reverse','--unidiff-zero','-'],input=patch,cwd=work,check=True,capture_output=True)
+  previous={path:(work/path).read_bytes() for path in paths}
+ def function(source,marker):
+  assert source.count(marker)==1,marker
+  begin=source.index(marker);start=source.index(b'{',begin);depth=1;end=start+1
+  while depth:
+   assert end<len(source),marker
+   depth+=(source[end:end+1]==b'{')-(source[end:end+1]==b'}');end+=1
+  return source[begin:end]
+ # Independently retain socket ownership and actual native poll core bytes.
+ for path,markers in {
+   paths[0]:[b'bool Remove(',b'void Insert(',b'bool ReplaceSocket(',b'bool LookupSocket(',b'static int PollFdsImpl('],
+   paths[1]:[b'bool SocketIo('],
+ }.items():
+  current=(ROOT/path).read_bytes()
+  for marker in markers:assert function(current,marker)==function(previous[path],marker),(path,marker)
+ return previous
 def old(path):return subprocess.check_output(['git','-C',str(ROOT),'show',BASE+':'+path])
 def check():
+ preceding=preceding_ofd_sources()
  assert hashlib.sha256((ROOT/OWNER_THREAD_DIAGNOSTIC_PATH).read_bytes()).hexdigest()==OWNER_THREAD_DIAGNOSTIC_SHA256,OWNER_THREAD_DIAGNOSTIC_PATH
  paths=subprocess.check_output(['git','-C',str(ROOT),'diff','1745e99d7f2849ba81784545e07d60cb2b7800c3^','1745e99d7f2849ba81784545e07d60cb2b7800c3','--name-only'],text=True).splitlines()
  paths+=['.github/workflows/net-tcp-coherent-component.yml','tests/net-tcp-priority/contract.cc','tests/net-tcp-priority/native_udp_control.cc','tests/native2/net_udp_trunc.cpp','tests/native2/net_udp_fault_observer.c','tools/net-tcp-priority/qualified/TsfJobSupervisor.cs','tools/windows4/TsfJobSupervisor.cs','tools/windows4/TsfJobWorker.cs','tools/windows4/test-tsf-job-supervisor.ps1','tools/ci/receipt-diagnostics.ps1','tools/net-tcp-priority/import-policy.json','tools/net-tcp-priority/import_policy.py','tools/net-tcp-priority/build-guests.py','tools/net-tcp-priority/prepare-ndk.py']
@@ -159,7 +200,7 @@ def check():
          WINSOCK_BASE if path=='compat/posix/src/winsock.cc' else
          CONTROL_BASE if path=='tools/windows4/test-tsf-job-supervisor.ps1' else BASE)
   expected=subprocess.check_output(['git','-C',str(ROOT),'show',epoch+':'+path])
-  actual=(ROOT/path).read_bytes()
+  actual=preceding.get(path,(ROOT/path).read_bytes())
   if path=='compat/posix/src/winsock.cc':
    assert actual==expected and hashlib.sha256(actual).hexdigest()==WINSOCK_SHA256,path
    original=old(path)
@@ -231,5 +272,30 @@ def check():
  assert pin['ordered_patch_sha256']=={'minimum-detached-retirement.patch':'ebc5aac990c6ec075431d0c25a9b74ecadc0940da1bdad9503f358d4fe3431ad','minimum-noattach-join.patch':'c4f47903af720542a584fa743932316d86c45683da70a4c8620d7a71d3eb7f96'}
  for name,digest in pin['ordered_patch_sha256'].items():assert hashlib.sha256((ROOT/'tools/host-pthread-authority'/name).read_bytes()).hexdigest()==digest
  for path in ['tools/net-tcp-priority/manifest.py','tools/host-pthread-authority/minimum_receipt.py']:ast.parse((ROOT/path).read_text(encoding='utf-8'))
- print('TCP_SELECTED_POLICY_PASS original_product3 reviewed_nested_epoll_fd reviewed_device_lookup_only reviewed_sendmsg_control reviewed_statvfs_affinity_file_allocation_writev_and_memfd_only reviewed_fcntl_argument_selection_only canonical_Recv originalworkflow original_fixture_assertions_deadlines=EXACT reviewed_select_and_owner_thread_diagnostics_only controller_execution_tail original_import_NDK_build_roles=EXACT new_two_supplier_DAG=BOUNDED source12_patch2_exact native_processes_started=0')
-if __name__=='__main__':check()
+ print('TCP_SELECTED_POLICY_PASS exact_OFD_stdio_pipe_transition original_socket_ownership_and_native_poll=EXACT original_product3 reviewed_nested_epoll_fd reviewed_device_lookup_only reviewed_sendmsg_control reviewed_statvfs_affinity_file_allocation_writev_and_memfd_only reviewed_fcntl_argument_selection_only canonical_Recv originalworkflow original_fixture_assertions_deadlines=EXACT reviewed_select_and_owner_thread_diagnostics_only controller_execution_tail original_import_NDK_build_roles=EXACT new_two_supplier_DAG=BOUNDED source12_patch2_exact native_processes_started=0')
+def transition_negative_controls():
+ from unittest.mock import patch
+ original=Path.read_bytes
+ cases=[
+  ('compat/posix/src/fd.cc',b'--state->description->descriptor_refs == 0',b'--state->description->descriptor_refs == 1'),
+  ('compat/posix/src/fd.cc',b'return TransferPipe(snapshot->handle, bytes, count, false);',b'return 0;'),
+  ('compat/posix/src/system.cc',b'gesher::ws::RecvOwned(state.socket,',b'gesher::ws::SendOwned(state.socket,'),
+  ('compat/posix/src/pipe_io.cc',b'if (!count) return 0;',b'if (!count) return 1;'),
+  ('tools/net-tcp-priority/qualified/ofd-stream-source.patch',b'@@',b'@x'),
+ ]
+ for name,before,after in cases:
+  target=ROOT/name
+  assert before in original(target),name
+  def changed(path):
+   raw=original(path)
+   return raw.replace(before,after,1) if path==target else raw
+  rejected=False
+  with patch.object(Path,'read_bytes',changed):
+   try:check()
+   except (AssertionError,subprocess.CalledProcessError):rejected=True
+  assert rejected,'unqualified mutation accepted: '+name
+ print('TCP_SELECTED_TRANSITION_NEGATIVE_CONTROLS_PASS cases='+str(len(cases)))
+if __name__=='__main__':
+ import sys
+ check()
+ if '--selftest' in sys.argv:transition_negative_controls()

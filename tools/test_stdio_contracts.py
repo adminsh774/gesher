@@ -71,6 +71,7 @@ def main() -> int:
         include = folder / "include/gesher"
         include.mkdir(parents=True)
         (include / "stdio.h").write_bytes((ROOT / "compat/posix/include/gesher/stdio.h").read_bytes())
+        (include / "cancellation.h").write_bytes((ROOT / "compat/posix/include/gesher/cancellation.h").read_bytes())
         generated = folder / "adapter.cc"
         generated.write_text(template)
         cxx = shlex.split(args.cxx) + ["-std=c++17", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-fno-builtin", "-pthread"]

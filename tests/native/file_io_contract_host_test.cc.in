@@ -46,6 +46,11 @@ static int ReadDevice(Device kind, void* bytes, unsigned count) {
 static unsigned poll_wakes;
 static bool HasPollWaiters() { return true; }
 static void WakePollers() { ++poll_wakes; }
+// Declared pipe boundary for this regular-file corpus. The complete pipe
+// implementation is executed separately by test_pipe_io_contracts.py.
+static int TransferPipe(HANDLE handle, void* bytes, unsigned count, bool writing) {
+  return static_cast<int>(writing ? ::write(handle->fd, bytes, count) : ::read(handle->fd, bytes, count));
+}
 @SNAPSHOT_FILE_IO@
 }
 

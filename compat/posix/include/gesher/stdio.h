@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <memory>
+#include <gesher/cancellation.h>
 namespace gesher::stdio {
 class StreamGuard {
  public:
@@ -12,7 +13,9 @@ class StreamGuard {
   StreamGuard& operator=(const StreamGuard&) = delete;
   explicit operator bool() const { return token_ != nullptr; }
  private:
+  void Release();
   std::shared_ptr<void> token_;
+  CancellationCleanup cleanup_;
 };
 void Lock(FILE* stream);
 void Unlock(FILE* stream);

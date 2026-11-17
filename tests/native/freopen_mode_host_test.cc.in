@@ -49,6 +49,10 @@ int RegisterOfd(int fd, int flags) {
   ++ofd_registrations;
   return 0;
 }
+struct RetiredDescriptor {
+  void Retire(int fd) { ForgetOfd(fd); }
+  int Finish() { return 0; }
+};
 PathKind MapPath(const char* path, std::wstring* out) {
   *out = std::wstring(path, path + std::strlen(path));
   return PathKind::kFile;

@@ -57,6 +57,11 @@ static gesher::exec::Launch Target(const std::wstring& path, const wchar_t* mode
 
 int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--aware") == 0) return AwareChild();
+  if (argc == 2 && std::strcmp(argv[1], "--pipe-aware") == 0) {
+    if (fcntl(37, F_SETFL, O_NONBLOCK) < 0 || (fcntl(7100, F_GETFL) & O_NONBLOCK) == 0) return 24;
+    char byte;
+    return read(37, &byte, 1) == -1 && errno == EAGAIN ? 0 : 25;
+  }
   wchar_t image[32768];
   DWORD length = GetModuleFileNameW(nullptr, image, sizeof(image) / sizeof(image[0]));
   if (!length || length >= sizeof(image) / sizeof(image[0])) return 1;
@@ -104,7 +109,7 @@ int main(int argc, char** argv) {
   error = gesher::exec::SpawnWithFds(native_launch, nullptr, L"", files, &child);
   Check("start native PE without inherited handles", error == 0);
   Check("native child sees closed standard handles", error == 0 && WaitChild(&child));
-  int pipes[2];
+  int pipes[2] = {-1, -1};
   if (pipe2(pipes, O_CLOEXEC | O_NONBLOCK) == 0) {
     auto pipe = gesher::CaptureDescriptor(pipes[0]);
     Check("pin nonblocking pipe", static_cast<bool>(pipe));
@@ -114,6 +119,35 @@ int main(int argc, char** argv) {
     }
     files.clear(); pipe.reset(); close(pipes[0]); close(pipes[1]);
   } else Check("nonblocking pipe fixture", false);
+  int incoming[2] = {-1, -1}, outgoing[2] = {-1, -1};
+  Check("native peer pipes", pipe2(incoming, O_CLOEXEC) == 0 && pipe2(outgoing, O_CLOEXEC) == 0);
+  auto incoming_reader = gesher::CaptureDescriptor(incoming[0]);
+  auto outgoing_writer = gesher::CaptureDescriptor(outgoing[1]);
+  if (incoming_reader && outgoing_writer) {
+    files = {{37, incoming_reader->handle, incoming_reader}, {38, outgoing_writer->handle, outgoing_writer}};
+    error = gesher::exec::SpawnWithFds(Target(native, L"--pipe"), nullptr, L"", files, &child);
+    Check("ordinary UCRT peer starts with real directional pipes", error == 0);
+    Check("parent writes actual pipe input", write(incoming[1], "P", 1) == 1);
+    close(incoming[1]); incoming[1] = -1;
+    files.clear(); incoming_reader.reset(); outgoing_writer.reset();
+    close(incoming[0]); incoming[0] = -1;
+    close(outgoing[1]); outgoing[1] = -1;
+    Check("native UCRT read sees data and real last-writer EOF", error == 0 && WaitChild(&child));
+    char byte;
+    Check("native UCRT writer reaches parent and closes", read(outgoing[0], &byte, 1) == 1 && byte == 'N' && read(outgoing[0], &byte, 1) == 0);
+  } else Check("capture native peer endpoints", false);
+  files.clear(); incoming_reader.reset(); outgoing_writer.reset();
+  for (int descriptor : {incoming[0], incoming[1], outgoing[0], outgoing[1]}) if (descriptor >= 0) close(descriptor);
+  pipes[0] = pipes[1] = -1;
+  Check("aware child pipe fixture", pipe2(pipes, O_CLOEXEC) == 0);
+  auto shared_pipe = gesher::CaptureDescriptor(pipes[0]);
+  if (shared_pipe) {
+    files = {{37, shared_pipe->handle, shared_pipe}, {7100, shared_pipe->handle, shared_pipe}};
+    error = gesher::exec::SpawnWithFds(Target(self, L"--pipe-aware"), nullptr, L"", files, &child);
+    Check("aware child inherits the actual pipe description", error == 0 && WaitChild(&child));
+    Check("child pipe mode change reaches parent's native endpoint", (fcntl(pipes[0], F_GETFL) & O_NONBLOCK) != 0);
+  } else Check("capture aware child pipe", false);
+  files.clear(); shared_pipe.reset(); close(pipes[0]); close(pipes[1]);
   gesher::exec::Launch shell;
   Check("prepare the shell", gesher::exec::PrepareLaunch({"sh", "-c", "printf Y"}, "", &shell) == 0);
   Check("set append for raw shell output", fcntl(fd, F_SETFL, O_APPEND) == 0 && lseek(fd, 0, SEEK_SET) == 0);

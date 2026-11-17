@@ -1,0 +1,202 @@
+// Real Linux pipe/thread boundary for the exact production pipe operations.
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#include <time.h>
+#include <unistd.h>
+#include <vector>
+
+#define WINAPI
+using DWORD = uint32_t;
+using ULONG = uint32_t;
+using LONG = int32_t;
+using BOOL = int;
+using HMODULE = void*;
+struct Handle {
+  int fd = -1;
+  bool worker = false;
+  pthread_t thread{};
+  std::atomic<bool> done{false};
+  DWORD (*entry)(void*) = nullptr;
+  void* argument = nullptr;
+};
+using HANDLE = Handle*;
+struct IO_STATUS_BLOCK {};
+using PIO_STATUS_BLOCK = IO_STATUS_BLOCK*;
+enum FILE_INFORMATION_CLASS { FilePipeInformation, FilePipeLocalInformation };
+struct FILE_PIPE_LOCAL_INFORMATION { ULONG NamedPipeState, ReadDataAvailable, WriteQuotaAvailable; };
+constexpr DWORD ERROR_SUCCESS = 0, ERROR_BROKEN_PIPE = 109, ERROR_PIPE_NOT_CONNECTED = 233,
+    ERROR_NO_DATA = 232, ERROR_OPERATION_ABORTED = 995, ERROR_MORE_DATA = 234,
+    ERROR_NOACCESS = 998, ERROR_INVALID_USER_BUFFER = 1784;
+constexpr DWORD WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258, STACK_SIZE_PARAM_IS_A_RESERVATION = 0x10000;
+constexpr DWORD PIPE_READMODE_BYTE = 0, PIPE_WAIT = 0, PIPE_NOWAIT = 1;
+static thread_local DWORD last_error;
+static std::atomic<int> live_workers{0}, peak_workers{0};
+static void (*before_io)(HANDLE, bool);
+static DWORD GetLastError() { return last_error; }
+static DWORD MapError(int error, bool writing) {
+  return error == EAGAIN ? writing ? ERROR_SUCCESS : ERROR_NO_DATA :
+      error == EPIPE ? ERROR_BROKEN_PIPE : error == EINTR ? ERROR_OPERATION_ABORTED : error;
+}
+static BOOL ReadFile(HANDLE file, void* bytes, DWORD count, DWORD* done, void*) {
+  if (before_io) { auto hook = before_io; before_io = nullptr; hook(file, false); }
+  const ssize_t result = read(file->fd, bytes, count);
+  if (result < 0) { last_error = MapError(errno, false); return 0; }
+  *done = static_cast<DWORD>(result);
+  return 1;
+}
+static BOOL WriteFile(HANDLE file, const void* bytes, DWORD count, DWORD* done, void*) {
+  if (before_io) { auto hook = before_io; before_io = nullptr; hook(file, true); }
+  const ssize_t result = write(file->fd, bytes, count);
+  if (result < 0) {
+    last_error = MapError(errno, true);
+    *done = 0;
+    // Windows message-type NOWAIT reports a successful zero-byte write when
+    // the whole message cannot be admitted. Production must map it to EAGAIN.
+    return errno == EAGAIN;
+  }
+  *done = static_cast<DWORD>(result);
+  return 1;
+}
+static LONG Query(HANDLE file, PIO_STATUS_BLOCK, void* output, ULONG size, FILE_INFORMATION_CLASS kind) {
+  if (kind == FilePipeInformation) {
+    if (size != 2 * sizeof(ULONG)) std::abort();
+    const int flags = fcntl(file->fd, F_GETFL);
+    if (flags < 0) return -errno;
+    auto* values = static_cast<ULONG*>(output);
+    values[0] = 0;
+    values[1] = (flags & O_NONBLOCK) != 0;
+    return 0;
+  }
+  if (size != sizeof(FILE_PIPE_LOCAL_INFORMATION)) std::abort();
+  int used = 0;
+  const int capacity = fcntl(file->fd, F_GETPIPE_SZ);
+  if (capacity < 0 || ioctl(file->fd, FIONREAD, &used) < 0) return -errno;
+  pollfd descriptor{file->fd, POLLIN | POLLOUT, 0};
+  if (poll(&descriptor, 1, 0) < 0) return -errno;
+  *static_cast<FILE_PIPE_LOCAL_INFORMATION*>(output) = {
+      (descriptor.revents & (POLLERR | POLLHUP)) != 0 ? 4u : 3u,
+      static_cast<ULONG>(used), static_cast<ULONG>(capacity - used)};
+  return 0;
+}
+static ULONG Convert(LONG error) { return static_cast<ULONG>(-error); }
+static HMODULE GetModuleHandleW(const wchar_t*) { return reinterpret_cast<void*>(1); }
+static void* GetProcAddress(HMODULE, const char* name) {
+  return std::strcmp(name, "NtQueryInformationFile") == 0 ? reinterpret_cast<void*>(Query) : reinterpret_cast<void*>(Convert);
+}
+static BOOL SetNamedPipeHandleState(HANDLE file, DWORD* mode, void*, void*) {
+  const int flags = fcntl(file->fd, F_GETFL);
+  if (flags < 0 || fcntl(file->fd, F_SETFL, (*mode & PIPE_NOWAIT) ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) < 0) {
+    last_error = errno; return 0;
+  }
+  return 1;
+}
+static void* ThreadEntry(void* raw) {
+  auto* thread = static_cast<Handle*>(raw);
+  thread->entry(thread->argument);
+  thread->done.store(true);
+  return nullptr;
+}
+static HANDLE CreateThread(void*, size_t, DWORD (*entry)(void*), void* argument, DWORD flags, void*) {
+  if (flags != STACK_SIZE_PARAM_IS_A_RESERVATION) std::abort();
+  auto* thread = new Handle;
+  thread->worker = true; thread->entry = entry; thread->argument = argument;
+  const int count = ++live_workers;
+  int peak = peak_workers.load();
+  while (peak < count && !peak_workers.compare_exchange_weak(peak, count)) {}
+  const int result = pthread_create(&thread->thread, nullptr, ThreadEntry, thread);
+  if (result) { --live_workers; delete thread; last_error = result; return nullptr; }
+  return thread;
+}
+static DWORD WaitForSingleObject(HANDLE thread, DWORD milliseconds) {
+  if (!thread->worker) std::abort();
+  for (DWORD elapsed = 0; elapsed < milliseconds && !thread->done.load(); ++elapsed) {
+    timespec slice{0, 1000000}; nanosleep(&slice, nullptr);
+  }
+  return thread->done.load() ? WAIT_OBJECT_0 : WAIT_TIMEOUT;
+}
+static BOOL CancelSynchronousIo(HANDLE thread) { return pthread_kill(thread->thread, SIGUSR1) == 0; }
+static BOOL CloseHandle(HANDLE handle) {
+  if (handle->worker) {
+    if (!handle->done.load() || pthread_join(handle->thread, nullptr)) std::abort();
+    --live_workers; delete handle;
+  } else close(handle->fd);
+  return 1;
+}
+namespace gesher {
+static int ErrnoFromWin32(DWORD error) { return static_cast<int>(error); }
+static int FailWithLastError() { return errno = static_cast<int>(GetLastError()), -1; }
+}
+
+@PIPE_IMPLEMENTATION@
+
+static int checks, failures;
+static void Check(const char* name, bool ok) {
+  ++checks;
+  if (!ok) { ++failures; std::fprintf(stderr, "FAIL pipe: %s errno=%d\n", name, errno); }
+}
+static void EmptyBeforeRead(HANDLE file, bool writing) {
+  if (writing) std::abort();
+  char byte;
+  if (read(file->fd, &byte, 1) != 1) std::abort();
+}
+static void* BlockedRead(void* raw) {
+  char byte;
+  const int result = gesher::TransferPipe(static_cast<HANDLE>(raw), &byte, 1, false);
+  return reinterpret_cast<void*>(static_cast<intptr_t>(result));
+}
+int main() {
+  struct sigaction action{}; action.sa_handler = +[](int) {}; sigemptyset(&action.sa_mask);
+  sigaction(SIGUSR1, &action, nullptr);
+  signal(SIGPIPE, SIG_IGN);
+  int descriptors[2];
+  Check("real blocking pipe created", pipe(descriptors) == 0);
+  Handle reader, writer; reader.fd = descriptors[0]; writer.fd = descriptors[1];
+  Check("native endpoints start blocking", (fcntl(reader.fd, F_GETFL) & O_NONBLOCK) == 0);
+  Check("production setter changes kernel mode", gesher::SetPipeNonBlocking(&reader, true) == 0 && gesher::SetPipeNonBlocking(&writer, true) == 0);
+  Handle alias; alias.fd = dup(reader.fd);
+  Check("duplicate observes kernel mode", (gesher::PipeStatusFlags(&alias, O_RDONLY) & O_NONBLOCK) != 0);
+  Check("alias setter changes original", gesher::SetPipeNonBlocking(&alias, false) == 0 && (gesher::PipeStatusFlags(&reader, 0) & O_NONBLOCK) == 0);
+  Check("restore nonblocking mode", gesher::SetPipeNonBlocking(&reader, true) == 0);
+  char byte = 0;
+  Check("empty read returns EAGAIN", gesher::TransferPipe(&reader, &byte, 1, false) == -1 && errno == EAGAIN);
+  Check("write enters real pipe", gesher::TransferPipe(&writer, const_cast<char*>("q"), 1, true) == 1);
+  before_io = EmptyBeforeRead;
+  Check("competing reader cannot turn nonblocking read into wait", gesher::TransferPipe(&reader, &byte, 1, false) == -1 && errno == EAGAIN);
+  const int capacity = fcntl(writer.fd, F_GETPIPE_SZ);
+  std::vector<char> payload(static_cast<size_t>(capacity), 'p');
+  Check("fill actual kernel capacity", write(writer.fd, payload.data(), payload.size()) == capacity);
+  Check("full pipe write returns EAGAIN without reader progress", gesher::TransferPipe(&writer, payload.data(), 1, true) == -1 && errno == EAGAIN);
+  Check("full pipe is not writable", gesher::PollPipeHandle(&writer, O_WRONLY, POLLOUT) == 0);
+  Check("partial page drain", read(reader.fd, payload.data(), 1024) == 1024);
+  Check("PIPE_BUF transfer remains all-or-none", gesher::TransferPipe(&writer, payload.data(), 4096, true) == -1 && errno == EAGAIN);
+  int buffered = 0; ioctl(reader.fd, FIONREAD, &buffered);
+  Check("failed atomic write changed no bytes", buffered == capacity - 1024);
+  Check("drain remaining contents", read(reader.fd, payload.data(), payload.size()) == capacity - 1024);
+  Check("zero length read does not wait", gesher::TransferPipe(&reader, nullptr, 0, false) == 0);
+  Check("blocking mode restored for cancellation", gesher::SetPipeNonBlocking(&reader, false) == 0);
+  for (int iteration = 0; iteration != 32; ++iteration) {
+    pthread_t caller;
+    Check("blocking caller starts", pthread_create(&caller, nullptr, BlockedRead, &reader) == 0);
+    while (live_workers.load() == 0) { timespec slice{0, 1000000}; nanosleep(&slice, nullptr); }
+    Check("caller cancellation submitted", pthread_cancel(caller) == 0);
+    void* result = nullptr;
+    Check("cancellation joins both caller and I/O worker", pthread_join(caller, &result) == 0 && result == PTHREAD_CANCELED && live_workers.load() == 0);
+  }
+  Check("sequential operations retain no workers", live_workers.load() == 0 && peak_workers.load() == 1);
+  CloseHandle(&writer);
+  Check("real last writer closure produces EOF", gesher::TransferPipe(&reader, &byte, 1, false) == 0);
+  Check("empty closed read pipe reports HUP only", gesher::PollPipeHandle(&reader, O_RDONLY, POLLIN) == POLLHUP);
+  CloseHandle(&alias); CloseHandle(&reader);
+  std::printf("Production pipe I/O: %d checks, %d failures\n", checks, failures);
+  return failures ? 1 : 0;
+}

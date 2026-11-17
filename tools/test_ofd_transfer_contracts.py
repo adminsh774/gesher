@@ -56,7 +56,7 @@ def main():
         source.write_text(template)
         executable = folder / "ofd_transfer"
         command = shlex.split(args.cxx) + ["-std=c++20", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-            "-Wno-unused-function", "-fno-exceptions", "-D_GNU_SOURCE", "-pthread",
+            "-Wno-unused-function", "-fexceptions", "-D_GNU_SOURCE", "-pthread",
             str(source), "-o", str(executable)]
         if args.sanitize:
             command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]

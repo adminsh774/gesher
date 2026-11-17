@@ -86,8 +86,14 @@ PR68's pipe backend must route both descriptor I/O and
 - A complete gathered vector must reach one pipe operation, including the
   PIPE_BUF rule; no second loop may split it into independent writes.
 - `/proc/self/fd` reopening of pipe endpoints still uses the older dup path.
-  It needs a fresh description with the requested flags, or a truthful
-  unsupported result when the backend cannot provide that reopen.
+  Linux permits a fresh description with independently requested access and
+  status. An invented unsupported error would not repair that contract. This
+  remains a blocker until the actual same-buffer reopen is implemented.
+
+The subsequent [repair candidate](pr73-repair-candidate.md) supplies kernel
+message-pipe admission and explicit native differential gates. It is an
+intermediate candidate; the new Windows gates and independent reopening are
+not claimed complete by portable execution.
 
 The existing non-file virtual-resource implementations retain their own status
 logic; the transport explicitly refuses unsupported process export. This work

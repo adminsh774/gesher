@@ -22,6 +22,7 @@
 #include "binder_internal.h"
 #include "event_internal.h"
 #include "record_lock_descriptors.h"
+#include "pipe_io.h"
 
 namespace {
 
@@ -289,20 +290,7 @@ pid_t fork(void) { return errno = ENOSYS, -1; }
 
 int pipe2(int fds[2], int flags) {
   if ((flags & ~(O_CLOEXEC | O_NONBLOCK)) != 0) return errno = EINVAL, -1;
-  int mode = _O_BINARY | ((flags & O_CLOEXEC) != 0 ? _O_NOINHERIT : 0);
-  gesher::record_locks::DescriptorGuard descriptor_guard;
-  int res = gesher::CrtResult(_pipe(fds, 64 * 1024, mode));
-  if (res < 0) return -1;
-  if (gesher::RegisterOfd(fds[0], O_RDONLY | (flags & O_NONBLOCK)) < 0 ||
-      gesher::RegisterOfd(fds[1], O_WRONLY | (flags & O_NONBLOCK)) < 0) {
-    int saved = errno;
-    gesher::ForgetOfd(fds[0]);
-    gesher::ForgetOfd(fds[1]);
-    _close(fds[0]);
-    _close(fds[1]);
-    return errno = saved, -1;
-  }
-  return 0;
+  return gesher::CreatePipeDescriptors(fds, flags);
 }
 
 int pipe(int fds[2]) { return pipe2(fds, 0); }
