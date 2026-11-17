@@ -1,6 +1,7 @@
 // gesher: starting programs the way Linux's execvp would (exec_spawn.h).
 
 #include "exec_spawn.h"
+#include "pe_exports.h"
 
 #include <gesher/reserved_names.h>
 
@@ -54,6 +55,28 @@ int Probe(const std::wstring& path, std::string* head) {
   if (!ok) return kEACCES;
   head->assign(buf, got);
   return 0;
+}
+
+// Pin the selected image against replacement until CreateProcess has opened
+// it. Export inspection is a data mapping; no target code runs in this process.
+DWORD DescriptorTransportSupport(const std::wstring& path, bool* supported, HANDLE* image) {
+  *supported = false;
+  *image = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (*image == INVALID_HANDLE_VALUE) { *image = nullptr; return GetLastError(); }
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(*image, &size)) return GetLastError();
+  if (size.QuadPart <= 0 || static_cast<uint64_t>(size.QuadPart) > SIZE_MAX) return ERROR_BAD_EXE_FORMAT;
+  HANDLE mapping = CreateFileMappingW(*image, nullptr, PAGE_READONLY, 0, 0, nullptr);
+  if (!mapping) return GetLastError();
+  const void* bytes = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+  DWORD error = bytes ? ERROR_SUCCESS : GetLastError();
+  if (bytes) {
+    *supported = HasFileDescriptionImporter(bytes, static_cast<size_t>(size.QuadPart));
+    UnmapViewOfFile(bytes);
+  }
+  CloseHandle(mapping);
+  return error;
 }
 
 bool IsShName(const std::string& name) {
@@ -248,6 +271,9 @@ const char* ErrorText(int error) {
     case kEACCES: return "Permission denied";
     case kENOTDIR: return "Not a directory";
     case kENAMETOOLONG: return "File name too long";
+    case kEBADF: return "Bad file descriptor";
+    case kEINVAL: return "Invalid argument";
+    case kEOPNOTSUPP: return "Operation not supported";
     default: return "Unknown error";
   }
 }
@@ -276,6 +302,12 @@ int ErrnoFromWin32(DWORD error) {
       return kENOMEM;
     case ERROR_FILENAME_EXCED_RANGE:
       return kENAMETOOLONG;
+    case ERROR_INVALID_HANDLE:
+      return kEBADF;
+    case ERROR_INVALID_PARAMETER:
+      return kEINVAL;
+    case ERROR_NOT_SUPPORTED:
+      return kEOPNOTSUPP;
     default:
       return kEIO;
   }
@@ -445,6 +477,13 @@ bool IsToolName(const std::string& name) { return !ToolName(name).empty(); }
 
 DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::wstring& cwd,
                    const std::vector<ChildFd>& fds, PROCESS_INFORMATION* info, DWORD extra_flags) {
+  struct ImagePin {
+    HANDLE value = nullptr;
+    ~ImagePin() { if (value) CloseHandle(value); }
+  } image;
+  bool transport = false;
+  DWORD image_error = DescriptorTransportSupport(launch.application, &transport, &image.value);
+  if (image_error) return image_error;
   struct OwnedHandles {
     std::vector<HANDLE> values;
     ~OwnedHandles() { for (HANDLE handle : values) CloseHandle(handle); }
@@ -471,6 +510,10 @@ DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::
     if (!snapshot) return errno_error();
     if (snapshot->kind == gesher::DescriptorKind::kUnshareable) return ERROR_NOT_SUPPORTED;
     if (file.snapshot && file.handle != snapshot->handle) return ERROR_INVALID_PARAMETER;
+    if (!transport) {
+      if (file.fd >= 7000) return ERROR_NOT_SUPPORTED;
+      if (gesher::ValidateNativeFileDescription(snapshot) < 0) return errno_error();
+    }
     snapshots[static_cast<size_t>(file.fd)] = std::move(snapshot);
   }
   auto inheritable = [&](HANDLE source) -> HANDLE {
@@ -489,6 +532,7 @@ DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::
     HANDLE file = inheritable(snapshot->handle);
     if (!file) return GetLastError();
     by_fd[static_cast<size_t>(fd)] = file;
+    if (!transport) continue;
     HANDLE shared = gesher::ShareFileDescription(snapshot);
     if (!shared) return errno_error();
     HANDLE inherited_description = nullptr;
@@ -505,6 +549,7 @@ DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::
   }
   uint32_t closed_stdio = 0;
   for (int fd = 0; fd < 3; ++fd) {
+    if (!transport) break;
     if (by_fd[static_cast<size_t>(fd)]) continue;
     closed_stdio |= 1u << fd;
     // The CRT may need real standard handles during startup. The description
@@ -522,7 +567,7 @@ DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::
   const int crt_count = std::min(count, 7000);
   const size_t crt_size = sizeof(int) + static_cast<size_t>(crt_count) * (1 + sizeof(intptr_t));
   constexpr unsigned char kFopen = 0x01, kFpipe = 0x08, kFdev = 0x40;
-  std::vector<unsigned char> block(crt_size + sizeof(gesher::ofd_transfer::Startup), 0);
+  std::vector<unsigned char> block(crt_size + (transport ? sizeof(gesher::ofd_transfer::Startup) : 0), 0);
   std::memcpy(block.data(), &crt_count, sizeof(crt_count));
   for (int fd = 0; fd < crt_count; ++fd) {
     HANDLE file = by_fd[static_cast<size_t>(fd)];
@@ -537,52 +582,59 @@ DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::
     std::memcpy(block.data() + sizeof(int) + static_cast<size_t>(crt_count) +
                   static_cast<size_t>(fd) * sizeof(intptr_t), &value, sizeof(value));
   }
-  const size_t manifest_size = sizeof(gesher::ofd_transfer::Header) +
-                               entries.size() * sizeof(gesher::ofd_transfer::Entry);
-  SECURITY_ATTRIBUTES manifest_attributes{sizeof(manifest_attributes), nullptr, TRUE};
-  HANDLE manifest = CreateFileMappingW(INVALID_HANDLE_VALUE, &manifest_attributes, PAGE_READWRITE,
-                                       0, static_cast<DWORD>(manifest_size), nullptr);
-  if (!manifest) return GetLastError();
-  owned.values.push_back(manifest);
-  void* view = MapViewOfFile(manifest, FILE_MAP_WRITE, 0, 0, manifest_size);
-  if (!view) return GetLastError();
-  const gesher::ofd_transfer::Header header{gesher::ofd_transfer::kMagic,
-      gesher::ofd_transfer::kVersion, static_cast<uint32_t>(entries.size()), closed_stdio, 0};
-  std::memcpy(view, &header, sizeof(header));
-  if (!entries.empty()) std::memcpy(static_cast<unsigned char*>(view) + sizeof(header),
-                                    entries.data(), entries.size() * sizeof(entries[0]));
-  UnmapViewOfFile(view);
-  const gesher::ofd_transfer::Startup extension{gesher::ofd_transfer::kMagic,
-      reinterpret_cast<uintptr_t>(manifest), manifest_size};
-  std::memcpy(block.data() + crt_size, &extension, sizeof(extension));
+  if (transport) {
+    const size_t manifest_size = sizeof(gesher::ofd_transfer::Header) +
+                                 entries.size() * sizeof(gesher::ofd_transfer::Entry);
+    SECURITY_ATTRIBUTES manifest_attributes{sizeof(manifest_attributes), nullptr, TRUE};
+    HANDLE manifest = CreateFileMappingW(INVALID_HANDLE_VALUE, &manifest_attributes, PAGE_READWRITE,
+                                         0, static_cast<DWORD>(manifest_size), nullptr);
+    if (!manifest) return GetLastError();
+    owned.values.push_back(manifest);
+    void* view = MapViewOfFile(manifest, FILE_MAP_WRITE, 0, 0, manifest_size);
+    if (!view) return GetLastError();
+    const gesher::ofd_transfer::Header header{gesher::ofd_transfer::kMagic,
+        gesher::ofd_transfer::kVersion, static_cast<uint32_t>(entries.size()), closed_stdio, 0};
+    std::memcpy(view, &header, sizeof(header));
+    if (!entries.empty()) std::memcpy(static_cast<unsigned char*>(view) + sizeof(header),
+                                      entries.data(), entries.size() * sizeof(entries[0]));
+    UnmapViewOfFile(view);
+    const gesher::ofd_transfer::Startup extension{gesher::ofd_transfer::kMagic,
+        reinterpret_cast<uintptr_t>(manifest), manifest_size};
+    std::memcpy(block.data() + crt_size, &extension, sizeof(extension));
+  }
 
   SIZE_T bytes = 0;
-  InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
-  if (!bytes) return GetLastError();
+  if (!owned.values.empty()) {
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
+    if (!bytes) return GetLastError();
+  }
   std::vector<char> storage(bytes);
-  auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
-  if (!InitializeProcThreadAttributeList(attributes, 1, 0, &bytes)) return GetLastError();
-  if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                 owned.values.data(), owned.values.size() * sizeof(HANDLE), nullptr, nullptr)) {
-    DWORD error = GetLastError();
-    DeleteProcThreadAttributeList(attributes);
-    return error;
+  auto* attributes = bytes ? reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data()) : nullptr;
+  if (attributes) {
+    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &bytes)) return GetLastError();
+    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   owned.values.data(), owned.values.size() * sizeof(HANDLE), nullptr, nullptr)) {
+      DWORD error = GetLastError();
+      DeleteProcThreadAttributeList(attributes);
+      return error;
+    }
   }
   STARTUPINFOEXW startup{};
-  startup.StartupInfo.cb = sizeof(startup);
+  startup.StartupInfo.cb = attributes ? sizeof(startup) : sizeof(startup.StartupInfo);
   startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-  startup.StartupInfo.hStdInput = by_fd[0];
-  startup.StartupInfo.hStdOutput = by_fd[1];
-  startup.StartupInfo.hStdError = by_fd[2];
+  startup.StartupInfo.hStdInput = by_fd[0] ? by_fd[0] : INVALID_HANDLE_VALUE;
+  startup.StartupInfo.hStdOutput = by_fd[1] ? by_fd[1] : INVALID_HANDLE_VALUE;
+  startup.StartupInfo.hStdError = by_fd[2] ? by_fd[2] : INVALID_HANDLE_VALUE;
   startup.StartupInfo.cbReserved2 = static_cast<WORD>(block.size());
   startup.StartupInfo.lpReserved2 = block.data();
   startup.lpAttributeList = attributes;
   std::wstring command_line = launch.command_line;
-  DWORD flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | extra_flags;
-  BOOL started = CreateProcessW(launch.application.c_str(), command_line.data(), nullptr, nullptr, TRUE,
+  DWORD flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | extra_flags;
+  if (attributes) flags |= EXTENDED_STARTUPINFO_PRESENT;
+  BOOL started = CreateProcessW(launch.application.c_str(), command_line.data(), nullptr, nullptr, attributes ? TRUE : FALSE,
       flags, const_cast<wchar_t*>(environment), cwd.empty() ? nullptr : cwd.c_str(), &startup.StartupInfo, info);
   DWORD error = started ? ERROR_SUCCESS : GetLastError();
-  DeleteProcThreadAttributeList(attributes);
+  if (attributes) DeleteProcThreadAttributeList(attributes);
   return error;
 }
 

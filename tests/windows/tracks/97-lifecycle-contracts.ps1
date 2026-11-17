@@ -25,6 +25,10 @@ foreach ($fixture in @(
      Label = 'actual timer backend, alias ownership and descriptor reuse' },
   @{ Exe = 'file_flags_ofd_test.exe'; Markers = @('file_flags_ofd_test:', ' assertions, 0 failures');
      Label = 'file status flags, OFD sharing across dup, and independent FD_CLOEXEC' },
+  @{ Exe = 'stdio_ofd_test.exe'; Markers = @('stdio OFD contracts:', ' checks, 0 failures');
+     Label = 'shared stdio buffers, append flags, descriptor ownership and concurrent close' },
+  @{ Exe = 'ofd_spawn_test.exe'; Markers = @('OFD Windows spawn:', ' checks, 0 failures');
+     Label = 'actual importer discovery, shared file descriptions and native PE interoperability' },
   @{ Exe = 'media_input_surface_callback_test.exe'; Markers = @('input surface callback contracts:', ' checks, 0 failures');
      Label = 'actual QueueSurface callback admission and quiescent retirement' }
 )) {
@@ -34,4 +38,19 @@ foreach ($fixture in @(
     $global:LASTEXITCODE = $lifecycleCode
     $lifecycleOut
   } $fixture.Markers
+}
+
+$stdioExitPath = Join-Path ([IO.Path]::GetTempPath()) "gesher-stdio-exit-$PID.txt"
+try {
+  $stdioExitOut = RunTimed "$Dir/stdio_ofd_test.exe" @('--exit-output', $stdioExitPath) 30
+  $stdioExitCode = $LASTEXITCODE
+  Check 'stdio: flush after application exit handlers' {
+    $global:LASTEXITCODE = $stdioExitCode
+    $stdioExitOut
+    if ((Test-Path $stdioExitPath) -and [IO.File]::ReadAllText($stdioExitPath) -eq 'earlylate') {
+      'stdio exit-handler output: earlylate'
+    }
+  } @('stdio exit-handler output: earlylate')
+} finally {
+  Remove-Item $stdioExitPath -Force -ErrorAction SilentlyContinue
 }

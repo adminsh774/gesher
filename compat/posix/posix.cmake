@@ -41,6 +41,7 @@ add_library(gesher_posix STATIC
   ${CMAKE_CURRENT_LIST_DIR}/src/sleep.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/socket.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/stat.cc
+  ${CMAKE_CURRENT_LIST_DIR}/src/stdio_output.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/syscall.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/sysv_shims.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/system.cc
@@ -81,6 +82,10 @@ target_link_options(gesher_posix INTERFACE -Wl,-u,gesher_futex_owner_anchor_v1)
 # child's shared descriptions before application code can recycle its fds.
 target_link_options(gesher_posix INTERFACE -Wl,-u,gesher_ofd_owner_anchor_v1)
 target_link_options(gesher_posix INTERFACE -Wl,-u,gesher_descriptor_transaction_anchor_v1)
+target_link_options(gesher_posix INTERFACE -Wl,-u,gesher_stdio_output_anchor_v1)
+# GNU scanf's parser uses public getc/ungetc; retain one stream lock around
+# its complete conversion sequence, including ANSI-mode assembly aliases.
+target_link_options(gesher_posix INTERFACE -Wl,--wrap=__mingw_vfscanf -Wl,--wrap=__mingw_vfwscanf)
 # posix_memalign() memory goes to free()/realloc() (src/memalign.cc).
 target_link_options(gesher_posix INTERFACE -Wl,--wrap=free -Wl,--wrap=realloc)
 target_include_directories(gesher_posix BEFORE PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
@@ -96,4 +101,8 @@ set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/binder.cc PROPERTIES
 # Only detached alias bookkeeping may throw; same pinned STL/CRT/allocator ABI.
 # Actual compile_commands effective ordering and throwing runtime require CI proof.
 set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/mman_alias_prepare.cc PROPERTIES
+  COMPILE_OPTIONS "-fexceptions")
+# Stream/map allocation failures are reported as ENOMEM before fdopen takes
+# descriptor ownership. Exceptions do not cross the stdio ABI boundary.
+set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/stdio_output.cc PROPERTIES
   COMPILE_OPTIONS "-fexceptions")

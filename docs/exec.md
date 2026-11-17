@@ -90,6 +90,13 @@ gesher-base's signal mailbox (`compat/bionic/process_bionic.cc`):
   with `F_SETFL` in a child or descendant reach the parent's aliases. A pinned
   startup manifest preserves the full descriptor range and avoids fd reuse
   between capture and launch. File actions precede the final `FD_CLOEXEC` pass.
+  This transport is used only when the target PE exports the runtime importer;
+  detection reads its export table without loading target code. Ordinary
+  Windows programs receive native handles and a CRT descriptor block. Logical
+  devices, emulated append/nonblocking-pipe status and descriptors above that
+  block's limit fail with `EOPNOTSUPP` instead of silently changing behavior.
+  A native program does not participate in Gesher's later shared `F_SETFL`
+  protocol. Closed standard descriptors are not replaced with NUL for it.
 - **`exec*()` outside a fork** spawns the program with this process's fds,
   environment and working directory, waits and exits with its status (the pid
   changes).

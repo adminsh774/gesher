@@ -4,7 +4,12 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/uio.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 static void test_dup3_contracts(void) {
   char source_path[] = "gesher-dup3-source-XXXXXX";
@@ -136,8 +141,61 @@ static void test_file_status_option_contracts(void) {
   unlink(path);
 }
 
+static void test_vector_append_contracts(void) {
+  char path[] = "gesher-ofd-vector-XXXXXX";
+  int fd = mkstemp(path);
+  check("vector append fixture opens", fd >= 0);
+  if (fd < 0) return;
+  check("vector append initial bytes and offset", write(fd, "base", 4) == 4 && lseek(fd, 1, SEEK_SET) == 1);
+  int alias = dup(fd);
+  check("vector append uses a shared description", alias >= 0 && fcntl(alias, F_SETFL, O_APPEND) == 0);
+  char a = 'A', b = 'B', c = 'C', d = 'D';
+  struct iovec ordinary[] = {{&a, 1}, {NULL, 0}, {&b, 1}};
+  struct iovec positioned[] = {{&c, 1}, {&d, 1}};
+  check("writev appends its complete vector", writev(fd, ordinary, 3) == 2 && lseek(alias, 0, SEEK_CUR) == 6);
+  check("pwritev appends despite its explicit offset", pwritev(alias, positioned, 2, 0) == 2);
+  check("positioned vector leaves the shared cursor unchanged", lseek(fd, 0, SEEK_CUR) == 6);
+  char actual[8];
+  check("scalar and vector appends retain all original bytes", pread(fd, actual, sizeof(actual), 0) == 8 &&
+      memcmp(actual, "baseABCD", 8) == 0);
+  check("clear append through a vector alias", fcntl(alias, F_SETFL, 0) == 0);
+  c = '1'; d = '2';
+  check("cleared append restores positioned-vector offsets", pwritev(fd, positioned, 2, 1) == 2 &&
+      pread(fd, actual, sizeof(actual), 0) == 8 && memcmp(actual, "b12eABCD", 8) == 0);
+  check("positioned vector still retains the ordinary cursor", lseek(alias, 0, SEEK_CUR) == 6);
+  check("empty file vector does not change the cursor", writev(fd, NULL, 0) == 0 && lseek(fd, 0, SEEK_CUR) == 6);
+  if (alias >= 0) close(alias);
+  close(fd); unlink(path);
+}
+
+static void test_procfs_description_access(void) {
+  int fd = open("/proc/self/comm", O_RDONLY | O_CLOEXEC);
+  check("procfs descriptor fixture opens", fd >= 0);
+  if (fd < 0) return;
+  check("procfs records read-only access and descriptor inheritance", (fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY &&
+      fcntl(fd, F_GETFD) == FD_CLOEXEC);
+  char byte;
+  check("procfs descriptor supplies real content", read(fd, &byte, 1) == 1);
+  errno = 0;
+  check("procfs read-only descriptor rejects writes", write(fd, "x", 1) == -1 && errno == EBADF);
+#ifdef _WIN32
+  check("procfs kernel handle also has no write access", _write(fd, "x", 1) == -1);
+#endif
+  check("failed procfs write retains the cursor", lseek(fd, 0, SEEK_CUR) == 1);
+  close(fd);
+  fd = open("/proc/self/comm", O_PATH);
+  check("procfs path-only descriptor has no data access", fd >= 0 && fcntl(fd, F_GETFL) == O_PATH);
+  if (fd >= 0) {
+    errno = 0;
+    check("procfs path-only descriptor rejects input", read(fd, &byte, 1) == -1 && errno == EBADF);
+    close(fd);
+  }
+}
+
 static void test_file_description_contracts(void) {
   test_dup3_contracts();
   test_stream_description_contracts();
   test_file_status_option_contracts();
+  test_vector_append_contracts();
+  test_procfs_description_access();
 }

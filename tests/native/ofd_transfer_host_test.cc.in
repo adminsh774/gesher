@@ -26,6 +26,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "@PE_EXPORTS_HEADER@"
 
 #define WINAPI
 #define CALLBACK
@@ -61,6 +62,7 @@ constexpr DWORD PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002, STARTF_USESTDHANDLE
 constexpr DWORD CREATE_UNICODE_ENVIRONMENT = 0x400, EXTENDED_STARTUPINFO_PRESENT = 0x80000,
     CREATE_NO_WINDOW = 0x8000000;
 constexpr int _O_BINARY = 0x8000;
+constexpr int _O_NOINHERIT = 0x0080;
 struct SECURITY_ATTRIBUTES { DWORD length; void* security; BOOL inherit; };
 struct IO_STATUS_BLOCK { uintptr_t unused[2]; };
 using PIO_STATUS_BLOCK = IO_STATUS_BLOCK*;
@@ -91,7 +93,10 @@ static uint64_t next_identity = 1;
 static thread_local DWORD error;
 static int duplicate_fail_after = -1, map_error, handle_information_error;
 static int create_process_error;
+static bool image_transport = true;
 static size_t last_inherited_handles;
+static WORD last_startup_bytes;
+static bool last_closed_stdio;
 static std::vector<unsigned char> startup;
 static std::array<HANDLE, 3> std_handles{};
 static HANDLE Handle(int fd) { return reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd) + 1); }
@@ -359,6 +364,13 @@ static FARPROC GetProcAddress(HMODULE module, const char* name) {
 namespace gesher::exec {
 struct Launch { std::wstring application, command_line; };
 struct ChildFd { int fd; HANDLE handle; gesher::DescriptorSnapshotPtr snapshot{}; };
+static DWORD DescriptorTransportSupport(const std::wstring& path, bool* supported, HANDLE* image) {
+  int fd = host::Own(open(host::Narrow(path.c_str()).c_str(), O_RDONLY | O_CLOEXEC));
+  if (fd < 0) return GetLastError();
+  *image = host::Handle(fd);
+  *supported = host::image_transport;  // PE export decoding is tested separately below.
+  return 0;
+}
 DWORD SpawnWithFds(const Launch&, const wchar_t*, const std::wstring&,
                    const std::vector<ChildFd>&, PROCESS_INFORMATION*, DWORD extra_flags = 0);
 @SPAWN_IMPLEMENTATION@
@@ -367,16 +379,21 @@ DWORD SpawnWithFds(const Launch&, const wchar_t*, const std::wstring&,
 static BOOL CreateProcessW(const wchar_t* app, wchar_t* command, void*, void*, BOOL inherit,
                            DWORD flags, void* environment, const wchar_t* cwd,
                            STARTUPINFOW* raw_startup, PROCESS_INFORMATION* info) {
-  host::Require(inherit && !environment && !cwd &&
-      flags == (CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW));
+  host::Require(!environment && !cwd &&
+      (flags & ~EXTENDED_STARTUPINFO_PRESENT) == (CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW));
   auto* startup = reinterpret_cast<STARTUPINFOEXW*>(raw_startup);
-  host::Require(raw_startup->cb == sizeof(*startup) && raw_startup->dwFlags == STARTF_USESTDHANDLES);
-  host::last_inherited_handles = startup->lpAttributeList->count;
+  const bool extended = (flags & EXTENDED_STARTUPINFO_PRESENT) != 0;
+  host::Require(inherit == extended && raw_startup->cb == (extended ? sizeof(*startup) : sizeof(*raw_startup)) &&
+      raw_startup->dwFlags == STARTF_USESTDHANDLES && extended == (startup->lpAttributeList != nullptr));
+  host::last_inherited_handles = extended ? startup->lpAttributeList->count : 0;
+  host::last_startup_bytes = raw_startup->cbReserved2;
+  host::last_closed_stdio = raw_startup->hStdInput == INVALID_HANDLE_VALUE &&
+      raw_startup->hStdOutput == INVALID_HANDLE_VALUE && raw_startup->hStdError == INVALID_HANDLE_VALUE;
   if (host::create_process_error) { SetLastError(host::create_process_error); return FALSE; }
   int transport = host::Own(static_cast<int>(syscall(SYS_memfd_create, "gesher-startup-test", MFD_CLOEXEC)));
   host::Require(transport >= 0 && write(transport, raw_startup->lpReserved2, raw_startup->cbReserved2) == raw_startup->cbReserved2);
   std::set<int> child_handles{transport};
-  for (size_t index = 0; index < startup->lpAttributeList->count; ++index) {
+  for (size_t index = 0; index < host::last_inherited_handles; ++index) {
     int fd = host::Native(startup->lpAttributeList->handles[index]);
     host::Require(fcntl(fd, F_GETFD) >= 0 && child_handles.insert(fd).second);
   }
@@ -435,6 +452,10 @@ static bool Byte(int slot, bool writing, char value = 0) {
   return result == 1 && (writing || actual == value);
 }
 static bool Child(int mode) {
+  if (mode == 2 || mode == 3) {
+    if (_get_osfhandle(0) != -1 || _get_osfhandle(1) != -1 || _get_osfhandle(2) != -1) return false;
+    return mode == 3 ? _get_osfhandle(37) == -1 : gesher::GetFileStatusFlags(37) == (O_RDWR | O_LARGEFILE);
+  }
   if (mode == 1) {
     // These are all imported by exact production ImportStartup, not by test
     // assignments. The 7100 slot lies beyond the ordinary UCRT startup block.
@@ -454,8 +475,35 @@ static bool Child(int mode) {
   return false;
 }
 
+static void PeCapabilities() {
+  // Ordinary PE32+/PE32 export layouts: the marker must be an actual export
+  // of this executable, not a forwarding export from another image.
+  std::vector<unsigned char> image(1536);
+  auto put = [&](size_t offset, uint32_t value, size_t bytes = 4) {
+    std::memcpy(image.data() + offset, &value, bytes);
+  };
+  put(0, 0x5a4d, 2); put(60, 128); put(128, 0x4550);
+  put(134, 1, 2); put(148, 240, 2); put(152, 0x20b, 2);
+  put(212, 512); put(260, 16); put(264, 0x1000); put(268, 256);
+  put(404, 0x1000); put(408, 1024); put(412, 512);
+  put(532, 1); put(536, 1); put(540, 0x1040); put(544, 0x1044); put(548, 0x1048);
+  put(576, 0x1200); put(580, 0x1080); put(584, 0, 2);
+  constexpr char marker[] = "gesher_ofd_owner_v1";
+  std::memcpy(image.data() + 640, marker, sizeof(marker));
+  Check("PE32+ executable advertises its importer", gesher::exec::HasFileDescriptionImporter(image.data(), image.size()));
+  image[640] = 'x';
+  Check("ordinary PE without the importer stays native", !gesher::exec::HasFileDescriptionImporter(image.data(), image.size()));
+  image[640] = marker[0]; put(576, 0x1098);
+  Check("forwarding export does not install an importer", !gesher::exec::HasFileDescriptionImporter(image.data(), image.size()));
+  put(576, 0x1200); put(152, 0x10b, 2); put(244, 16); put(248, 0x1000); put(252, 256);
+  Check("PE32 export layout is recognized", gesher::exec::HasFileDescriptionImporter(image.data(), image.size()));
+  put(248, 0);
+  Check("PE with no exports has no importer", !gesher::exec::HasFileDescriptionImporter(image.data(), image.size()));
+}
+
 int main(int argc, char** argv) {
   if (argc == 3 && std::strcmp(argv[1], "--child") == 0) return Child(std::atoi(argv[2])) ? 0 : 29;
+  PeCapabilities();
   Check("open source fixture", OpenFixture("source", 37) == 37);
   Check("ordinary source bytes and offset", write(NativeFd(37), "seed", 4) == 4 && lseek(NativeFd(37), 2, SEEK_SET) == 2);
   Check("open independent description", OpenFixture("source", 39, O_RDWR) == 39);
@@ -474,6 +522,16 @@ int main(int argc, char** argv) {
   auto raw = gesher::CaptureFileHandle(snapshot->handle);
   Check("raw duplicate resolves same registered description", raw && raw->description == snapshot->description);
   raw.reset();
+  int attached = gesher::AttachFileDescription(snapshot, false);
+  Check("raw snapshot attaches as a new descriptor", attached >= 0 && attached != 37);
+  auto attached_snapshot = gesher::CaptureDescriptor(attached);
+  Check("attached descriptor retains shared status and independent descriptor flags",
+      attached_snapshot && attached_snapshot->description == snapshot->description && attached_snapshot->descriptor_flags == 0);
+  Check("attached alias can change the original status", gesher::SetFileStatusFlags(attached, O_NONBLOCK) == 0 &&
+      (gesher::GetFileStatusFlags(37) & O_NONBLOCK) != 0);
+  Check("attached alias closes without retiring its source", CloseFixture(attached) == 0 &&
+      gesher::SetFileStatusFlags(37, 0) == 0);
+  attached_snapshot.reset();
   host::map_error = ERROR_NOT_ENOUGH_MEMORY;
   Check("promotion failure preserves local status", !gesher::ShareFileDescription(snapshot) && errno == ENOMEM &&
       gesher::GetFileStatusFlags(37) == (O_RDWR | O_LARGEFILE));
@@ -519,6 +577,47 @@ int main(int argc, char** argv) {
   std::vector<gesher::exec::ChildFd> bad{{50, private_resource->handle, private_resource}};
   Check("unshareable resource is never exported as NUL", gesher::exec::SpawnWithFds(launch, nullptr, L"", bad, &info, 0) == ERROR_NOT_SUPPORTED);
   bad.clear(); private_resource.reset();
+  host::image_transport = false;
+  auto zero = gesher::CaptureDescriptor(42);
+  bad = {{42, zero->handle, zero}};
+  Check("native PE cannot inherit a logical zero device as NUL",
+      gesher::exec::SpawnWithFds(launch, nullptr, L"", bad, &info, 0) == ERROR_NOT_SUPPORTED);
+  zero.reset();
+  bad = {{7100, snapshot->handle, snapshot}};
+  Check("native PE rejects an unrepresentable high descriptor",
+      gesher::exec::SpawnWithFds(launch, nullptr, L"", bad, &info, 0) == ERROR_NOT_SUPPORTED);
+  bad = {{37, snapshot->handle, snapshot}};
+  Check("native PE rejects emulated append",
+      gesher::SetFileStatusFlags(37, O_APPEND) == 0 &&
+      gesher::exec::SpawnWithFds(launch, nullptr, L"", bad, &info, 0) == ERROR_NOT_SUPPORTED);
+  Check("native rejection preserves mutable status", (gesher::GetFileStatusFlags(38) & O_APPEND) != 0 &&
+      gesher::SetFileStatusFlags(37, 0) == 0);
+  auto nonblocking = gesher::CaptureDescriptor(40);
+  bad = {{40, nonblocking->handle, nonblocking}};
+  Check("native PE rejects emulated nonblocking pipe status",
+      gesher::SetFileStatusFlags(40, O_NONBLOCK) == 0 &&
+      gesher::exec::SpawnWithFds(launch, nullptr, L"", bad, &info, 0) == ERROR_NOT_SUPPORTED);
+  Check("restore pipe status after native refusal", gesher::SetFileStatusFlags(40, 0) == 0);
+  bad = {{37, snapshot->handle, snapshot}};
+  nonblocking.reset();
+  gesher::exec::Launch native_launch{launch.application, L"--child 2"};
+  Check("native PE receives ordinary file handles", gesher::exec::SpawnWithFds(native_launch, nullptr, L"", bad, &info, 0) == 0);
+  Check("native PE receives no private mappings or NUL placeholders",
+      host::last_inherited_handles == 1 && host::last_closed_stdio &&
+      host::last_startup_bytes == sizeof(int) + 38 * (1 + sizeof(intptr_t)));
+  int native_status = -1;
+  Check("native file child observes the requested descriptor table",
+      waitpid(static_cast<pid_t>(info.dwProcessId), &native_status, 0) == static_cast<pid_t>(info.dwProcessId) &&
+      WIFEXITED(native_status) && WEXITSTATUS(native_status) == 0);
+  bad.clear(); native_launch.command_line = L"--child 3";
+  Check("native PE with no descriptors starts without inheriting handles",
+      gesher::exec::SpawnWithFds(native_launch, nullptr, L"", bad, &info, 0) == 0 &&
+      host::last_inherited_handles == 0 && host::last_closed_stdio);
+  Check("native child sees standard descriptors closed",
+      waitpid(static_cast<pid_t>(info.dwProcessId), &native_status, 0) == static_cast<pid_t>(info.dwProcessId) &&
+      WIFEXITED(native_status) && WEXITSTATUS(native_status) == 0);
+  Check("native spawn paths release temporary handles", host::owned.size() == before_failure);
+  host::image_transport = true;
   Check("launch real child through production transport", gesher::exec::SpawnWithFds(launch, nullptr, L"", fds, &info, 0) == 0);
   // 7 file handles + 5 descriptions + 3 closed stdio placeholders + manifest.
   Check("alias mapping handles are deduplicated", host::last_inherited_handles == 16);

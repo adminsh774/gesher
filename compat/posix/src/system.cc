@@ -26,7 +26,11 @@
 #include <unistd.h>
 #include <windows.h>
 #include <psapi.h>
+#include <gesher/file_description.h>
 
+#include <array>
+#include <memory>
+#include <new>
 #include <string>
 #include <limits>
 #include <vector>
@@ -582,6 +586,72 @@ bool BadVector(int fd, int iovcnt) {
   return false;
 }
 
+struct FileVectorTransfer {
+  gesher::DescriptorSnapshotPtr snapshot;
+  std::unique_ptr<unsigned char[]> allocated;
+  unsigned char small[4096];
+};
+void ReleaseCanceledFileVector(void* raw) {
+  auto* state = static_cast<FileVectorTransfer*>(raw);
+  state->snapshot.reset();
+  state->allocated.reset();
+}
+
+bool FileWriteVector(int fd, const iovec* iov, int iovcnt, bool positioned,
+                     off_t offset, ssize_t* result) {
+  pthread_testcancel();
+  FileVectorTransfer state;
+  {
+    gesher::record_locks::DescriptorGuard guard;
+    HANDLE handle = gesher::HandleFromFd(fd);
+    if (handle == INVALID_HANDLE_VALUE) { *result = -1; errno = EBADF; return true; }
+    const DWORD type = GetFileType(handle);
+    if (type != FILE_TYPE_DISK && type != FILE_TYPE_PIPE) return false;
+    state.snapshot = gesher::CaptureDescriptor(fd);
+  }
+  if (!state.snapshot) { *result = -1; return true; }
+  std::array<iovec, IOV_MAX> copied{};
+  if (!gesher::ws::CopyFromUser(copied.data(), iov, static_cast<size_t>(iovcnt) * sizeof(iovec))) {
+    *result = -1; errno = EFAULT; return true;
+  }
+  // A file or pipe writev is one write, including append placement and the
+  // PIPE_BUF guarantee. The native ordinary-file API accepts one span, so
+  // gather multiple nonempty spans before submitting the single operation.
+  // A single span has no copy or allocation; small vectors use stack storage.
+  constexpr size_t maximum = 0x7ffff000;
+  size_t total = 0, requested = 0, spans = 0;
+  const void* single = nullptr;
+  for (int i = 0; i < iovcnt; ++i) {
+    if (copied[i].iov_len > static_cast<size_t>(std::numeric_limits<ssize_t>::max()) - requested) {
+      *result = -1; errno = EINVAL; return true;
+    }
+    requested += copied[i].iov_len;
+    copied[i].iov_len = std::min(copied[i].iov_len, maximum - total);
+    total += copied[i].iov_len;
+    if (copied[i].iov_len) { ++spans; single = copied[i].iov_base; }
+  }
+  const void* data = single;
+  if (spans > 1) {
+    if (total > sizeof(state.small)) {
+      state.allocated.reset(new (std::nothrow) unsigned char[total]);
+      if (!state.allocated) { *result = -1; errno = ENOMEM; return true; }
+    }
+    unsigned char* to = state.allocated ? state.allocated.get() : state.small;
+    data = to;
+    for (int i = 0; i < iovcnt; ++i) {
+      if (!gesher::ws::CopyFromUser(to, copied[i].iov_base, copied[i].iov_len)) {
+        *result = -1; errno = EFAULT; return true;
+      }
+      to += copied[i].iov_len;
+    }
+  }
+  pthread_cleanup_push(ReleaseCanceledFileVector, &state);
+  *result = positioned ? gesher::WriteFileDescriptionAt(state.snapshot, data, static_cast<unsigned>(total), offset)
+                       : gesher::WriteFileDescription(state.snapshot, data, static_cast<unsigned>(total));
+  pthread_cleanup_pop(0);
+  return true;
+}
+
 }  // namespace
 
 ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
@@ -600,6 +670,8 @@ ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
 ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
   if (BadVector(fd, iovcnt)) return -1;
   if (int error = gesher::EventObjectWriteError(fd)) return errno = error, -1;
+  ssize_t transferred = 0;
+  if (FileWriteVector(fd, iov, iovcnt, false, 0, &transferred)) return transferred;
   // A zero-total vector performs no device operation (eventfd rejects a
   // zero-byte scalar write). Preserve each vector boundary otherwise: Linux's
   // legacy .write fallback, including eventfd, writes one element at a time.
@@ -651,6 +723,7 @@ ssize_t preadv(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
 ssize_t pwritev(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
   if (BadVector(fd, iovcnt)) return -1;
   ssize_t total = 0;
+  if (FileWriteVector(fd, iov, iovcnt, true, offset, &total)) return total;
   for (int i = 0; i < iovcnt; ++i) {
     ssize_t n = pwrite(fd, iov[i].iov_base, iov[i].iov_len, offset + total);
     if (n < 0) return total > 0 ? total : -1;

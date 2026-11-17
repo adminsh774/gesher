@@ -392,6 +392,37 @@ DescriptorSnapshotPtr CaptureHandleLocal(HANDLE file) {
   return Snapshot(file, description);
 }
 
+int AttachLocal(const DescriptorSnapshotPtr& snapshot, bool close_on_exec) {
+  if (!snapshot || !snapshot->description || !snapshot->handle || snapshot->handle == INVALID_HANDLE_VALUE)
+    return errno = EBADF, -1;
+  if (snapshot->kind == DescriptorKind::kUnshareable) return errno = EOPNOTSUPP, -1;
+  record_locks::DescriptorGuard guard;
+  if (InitializeLocal() < 0) return -1;
+  HANDLE duplicate = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), snapshot->handle, GetCurrentProcess(), &duplicate,
+                       0, close_on_exec ? FALSE : TRUE, DUPLICATE_SAME_ACCESS)) return FailWithLastError();
+  int fd = _open_osfhandle(reinterpret_cast<intptr_t>(duplicate),
+                           _O_BINARY | (close_on_exec ? _O_NOINHERIT : 0));
+  if (fd < 0) {
+    int error = gesher_errno_from_crt(errno);
+    CloseHandle(duplicate);
+    return errno = error, -1;
+  }
+  if (!ValidSlot(fd)) {
+    _close(fd);
+    return errno = EMFILE, -1;
+  }
+  if (!SetHandleInformation(HandleFromFd(fd), HANDLE_FLAG_INHERIT,
+                            close_on_exec ? 0 : HANDLE_FLAG_INHERIT)) {
+    int error = ErrnoFromWin32(GetLastError());
+    _close(fd);
+    return errno = error, -1;
+  }
+  std::lock_guard<std::mutex> lock(table->mutex);
+  table->entries[fd] = snapshot->description;
+  return fd;
+}
+
 int SetKindLocal(int fd, DescriptorKind kind) {
   record_locks::DescriptorGuard guard;
   if (!ValidSlot(fd) || InitializeLocal() < 0) return errno = EBADF, -1;
@@ -455,6 +486,7 @@ struct OwnerApi {
   int (*set_flags)(int, int);
   DescriptorSnapshotPtr (*capture_fd)(int);
   DescriptorSnapshotPtr (*capture_handle)(HANDLE);
+  int (*attach)(const DescriptorSnapshotPtr&, bool);
   int (*capture_all)(std::vector<std::pair<int, DescriptorSnapshotPtr>>*, bool);
   HANDLE (*share)(const DescriptorSnapshotPtr&);
 };
@@ -472,7 +504,7 @@ extern "C" void gesher_ofd_owner_anchor_v1() {}
 extern "C" __declspec(dllexport) const OwnerApi* gesher_ofd_owner_v1() {
   static const OwnerApi api{InitializeLocal, RegisterLocal, DupLocal, ForgetLocal,
                             LookupLocal, SetKindLocal, GetKindLocal, GetFlagsLocal, SetFlagsLocal, CaptureLocal,
-                            CaptureHandleLocal, CaptureAllLocal, ShareLocal};
+                            CaptureHandleLocal, AttachLocal, CaptureAllLocal, ShareLocal};
   return &api;
 }
 
@@ -510,6 +542,29 @@ DescriptorSnapshotPtr CaptureDescriptor(int fd) {
 DescriptorSnapshotPtr CaptureFileHandle(HANDLE file) {
   const auto* owner = Owner();
   return owner ? owner->capture_handle(file) : DescriptorSnapshotPtr{};
+}
+int AttachFileDescription(const DescriptorSnapshotPtr& snapshot, bool close_on_exec) {
+  const auto* owner = Owner();
+  return owner ? owner->attach(snapshot, close_on_exec) : -1;
+}
+int FileDescriptionFlags(const DescriptorSnapshotPtr& snapshot) {
+  if (!snapshot || !snapshot->description) return errno = EBADF, -1;
+  return snapshot->description->Flags();
+}
+int ValidateNativeFileDescription(const DescriptorSnapshotPtr& snapshot) {
+  int flags = FileDescriptionFlags(snapshot);
+  if (flags < 0) return -1;
+  if (snapshot->kind != DescriptorKind::kFile) return errno = EOPNOTSUPP, -1;
+  int native = NativeFlags(snapshot->handle);
+  if (native < 0) return -1;
+  // The Windows program will use the handle directly. There is no importer
+  // to translate logical devices, access metadata or dynamically emulated
+  // write/pipe policy on its behalf.
+  constexpr int kernel_policy = O_ACCMODE | O_PATH | O_APPEND | O_DIRECT | O_SYNC | O_NOATIME;
+  if (((flags ^ native) & kernel_policy) != 0) return errno = EOPNOTSUPP, -1;
+  if (GetFileType(snapshot->handle) == FILE_TYPE_PIPE && (flags & (O_NONBLOCK | O_ASYNC)) != 0)
+    return errno = EOPNOTSUPP, -1;
+  return 0;
 }
 int CaptureDescriptors(std::vector<std::pair<int, DescriptorSnapshotPtr>>* out, bool include_close_on_exec) {
   const auto* owner = Owner();

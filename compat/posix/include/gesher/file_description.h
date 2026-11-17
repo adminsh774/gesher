@@ -28,6 +28,20 @@ struct DescriptorSnapshot {
 using DescriptorSnapshotPtr = std::shared_ptr<DescriptorSnapshot>;
 DescriptorSnapshotPtr CaptureDescriptor(int fd);
 DescriptorSnapshotPtr CaptureFileHandle(HANDLE file);
+// A new descriptor alias with independent descriptor flags. The snapshot
+// retains its reference; the new slot owns an explicit native duplicate.
+int AttachFileDescription(const DescriptorSnapshotPtr& snapshot, bool close_on_exec);
+int FileDescriptionFlags(const DescriptorSnapshotPtr& snapshot);
+// Native Windows programs do not import Gesher metadata. Reject descriptions
+// whose current behavior cannot be supplied by the inherited kernel handle.
+int ValidateNativeFileDescription(const DescriptorSnapshotPtr& snapshot);
+// Raw-handle consumers such as the shell retain this snapshot and use the
+// same I/O policy as descriptor callers, including shared status and devices.
+int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count);
+int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* bytes, unsigned count);
+// Linux pwrite policy (including O_APPEND) while retaining the shared cursor.
+int64_t WriteFileDescriptionAt(const DescriptorSnapshotPtr& snapshot, const void* bytes,
+                              unsigned count, int64_t offset);
 // One transaction captures all open slots and their descriptor flags. Each
 // snapshot owns its native reference after the transaction is released.
 int CaptureDescriptors(std::vector<std::pair<int, DescriptorSnapshotPtr>>* out,

@@ -13,6 +13,7 @@
 #include <winioctl.h>
 #include <winternl.h>
 #include <gesher/font_environment.h>
+#include <gesher/file_description.h>
 
 #include <atomic>
 #include <string>
@@ -441,9 +442,72 @@ static int PositionedNullDevice(HANDLE file, bool* is_null) {
   return 0;
 }
 
+static ssize_t PositionedNativeIo(HANDLE anchor, DWORD type, DWORD access, bool append,
+                                   void* buf, size_t count, off_t offset, bool writing) {
+  PositionedHandle positioned, event;
+  HANDLE file = anchor;
+  const DWORD want = count > 0x7ffff000 ? 0x7ffff000 : static_cast<DWORD>(count);
+  if (type == FILE_TYPE_DISK) {
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (!GetFileInformationByHandle(file, &information)) return gesher::FailWithLastError();
+    if (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return errno = EISDIR, -1;
+    if (want == 0) return 0;
+    if (buf == nullptr) {
+      // An EOF read consumes no destination memory. Observe the real pinned
+      // file's length, without seeking or resolving its pathname.
+      if (!writing) {
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(file, &size)) return gesher::FailWithLastError();
+        if (offset >= size.QuadPart) return 0;
+      }
+      return errno = EFAULT, -1;
+    }
+    DWORD flags;
+    int error = PositionedMode(file, &flags);
+    if (error) return errno = error, -1;
+    positioned.value = ReOpenFile(file, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, flags);
+    if (positioned.value == INVALID_HANDLE_VALUE) return gesher::FailWithLastError();
+    file = positioned.value;
+  }
+  if (count != 0 && buf == nullptr) {
+    // Only a proven NUL device may discard an unused buffer. A console,
+    // socket, or other character driver is never classified by type alone.
+    if (type == FILE_TYPE_CHAR) {
+      bool is_null = false;
+      int error = PositionedNullDevice(file, &is_null);
+      if (error) return errno = error, -1;
+      if (is_null) return writing ? static_cast<ssize_t>(want) : 0;
+    }
+    return errno = EFAULT, -1;
+  }
+  event.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (event.value == nullptr) return gesher::FailWithLastError();
+  OVERLAPPED ov{};
+  ov.hEvent = event.value;
+  ov.Offset = append ? MAXDWORD : static_cast<DWORD>(static_cast<unsigned long long>(offset));
+  ov.OffsetHigh = append ? MAXDWORD : static_cast<DWORD>(static_cast<unsigned long long>(offset) >> 32);
+  DWORD transferred = 0;
+  BOOL done = writing ? WriteFile(file, buf, want, &transferred, &ov)
+                      : ReadFile(file, buf, want, &transferred, &ov);
+  DWORD error = done ? ERROR_SUCCESS : GetLastError();
+  if (!done && error == ERROR_IO_PENDING) {
+    // Keep the buffer, OVERLAPPED, event and both file objects alive until the
+    // operation has completed. The caller sees synchronous POSIX semantics.
+    done = GetOverlappedResult(file, &ov, &transferred, TRUE);
+    error = done ? ERROR_SUCCESS : GetLastError();
+  }
+  if (!done) {
+    if (!writing && error == ERROR_HANDLE_EOF) return 0;
+    if (error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER) return errno = EFAULT, -1;
+    return errno = gesher::ErrnoFromWin32(error), -1;
+  }
+  if (writing && transferred > 0) gesher::InotifyNoteWrite(anchor);
+  return static_cast<ssize_t>(transferred);
+}
+
 static ssize_t PositionedIo(int fd, void* buf, size_t count, off_t offset, bool writing) {
   if (offset < 0) return errno = EINVAL, -1;
-  PositionedHandle anchor, positioned, event;
+  PositionedHandle anchor;
   DWORD type, access;
   bool append = false;
   // Linux's MAX_RW_COUNT for the 4 KiB pages exposed by this Windows backend.
@@ -501,63 +565,7 @@ static ssize_t PositionedIo(int fd, void* buf, size_t count, off_t offset, bool 
     if (!DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(), &anchor.value,
                          0, FALSE, DUPLICATE_SAME_ACCESS)) return gesher::FailWithLastError();
   }
-  HANDLE file = anchor.value;
-  if (type == FILE_TYPE_DISK) {
-    BY_HANDLE_FILE_INFORMATION information{};
-    if (!GetFileInformationByHandle(file, &information)) return gesher::FailWithLastError();
-    if (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) return errno = EISDIR, -1;
-    if (want == 0) return 0;
-    if (buf == nullptr) {
-      // An EOF read consumes no destination memory. Observe the real pinned
-      // file's length, without seeking or resolving its pathname.
-      if (!writing) {
-        LARGE_INTEGER size{};
-        if (!GetFileSizeEx(file, &size)) return gesher::FailWithLastError();
-        if (offset >= size.QuadPart) return 0;
-      }
-      return errno = EFAULT, -1;
-    }
-    DWORD flags;
-    int error = PositionedMode(file, &flags);
-    if (error) return errno = error, -1;
-    positioned.value = ReOpenFile(file, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, flags);
-    if (positioned.value == INVALID_HANDLE_VALUE) return gesher::FailWithLastError();
-    file = positioned.value;
-  }
-  if (count != 0 && buf == nullptr) {
-    // Only a proven NUL device may discard an unused buffer. A console,
-    // socket, or other character driver is never classified by type alone.
-    if (type == FILE_TYPE_CHAR) {
-      bool is_null = false;
-      int error = PositionedNullDevice(file, &is_null);
-      if (error) return errno = error, -1;
-      if (is_null) return writing ? static_cast<ssize_t>(want) : 0;
-    }
-    return errno = EFAULT, -1;
-  }
-  event.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (event.value == nullptr) return gesher::FailWithLastError();
-  OVERLAPPED ov{};
-  ov.hEvent = event.value;
-  ov.Offset = append ? MAXDWORD : static_cast<DWORD>(static_cast<unsigned long long>(offset));
-  ov.OffsetHigh = append ? MAXDWORD : static_cast<DWORD>(static_cast<unsigned long long>(offset) >> 32);
-  DWORD transferred = 0;
-  BOOL done = writing ? WriteFile(file, buf, want, &transferred, &ov)
-                      : ReadFile(file, buf, want, &transferred, &ov);
-  DWORD error = done ? ERROR_SUCCESS : GetLastError();
-  if (!done && error == ERROR_IO_PENDING) {
-    // Keep the buffer, OVERLAPPED, event and both file objects alive until the
-    // operation has completed. The caller sees synchronous POSIX semantics.
-    done = GetOverlappedResult(file, &ov, &transferred, TRUE);
-    error = done ? ERROR_SUCCESS : GetLastError();
-  }
-  if (!done) {
-    if (!writing && error == ERROR_HANDLE_EOF) return 0;
-    if (error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER) return errno = EFAULT, -1;
-    return errno = gesher::ErrnoFromWin32(error), -1;
-  }
-  if (writing && transferred > 0) gesher::InotifyNoteWrite(anchor.value);
-  return static_cast<ssize_t>(transferred);
+  return PositionedNativeIo(anchor.value, type, access, append, buf, count, offset, writing);
 }
 
 ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
@@ -729,3 +737,21 @@ int unsetenv(const char* name) {
 }
 
 }  // extern "C"
+
+namespace gesher {
+int64_t WriteFileDescriptionAt(const DescriptorSnapshotPtr& snapshot, const void* bytes,
+                              unsigned count, int64_t offset) {
+  if (offset < 0) return errno = EINVAL, -1;
+  const int flags = FileDescriptionFlags(snapshot);
+  if (flags < 0) return -1;
+  if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_RDONLY) return errno = EBADF, -1;
+  if (snapshot->kind != DescriptorKind::kFile || GetFileType(snapshot->handle) != FILE_TYPE_DISK)
+    return errno = ESPIPE, -1;
+  uint32_t granted = 0;
+  if (int error = record_locks::HandleAccess(snapshot->handle, &granted)) return errno = error, -1;
+  const DWORD access = granted & FILE_WRITE_DATA ? FILE_WRITE_DATA : FILE_APPEND_DATA;
+  if ((granted & access) == 0) return errno = EBADF, -1;
+  return PositionedNativeIo(snapshot->handle, FILE_TYPE_DISK, access, (flags & O_APPEND) != 0,
+                            const_cast<void*>(bytes), count, offset, true);
+}
+}  // namespace gesher

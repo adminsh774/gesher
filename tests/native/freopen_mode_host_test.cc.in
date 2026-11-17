@@ -30,6 +30,7 @@ static constexpr int INVALID_HANDLE_VALUE = -1;
 struct StreamLock {
   explicit StreamLock(FILE*) { ++stream_depth; }
   ~StreamLock() { --stream_depth; }
+  explicit operator bool() const { return true; }
 };
 enum class PathKind { kFile, kNull, kMissing };
 namespace gesher {
@@ -51,6 +52,16 @@ int RegisterOfd(int fd, int flags) {
 PathKind MapPath(const char* path, std::wstring* out) {
   *out = std::wstring(path, path + std::strlen(path));
   return PathKind::kFile;
+}
+namespace stdio {
+// This envelope exercises stream lifecycle/mode behavior. Output buffering is
+// separately executed from stdio_output_buffer.h with real descriptors.
+int FlushOutput(FILE*) { return 0; }
+void Forget(FILE*) {}
+int PrepareReopenedStream(FILE* stream, int flags) {
+  const int actual = fcntl(fileno(stream), F_GETFL);
+  return actual >= 0 && (actual & O_ACCMODE) == (flags & O_ACCMODE) ? 0 : -1;
+}
 }
 namespace record_locks {
 class ClosingDescriptor {
@@ -114,7 +125,6 @@ static FILE* F(void* stream) { return static_cast<FILE*>(stream); }
 static FILE* HostFreopen(const char* path, const char* mode, FILE* stream) {
   return host::freopen(path, mode, stream);
 }
-@GUEST_CRT_MODE@
 @GUEST_FREOPEN@
 }  // namespace guest
 

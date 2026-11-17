@@ -38,9 +38,12 @@ std::string Narrow(const std::wstring& utf16);
 constexpr int kENOENT = 2;
 constexpr int kE2BIG = 7;
 constexpr int kENOEXEC = 8;
+constexpr int kEBADF = 9;
 constexpr int kENOMEM = 12;
 constexpr int kEACCES = 13;
 constexpr int kENOTDIR = 20;
+constexpr int kEINVAL = 22;
+constexpr int kEOPNOTSUPP = 95;
 
 // strerror for the values above (and a generic text for others).
 const char* ErrorText(int error);
@@ -116,6 +119,9 @@ struct ChildFd {
 // across exec/spawn, including descriptors above the UCRT block's size limit.
 // Only pinned, inheritable duplicates are supplied to CreateProcess. Missing
 // standard descriptors are closed before Gesher application code runs.
+// Native PE programs without the importer receive only kernel-representable
+// files and the CRT block: logical devices, emulated append/nonblocking pipe
+// policy and descriptors above its limit fail with ERROR_NOT_SUPPORTED.
 // Returns 0 or the Win32 error.
 DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::wstring& cwd,
                    const std::vector<ChildFd>& fds, PROCESS_INFORMATION* info, DWORD extra_flags = 0);

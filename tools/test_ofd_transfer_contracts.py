@@ -39,6 +39,7 @@ def main():
     builder = spawn[spawn.index(begin):spawn.index(end)]
     template = (ROOT / "tests/native/ofd_transfer_host_test.cc.in").read_text()
     sections = {
+        "@PE_EXPORTS_HEADER@": str(ROOT / "compat/elf/exec/pe_exports.h"),
         "@OFD_DECLARATIONS@": without_includes(public) + without_includes(private),
         "@OFD_IMPLEMENTATION@": without_includes(implementation),
         "@SPAWN_IMPLEMENTATION@": builder,

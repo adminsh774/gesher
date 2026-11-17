@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -30,7 +31,12 @@ static inline int ofd_record_writer(const char* path, char marker) {
     record[1] = (char)('0' + i / 100);
     record[2] = (char)('0' + (i / 10) % 10);
     record[3] = (char)('0' + i % 10);
-    if (write(fd, record, sizeof(record)) != (ssize_t)sizeof(record)) { close(fd); return 34; }
+    off_t before = lseek(fd, 0, SEEK_CUR);
+    struct iovec parts[] = {{record, 17}, {record + 17, sizeof(record) - 17}};
+    ssize_t written = i % 3 == 0 ? write(fd, record, sizeof(record)) :
+                      i % 3 == 1 ? writev(fd, parts, 2) : pwritev(fd, parts, 2, 0);
+    if (written != (ssize_t)sizeof(record)) { close(fd); return 34; }
+    if (i % 3 == 2 && lseek(fd, 0, SEEK_CUR) != before) { close(fd); return 36; }
   }
   return close(fd) == 0 ? 0 : 35;
 }

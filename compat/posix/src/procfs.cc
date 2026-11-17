@@ -40,6 +40,8 @@
 #include <vector>
 
 #include "internal.h"
+#include "ofd_internal.h"
+#include "record_lock_descriptors.h"
 
 #include <gesher/process_name.h>
 
@@ -863,6 +865,7 @@ bool List(const std::wstring& name, std::vector<Entry>* entries) {
 }
 
 int Open(const std::wstring& name, int flags) {
+  if ((flags & O_PATH) != 0) flags &= O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW;
   Node n = Lookup(name, false);
   if (n.type == kNone) return errno = (flags & O_CREAT) != 0 ? EACCES : ENOENT, -1;
   if (n.type == kLink) {
@@ -880,17 +883,50 @@ int Open(const std::wstring& name, int flags) {
   }
   if (n.type == kDir) return errno = (flags & O_ACCMODE) != O_RDONLY ? EISDIR : EOPNOTSUPP, -1;
   if ((flags & O_DIRECTORY) != 0) return errno = ENOTDIR, -1;
+  if ((flags & O_DIRECT) != 0) return errno = EINVAL, -1;
+  if ((flags & O_NOATIME) != 0) return errno = EOPNOTSUPP, -1;
   if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_TRUNC | O_CREAT)) != 0) {
     return errno = EACCES, -1;
   }
   std::string content = Content(n);
+  record_locks::DescriptorGuard descriptors;
   int fd = memfd_create("procfs", (flags & O_CLOEXEC) != 0 ? MFD_CLOEXEC : 0);
   if (fd < 0) return -1;
   if (_write(fd, content.data(), static_cast<unsigned>(content.size())) !=
           static_cast<int>(content.size()) ||
       _lseeki64(fd, 0, SEEK_SET) != 0) {
     int saved = gesher_errno_from_crt(errno);
-    _close(fd);
+    close(fd);
+    return errno = saved, -1;
+  }
+  // The content builder needs write access; the caller does not. Reduce the
+  // actual kernel handle's rights before publishing the descriptor, so both
+  // POSIX I/O and direct/native consumers see the requested read-only/O_PATH
+  // access. A metadata-only O_RDONLY would still permit writes through mmap.
+  HANDLE readonly = nullptr;
+  DWORD access = (flags & O_PATH) != 0 ? FILE_READ_ATTRIBUTES | SYNCHRONIZE : FILE_GENERIC_READ;
+  BOOL inherit = (flags & O_CLOEXEC) == 0;
+  if (!DuplicateHandle(GetCurrentProcess(), HandleFromFd(fd), GetCurrentProcess(),
+                         &readonly, access, inherit, 0)) {
+    int saved = ErrnoFromWin32(GetLastError());
+    close(fd);
+    return errno = saved, -1;
+  }
+  if (close(fd) < 0) {
+    int saved = errno;
+    CloseHandle(readonly);
+    return errno = saved, -1;
+  }
+  fd = _open_osfhandle(reinterpret_cast<intptr_t>(readonly), _O_RDONLY | _O_BINARY |
+                      ((flags & O_CLOEXEC) != 0 ? _O_NOINHERIT : 0));
+  if (fd < 0) {
+    int saved = gesher_errno_from_crt(errno);
+    CloseHandle(readonly);
+    return errno = saved, -1;
+  }
+  if (RegisterOfd(fd, flags | ((flags & O_PATH) == 0 ? O_LARGEFILE : 0)) < 0) {
+    int saved = errno;
+    close(fd);
     return errno = saved, -1;
   }
   return fd;

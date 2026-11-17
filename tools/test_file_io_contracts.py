@@ -22,17 +22,22 @@ def main():
     parser.add_argument("--sanitize", action="store_true")
     args = parser.parse_args()
     source = (ROOT / "compat/posix/src/fd.cc").read_text()
-    first, last = "bool NativeFileIo(", "\nint CloseFdBody("
+    first, last = "int TransferFileHandle(", "\nint CloseFdBody("
     if source.count(first) != 1 or source.count(last) != 1:
         raise ValueError("native file-I/O boundaries changed")
     implementation = source[source.index(first):source.index(last)]
+    snapshot_begin, snapshot_end = "int ReadFileDescription(", "\n}  // namespace gesher\n\nextern \"C\" {"
+    if source.count(snapshot_begin) != 1 or source.count(snapshot_end) != 1:
+        raise ValueError("snapshot file-I/O boundaries changed")
+    snapshot_io = source[source.index(snapshot_begin):source.index(snapshot_end)]
     shared = (ROOT / "tests/native/positioned_io_host_test.cc.in").read_text()
     boundary_end = "#define pread tested_pread"
     if shared.count(boundary_end) != 1:
         raise ValueError("shared Windows I/O boundary changed")
     boundary = shared[:shared.index(boundary_end)]
     template = (ROOT / "tests/native/file_io_contract_host_test.cc.in").read_text()
-    for marker, value in {"@WINDOWS_IO_BOUNDARY@": boundary, "@NATIVE_FILE_IO@": implementation}.items():
+    for marker, value in {"@WINDOWS_IO_BOUNDARY@": boundary, "@NATIVE_FILE_IO@": implementation,
+                          "@SNAPSHOT_FILE_IO@": snapshot_io}.items():
         if template.count(marker) != 1:
             raise ValueError("file-I/O fixture marker changed")
         template = template.replace(marker, value)

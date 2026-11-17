@@ -11,12 +11,23 @@ target_include_directories(gesher_exec_spawn PUBLIC ${CMAKE_CURRENT_LIST_DIR})
 target_link_libraries(gesher_exec_spawn PUBLIC gesher_posix)
 target_compile_options(gesher_exec_spawn PRIVATE -Wall -Wextra -Werror)
 
+add_executable(ofd_native_child ${CMAKE_SOURCE_DIR}/tests/exec/ofd-native-child.cc)
+# posix.cmake supplies a directory-wide link_libraries default. This fixture
+# must remain an ordinary Windows executable without the Gesher importer.
+set_property(TARGET ofd_native_child PROPERTY LINK_LIBRARIES "")
+target_compile_options(ofd_native_child PRIVATE -Wall -Wextra -Werror)
+add_executable(ofd_spawn_test ${CMAKE_SOURCE_DIR}/tests/exec/ofd-spawn-test.cc)
+target_compile_options(ofd_spawn_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(ofd_spawn_test PRIVATE gesher_exec_spawn)
+add_dependencies(ofd_spawn_test ofd_native_child)
+
 add_executable(gesher-exec
   ${CMAKE_CURRENT_LIST_DIR}/gesher_exec.cc
   ${CMAKE_CURRENT_LIST_DIR}/spawn_actions.cc
   ${CMAKE_CURRENT_LIST_DIR}/gesher_shell.cc)
 target_compile_options(gesher-exec PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(gesher-exec PRIVATE gesher_exec_spawn gesher_bionic gesher_elf bcrypt shell32)
+add_dependencies(ofd_spawn_test gesher-exec)
 
 add_executable(exec4_no_console_probe ${CMAKE_SOURCE_DIR}/tests/exec/no-console-spawn.cc)
 target_compile_options(exec4_no_console_probe PRIVATE -Wall -Wextra -Werror)

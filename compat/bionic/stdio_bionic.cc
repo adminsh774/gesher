@@ -19,6 +19,7 @@
 
 #include "shim_internal.h"
 #include <gesher/logging.h>
+#include <gesher/stdio.h>
 
 #include <windows.h>
 
@@ -31,9 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 extern "C" int32_t __android_log_get_minimum_priority();
@@ -341,170 +340,115 @@ FILE* F(void* f) {
   return static_cast<FILE*>(f);
 }
 
-// bionic's fopen modes as the CRT's: always binary (bionic has no text
-// mode), 'e' (O_CLOEXEC) as 'N' (not inherited), 'x' kept; anything else the
-// CRT would reject as an invalid parameter is dropped.
-std::string CrtMode(const char* mode) {
-  std::string out;
-  if (mode == nullptr || (*mode != 'r' && *mode != 'w' && *mode != 'a')) return out;
-  out += *mode;
-  bool plus = false, excl = false, noinherit = false;
-  for (const char* p = mode + 1; *p; ++p) {
-    if (*p == '+') plus = true;
-    if (*p == 'x') excl = true;
-    if (*p == 'e') noinherit = true;
-  }
-  if (plus) out += '+';
-  out += 'b';
-  if (excl && *mode == 'w') out += 'x';
-  if (noinherit) out += 'N';
-  return out;
-}
 }  // namespace
 
-// /dev/zero and /dev/random are NUL handles that gesher's read() fills: the
-// CRT's own read of one returns nothing (mbedtls seeds its DRBG with
-// fread from fopen("/dev/urandom"), and WhatsApp aborts when that fails).
+// Every stream reads through the descriptor implementation, including pipes,
+// /dev/zero and /dev/random. EOF/error/buffering are shared with host stdio.
 size_t ReadStream(void* buf, size_t size, size_t n, FILE* f, bool unlocked) {
-  int fd = _fileno(f);
-  if (size == 0 || n == 0 || fd < 0 || !gesher_is_device_fd(fd)) {
-    return unlocked ? _fread_nolock(buf, size, n, f) : std::fread(buf, size, n, f);
-  }
-  auto* p = static_cast<unsigned char*>(buf);
-  size_t total = n > SIZE_MAX / size ? SIZE_MAX / size * size : size * n;
-  size_t done = 0;
-  while (done < total) {
-    size_t chunk = total - done < 0x40000000 ? total - done : 0x40000000;
-    int r = read(fd, p + done, static_cast<unsigned int>(chunk));
-    if (r <= 0) break;
-    done += static_cast<size_t>(r);
-  }
-  return done / size;
+  return gesher::stdio::Read(buf, size, n, f, unlocked);
 }
 
 namespace {
 
-// fopen through gesher-base's open (Linux O_* flags, delete access shared, so
-// the file can be unlinked or renamed while open, as on Linux), then fdopen.
+// Host and guest streams share creation, mode parsing, descriptor flags and
+// the descriptor-backed output buffer; the guest adapter only converts ABI.
 FILE* BIONIC_SYSV Fopen(const char* path, const char* mode) {
-  std::string m = CrtMode(mode);
-  if (m.empty()) return errno = kEINVAL, nullptr;
-  bool plus = m.find('+') != std::string::npos;
-  int flags = 0;
-  switch (m[0]) {
-    case 'r': flags = plus ? O_RDWR : O_RDONLY; break;
-    case 'w': flags = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC; break;
-    default: flags = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND; break;
-  }
-  if (m.find('x') != std::string::npos) flags |= O_EXCL;
-  if (m.find('N') != std::string::npos) flags |= O_CLOEXEC;
-  int fd = open(path, flags, 0666);
-  if (fd < 0) return nullptr;
-  std::string crt = m.substr(0, plus ? 2 : 1) + "b";
-  FILE* f = fdopen(fd, crt.c_str());
-  if (f == nullptr) {
-    int saved = errno;
-    close(fd);
-    errno = saved;
-  }
-  return f;
+  return std::fopen(path, mode);
 }
-FILE* BIONIC_SYSV Fdopen(int fd, const char* mode) {
-  std::string m = CrtMode(mode);
-  if (m.empty()) return errno = kEINVAL, nullptr;
-  if (m.back() == 'N') m.pop_back();
-  if (m.size() > 1 && m.back() == 'x') m.pop_back();
-  return fdopen(fd, m.c_str());
-}
+FILE* BIONIC_SYSV Fdopen(int fd, const char* mode) { return fdopen(fd, mode); }
 FILE* BIONIC_SYSV Freopen(const char* path, const char* mode, void* f) {
-  std::string m = CrtMode(mode);
-  if (m.empty()) return errno = kEINVAL, nullptr;
-  // gesher-base's freopen consumes Linux modes and maps them for the CRT.
-  // Passing CrtMode's 'N' would lose Android's 'e' before that mapping.
   return std::freopen(path, mode, F(f));
 }
 int BIONIC_SYSV Fgetpos(void* f, int64_t* pos) {
-  int64_t p = _ftelli64(F(f));
+  int64_t p = gesher::stdio::Tell(F(f));
   if (p < 0) return -1;
   *pos = p;
   return 0;
 }
-int BIONIC_SYSV Fsetpos(void* f, const int64_t* pos) { return _fseeki64(F(f), *pos, SEEK_SET); }
+int BIONIC_SYSV Fsetpos(void* f, const int64_t* pos) { return static_cast<int>(gesher::stdio::Seek(F(f), *pos, SEEK_SET)); }
 
 // getline/getdelim: *line grows with the CRT's realloc, which the .so's
 // free (the shim's) accepts.
 int64_t BIONIC_SYSV Getdelim(char** line, size_t* n, int delim, void* f) {
-  if (line == nullptr || n == nullptr) return errno = kEINVAL, -1;
-  FILE* fp = F(f);
-  size_t len = 0;
-  int c;
-  while ((c = std::fgetc(fp)) != EOF) {
-    if (*line == nullptr || len + 2 > *n) {
-      size_t cap = *n < 120 ? 120 : *n * 2;
-      char* grown = static_cast<char*>(std::realloc(*line, cap));
-      if (grown == nullptr) return errno = kENOMEM, -1;
-      *line = grown;
-      *n = cap;
-    }
-    (*line)[len++] = static_cast<char>(c);
-    if (c == delim) break;
-  }
-  if (len == 0) return -1;
-  (*line)[len] = 0;
-  return static_cast<int64_t>(len);
+  return static_cast<int64_t>(::getdelim(line, n, delim, F(f)));
 }
 int64_t BIONIC_SYSV Getline(char** line, size_t* n, void* f) { return Getdelim(line, n, '\n', f); }
 
 // --- wide characters on a FILE: UTF-8 in the stream, UTF-32 in the .so --------
 
 constexpr uint32_t kWeof = 0xffffffffu;
-std::mutex g_unget_mutex;
-std::unordered_map<FILE*, std::vector<uint32_t>> g_unget;  // ungetwc pushback
+
+size_t EncodeWideCharacter(uint32_t value, char bytes[4]) {
+  if (value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) return 0;
+  if (value < 0x80) { bytes[0] = static_cast<char>(value); return 1; }
+  size_t length = value < 0x800 ? 2 : value < 0x10000 ? 3 : 4;
+  for (size_t i = length - 1; i != 0; --i) {
+    bytes[i] = static_cast<char>(0x80 | (value & 0x3f));
+    value >>= 6;
+  }
+  bytes[0] = static_cast<char>((length == 2 ? 0xc0 : length == 3 ? 0xe0 : 0xf0) | value);
+  return length;
+}
 
 uint32_t BIONIC_SYSV Fgetwc(void* f) {
   FILE* fp = F(f);
-  {
-    std::lock_guard<std::mutex> lock(g_unget_mutex);
-    auto it = g_unget.find(fp);
-    if (it != g_unget.end() && !it->second.empty()) {
-      uint32_t c = it->second.back();
-      it->second.pop_back();
-      return c;
-    }
-  }
-  int b = std::fgetc(fp);
+  gesher::stdio::StreamGuard lock(fp);
+  if (!lock) return kWeof;
+  gesher::stdio::Orient(fp, 1);
+  int b = gesher::stdio::Get(fp, true);
   if (b == EOF) return kWeof;
-  int extra = b < 0x80 ? 0 : b < 0xe0 ? 1 : b < 0xf0 ? 2 : 3;
+  int extra = b < 0x80 ? 0 : b >= 0xc2 && b <= 0xdf ? 1 :
+      b >= 0xe0 && b <= 0xef ? 2 : b >= 0xf0 && b <= 0xf4 ? 3 : -1;
+  if (extra < 0) { gesher::stdio::SetError(fp, EILSEQ); return kWeof; }
   uint32_t c = extra == 0 ? b : extra == 1 ? (b & 0x1f) : extra == 2 ? (b & 0x0f) : (b & 0x07);
   for (int i = 0; i < extra; ++i) {
-    int nb = std::fgetc(fp);
+    int nb = gesher::stdio::Get(fp, true);
     if (nb == EOF || (nb & 0xc0) != 0x80) {
       if (nb != EOF) std::ungetc(nb, fp);
-      errno = 84;  // EILSEQ
+      gesher::stdio::SetError(fp, EILSEQ);
       return kWeof;
     }
     c = (c << 6) | (nb & 0x3f);
+  }
+  const uint32_t minimum[] = {0, 0x80, 0x800, 0x10000};
+  if (c < minimum[extra] || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) {
+    gesher::stdio::SetError(fp, EILSEQ);
+    return kWeof;
   }
   return c;
 }
 uint32_t BIONIC_SYSV Ungetwc(uint32_t c, void* f) {
   if (c == kWeof) return kWeof;
-  std::lock_guard<std::mutex> lock(g_unget_mutex);
-  g_unget[F(f)].push_back(c);
+  char bytes[4];
+  size_t count = EncodeWideCharacter(c, bytes);
+  if (!count) return errno = EILSEQ, kWeof;
+  FILE* fp = F(f);
+  gesher::stdio::StreamGuard lock(fp);
+  if (!lock) return kWeof;
+  gesher::stdio::Orient(fp, 1);
+  while (count) if (std::ungetc(static_cast<unsigned char>(bytes[--count]), fp) == EOF) return kWeof;
   return c;
 }
 uint32_t BIONIC_SYSV Fputwc(uint32_t c, void* f) {
-  uint32_t wc[2] = {c, 0};
-  std::string s = c == 0 ? std::string(1, '\0') : Utf32ToUtf8(wc, -1);
-  return std::fwrite(s.data(), 1, s.size(), F(f)) == s.size() ? c : kWeof;
+  FILE* fp = F(f);
+  gesher::stdio::StreamGuard lock(fp);
+  if (!lock) return kWeof;
+  gesher::stdio::Orient(fp, 1);
+  char bytes[4];
+  const size_t count = EncodeWideCharacter(c, bytes);
+  if (!count) { gesher::stdio::SetError(fp, EILSEQ); return kWeof; }
+  return gesher::stdio::Write(bytes, 1, count, fp, true) == count ? c : kWeof;
 }
 int BIONIC_SYSV Fputws(const uint32_t* ws, void* f) {
-  std::string s = Utf32ToUtf8(ws, -1);
-  return std::fwrite(s.data(), 1, s.size(), F(f)) == s.size() ? 0 : -1;
+  gesher::stdio::StreamGuard lock(F(f));
+  if (!lock) return -1;
+  gesher::stdio::Orient(F(f), 1);
+  while (*ws) if (Fputwc(*ws++, f) == kWeof) return -1;
+  return 0;
 }
 uint32_t BIONIC_SYSV Getwchar() { return Fgetwc(stdin); }
 uint32_t BIONIC_SYSV Putwchar(uint32_t c) { return Fputwc(c, stdout); }
-int BIONIC_SYSV Fwide(void*, int mode) { return mode > 0 ? 1 : mode < 0 ? -1 : 0; }
+int BIONIC_SYSV Fwide(void* f, int mode) { return gesher::stdio::Orient(F(f), mode); }
 int BIONIC_SYSV Fclose(void* f) { return std::fclose(F(f)); }
 size_t BIONIC_SYSV Fread(void* buf, size_t size, size_t n, void* f) {
   return ReadStream(buf, size, n, F(f));
@@ -533,12 +477,7 @@ size_t BIONIC_SYSV FwriteChk(const void* buf, size_t size, size_t n, void* f, si
   if (size != 0 && n > buf_size / size) StdioFortify("fwrite");
   return std::fwrite(buf, size, n, F(f));
 }
-int BIONIC_SYSV Fgetc(void* f) {
-  unsigned char c;
-  int fd = _fileno(F(f));
-  if (fd >= 0 && gesher_is_device_fd(fd)) return ReadStream(&c, 1, 1, F(f)) == 1 ? c : EOF;
-  return std::fgetc(F(f));
-}
+int BIONIC_SYSV Fgetc(void* f) { return std::fgetc(F(f)); }
 int BIONIC_SYSV Getchar() { return std::getchar(); }
 int BIONIC_SYSV Ungetc(int c, void* f) { return std::ungetc(c, F(f)); }
 int BIONIC_SYSV Fflush(void* f) { return std::fflush(f ? F(f) : nullptr); }
@@ -546,8 +485,8 @@ int BIONIC_SYSV Feof(void* f) { return std::feof(F(f)); }
 int BIONIC_SYSV Ferror(void* f) { return std::ferror(F(f)); }
 void BIONIC_SYSV Clearerr(void* f) { std::clearerr(F(f)); }
 int BIONIC_SYSV Fileno(void* f) { return _fileno(F(f)); }
-int BIONIC_SYSV Fseek(void* f, int64_t off, int whence) { return _fseeki64(F(f), off, whence); }
-int64_t BIONIC_SYSV Ftell(void* f) { return _ftelli64(F(f)); }
+int BIONIC_SYSV Fseek(void* f, int64_t off, int whence) { return static_cast<int>(gesher::stdio::Seek(F(f), off, whence)); }
+int64_t BIONIC_SYSV Ftell(void* f) { return gesher::stdio::Tell(F(f)); }
 void BIONIC_SYSV Rewind(void* f) { std::rewind(F(f)); }
 int BIONIC_SYSV Setvbuf(void* f, char* buf, int mode, size_t size) {
   // bionic: _IOFBF 0, _IOLBF 1, _IONBF 2; the CRT: 0x0000, 0x0040, 0x0004.
@@ -555,7 +494,7 @@ int BIONIC_SYSV Setvbuf(void* f, char* buf, int mode, size_t size) {
   if (mode < 0 || mode > 2) return -1;
   return std::setvbuf(F(f), buf, kModes[mode], size);
 }
-void BIONIC_SYSV Setbuf(void* f, char* buf) { std::setbuf(F(f), buf); }
+void BIONIC_SYSV Setbuf(void* f, char* buf) { std::setvbuf(F(f), buf, buf ? _IOFBF : _IONBF, 1024); }
 FILE* BIONIC_SYSV Tmpfile() { return std::tmpfile(); }
 void BIONIC_SYSV Perror(const char* s) {
   if (s != nullptr && *s != 0) {

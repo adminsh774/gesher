@@ -92,6 +92,8 @@ bool LookupDevice(int fd, Device* device) {
 void ForgetDevice(int) {}  // retiring the OFD retires its logical device kind
 
 int ReadDevice(Device device, void* buf, unsigned int count) {
+  if (count == 0) return 0;
+  if (!buf) return errno = EFAULT, -1;
   if (device == Device::kZero) {
     memset(buf, 0, count);
   } else if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, static_cast<PUCHAR>(buf), count,
@@ -170,49 +172,16 @@ using gesher::Device;
 using gesher::SocketFd;
 
 namespace {
-// A regular-file operation pins one native object and reads its status in the
-// same descriptor transaction. The CRT's fd-number lookup after a separate
-// F_GETFL can otherwise use a replacement fd during close/dup2. Append uses
-// one kernel write-to-end operation, including independent processes.
-bool NativeFileIo(int fd, void* buffer, unsigned int count, bool writing, int* result) {
-  HANDLE file = nullptr;
-  bool append = false;
-  {
-    gesher::record_locks::DescriptorGuard descriptor_guard;
-    HANDLE source = gesher::HandleFromFd(fd);
-    if (source == INVALID_HANDLE_VALUE) {
-      *result = (errno = EBADF, -1);
-      return true;
-    }
-    if (GetFileType(source) != FILE_TYPE_DISK) return false;
-    int flags = gesher::GetFileStatusFlags(fd);
-    if (flags < 0) { *result = -1; return true; }
-    if ((flags & O_PATH) != 0 ||
-        (flags & O_ACCMODE) == (writing ? O_RDONLY : O_WRONLY)) {
-      *result = (errno = EBADF, -1);
-      return true;
-    }
-    // A zero-length append must not move the shared cursor to EOF.
-    if (writing && count == 0) { *result = 0; return true; }
-    append = writing && (flags & O_APPEND) != 0;
-    // Pin this exact object before close/dup2 can recycle either its fd or
-    // native HANDLE. Do not hold the global descriptor lock during file I/O.
-    if (!DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(), &file,
-                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
-      *result = gesher::FailWithLastError();
-      return true;
-    }
-  }
+// The caller owns an exact native object reference for the whole operation.
+// Append is one kernel write-to-end request; no seek/write race is possible
+// between independent opens or writers in another process.
+int TransferFileHandle(HANDLE file, void* buffer, unsigned int count, bool writing, bool append) {
+  if (writing && count == 0) return 0;
   HANDLE event = nullptr;
   OVERLAPPED operation{};
   if (append) {
     event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!event) {
-      DWORD error = GetLastError();
-      CloseHandle(file);
-      *result = (errno = gesher::ErrnoFromWin32(error), -1);
-      return true;
-    }
+    if (!event) return gesher::FailWithLastError();
     operation.hEvent = event;
     operation.Offset = operation.OffsetHigh = MAXDWORD;
   }
@@ -233,15 +202,44 @@ bool NativeFileIo(int fd, void* buffer, unsigned int count, bool writing, int* r
   }
   if (done && writing && transferred != 0) gesher::InotifyNoteWrite(file);
   if (event) CloseHandle(event);
-  CloseHandle(file);
-  if (!done && !writing && error == ERROR_HANDLE_EOF) {
-    *result = 0;
-  } else if (!done) {
-    *result = (errno = native_error ? native_error :
-        error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER ? EFAULT : gesher::ErrnoFromWin32(error), -1);
-  } else {
-    *result = static_cast<int>(transferred);
+  if (!done && !writing && (error == ERROR_HANDLE_EOF || error == ERROR_BROKEN_PIPE)) return 0;
+  if (!done) {
+    return errno = native_error ? native_error :
+        error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER ? EFAULT : gesher::ErrnoFromWin32(error), -1;
   }
+  return static_cast<int>(transferred);
+}
+
+// Capture the object and its status in the same descriptor transaction. A
+// later CRT fd-number lookup can otherwise use a replacement after close/dup2.
+bool NativeFileIo(int fd, void* buffer, unsigned int count, bool writing, int* result) {
+  HANDLE file = nullptr;
+  bool append = false;
+  {
+    gesher::record_locks::DescriptorGuard descriptor_guard;
+    HANDLE source = gesher::HandleFromFd(fd);
+    if (source == INVALID_HANDLE_VALUE) { *result = (errno = EBADF, -1); return true; }
+    if (GetFileType(source) != FILE_TYPE_DISK) return false;
+    int flags = gesher::GetFileStatusFlags(fd);
+    if (flags < 0) { *result = -1; return true; }
+    if ((flags & O_PATH) != 0 ||
+        (flags & O_ACCMODE) == (writing ? O_RDONLY : O_WRONLY)) {
+      *result = (errno = EBADF, -1);
+      return true;
+    }
+    // A zero-length append must not move the shared cursor to EOF.
+    if (writing && count == 0) { *result = 0; return true; }
+    append = writing && (flags & O_APPEND) != 0;
+    if (!DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(), &file,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      *result = gesher::FailWithLastError();
+      return true;
+    }
+  }
+  *result = TransferFileHandle(file, buffer, count, writing, append);
+  const int saved = errno;
+  CloseHandle(file);
+  errno = saved;
   return true;
 }
 
@@ -318,6 +316,37 @@ int CloseUnpublishedDuplicate(int fd) {
   record_locks::DescriptorGuard descriptor_guard;
   return CloseFdBody(fd, true);
 }
+int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count) {
+  const int flags = FileDescriptionFlags(snapshot);
+  if (flags < 0) return -1;
+  if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_WRONLY) return errno = EBADF, -1;
+  if (snapshot->kind == DescriptorKind::kUnshareable) return errno = EOPNOTSUPP, -1;
+  count = std::min(count, 0x7ffff000u);
+  if (snapshot->kind == DescriptorKind::kZero || snapshot->kind == DescriptorKind::kRandom) {
+    return ReadDevice(snapshot->kind == DescriptorKind::kZero ? Device::kZero : Device::kRandom, bytes, count);
+  }
+  if (count == 0 && GetFileType(snapshot->handle) != FILE_TYPE_DISK) return 0;
+  if (count != 0 && GetFileType(snapshot->handle) == FILE_TYPE_PIPE && (flags & O_NONBLOCK) != 0) {
+    DWORD available = 0;
+    if (PeekNamedPipe(snapshot->handle, nullptr, 0, nullptr, &available, nullptr)) {
+      if (available == 0) return errno = EAGAIN, -1;
+      count = std::min<unsigned>(count, available);
+    }
+  }
+  return TransferFileHandle(snapshot->handle, bytes, count, false, false);
+}
+int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* bytes, unsigned count) {
+  const int flags = FileDescriptionFlags(snapshot);
+  if (flags < 0) return -1;
+  if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_RDONLY) return errno = EBADF, -1;
+  if (snapshot->kind == DescriptorKind::kUnshareable) return errno = EOPNOTSUPP, -1;
+  count = std::min(count, 0x7ffff000u);
+  if (snapshot->kind == DescriptorKind::kZero) return static_cast<int>(count);
+  const bool append = (flags & O_APPEND) != 0 && GetFileType(snapshot->handle) == FILE_TYPE_DISK;
+  int result = TransferFileHandle(snapshot->handle, const_cast<void*>(bytes), count, true, append);
+  if (result > 0 && HasPollWaiters() && GetFileType(snapshot->handle) == FILE_TYPE_PIPE) WakePollers();
+  return result;
+}
 }  // namespace gesher
 
 extern "C" {
@@ -347,13 +376,9 @@ int read(int fd, void* buf, unsigned int count) {
     if (NativeFileIo(fd, buf, count, false, &result)) return result;
     if (gesher::ReadEventObject(fd, buf, count, &result)) return result;
     HANDLE h = gesher::HandleFromFd(fd);
-    if (count != 0 && h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE &&
-        gesher::IsNonBlockingMode(fd)) {
-      DWORD avail = 0;
-      if (PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
-        if (avail == 0) return errno = EAGAIN, -1;
-        if (count > avail) count = avail;
-      }
+    if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE) {
+      auto snapshot = gesher::CaptureDescriptor(fd);
+      return snapshot ? gesher::ReadFileDescription(snapshot, buf, count) : -1;
     }
     return gesher::CrtResult(_read(fd, buf, count));
   }
@@ -371,6 +396,11 @@ int write(int fd, const void* buf, unsigned int count) {
     int result;
     if (NativeFileIo(fd, const_cast<void*>(buf), count, true, &result)) return result;
     if (gesher::WriteEventObject(fd, buf, count, &result)) return result;
+    HANDLE h = gesher::HandleFromFd(fd);
+    if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE) {
+      auto snapshot = gesher::CaptureDescriptor(fd);
+      return snapshot ? gesher::WriteFileDescription(snapshot, buf, count) : -1;
+    }
     result = gesher::CrtResult(_write(fd, buf, count));
     if (result > 0) gesher::InotifyNoteWrite(fd);
     if (result > 0 && gesher::HasPollWaiters() &&

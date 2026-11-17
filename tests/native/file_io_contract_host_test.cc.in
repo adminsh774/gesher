@@ -1,6 +1,53 @@
 @WINDOWS_IO_BOUNDARY@
 
+#include <sys/ioctl.h>
+#include <sys/random.h>
+#include <poll.h>
+
+static BOOL PeekNamedPipe(HANDLE file, void*, DWORD, DWORD*, DWORD* available, DWORD*) {
+  int count = 0;
+  if (ioctl(file->fd, FIONREAD, &count) < 0) { SetLastError(errno); return FALSE; }
+  pollfd item{file->fd, POLLIN, 0};
+  if (poll(&item, 1, 0) < 0) { SetLastError(errno); return FALSE; }
+  if (count == 0 && (item.revents & POLLHUP) != 0) { SetLastError(ERROR_BROKEN_PIPE); return FALSE; }
+  *available = static_cast<DWORD>(count);
+  return TRUE;
+}
+
 @NATIVE_FILE_IO@
+
+namespace gesher {
+// The description metadata is an OS boundary in this file-I/O fixture;
+// test_ofd_transfer_contracts.py separately executes the complete registry.
+enum class DescriptorKind { kFile, kZero, kRandom, kUnshareable };
+struct DescriptorSnapshot {
+  HANDLE handle;
+  DescriptorKind kind;
+  ~DescriptorSnapshot() { CloseHandle(handle); }
+};
+using DescriptorSnapshotPtr = std::shared_ptr<DescriptorSnapshot>;
+static int FileDescriptionFlags(const DescriptorSnapshotPtr& value) {
+  return value ? ::fcntl(value->handle->fd, F_GETFL) : (errno = EBADF, -1);
+}
+static DescriptorSnapshotPtr Capture(int fd, DescriptorKind kind = DescriptorKind::kFile) {
+  int copy = ::dup(fd);
+  if (copy < 0) return {};
+  auto value = std::make_shared<DescriptorSnapshot>();
+  value->handle = Owned(copy);
+  value->kind = kind;
+  return value;
+}
+static int ReadDevice(Device kind, void* bytes, unsigned count) {
+  if (!count) return 0;
+  if (!bytes) return errno = EFAULT, -1;
+  if (kind == Device::kZero) { std::memset(bytes, 0, count); return static_cast<int>(count); }
+  return static_cast<int>(getrandom(bytes, count, 0));
+}
+static unsigned poll_wakes;
+static bool HasPollWaiters() { return true; }
+static void WakePollers() { ++poll_wakes; }
+@SNAPSHOT_FILE_IO@
+}
 
 static int checks, failures;
 static void Check(const char* message, bool ok) {
@@ -74,10 +121,41 @@ int main() {
   Check("old alias received exactly the in-flight bytes", pread(alias, bytes, 3, 0) == 3 && std::memcmp(bytes, "aLK", 3) == 0);
   Check("replacement descriptor was not written", pread(fd, bytes, 3, 0) == 3 && std::memcmp(bytes, "new", 3) == 0);
   Check("in-flight operation releases native pin", live_handles == 0);
+  auto snapshot = gesher::Capture(alias);
+  Check("raw snapshot reads the same ordinary file position", snapshot && lseek(alias, 0, SEEK_SET) == 0 &&
+      gesher::ReadFileDescription(snapshot, bytes, 3) == 3 && std::memcmp(bytes, "aLK", 3) == 0 &&
+      lseek(alias, 0, SEEK_CUR) == 3);
+  Check("raw snapshot observes status changes through aliases", fcntl(alias, F_SETFL, O_APPEND) == 0 &&
+      gesher::WriteFileDescription(snapshot, "S", 1) == 1 && lseek(alias, 0, SEEK_CUR) == 13);
+  Check("raw snapshot does not append on a zero-byte request", lseek(alias, 2, SEEK_SET) == 2 &&
+      gesher::WriteFileDescription(snapshot, nullptr, 0) == 0 && lseek(alias, 0, SEEK_CUR) == 2);
+  snapshot.reset();
+  int nullfd = open("/dev/null", O_RDWR);
+  auto device = gesher::Capture(nullfd, gesher::DescriptorKind::kZero);
+  std::memset(bytes, '!', 4);
+  Check("raw logical zero device is not exported as native NUL EOF", device &&
+      gesher::ReadFileDescription(device, bytes, 4) == 4 && bytes[0] == 0 && bytes[3] == 0);
+  Check("logical zero writes discard bytes as Linux does", gesher::WriteFileDescription(device, nullptr, 4) == 4);
+  device.reset();
+  auto unsupported = gesher::Capture(nullfd, gesher::DescriptorKind::kUnshareable);
+  Check("unshareable NUL reservation never becomes a successful device read",
+      gesher::ReadFileDescription(unsupported, bytes, 1) == -1 && errno == EOPNOTSUPP);
+  Check("unshareable NUL reservation never becomes a successful discarded write",
+      gesher::WriteFileDescription(unsupported, "x", 1) == -1 && errno == EOPNOTSUPP);
+  unsupported.reset(); close(nullfd);
   int pipes[2];
   Check("pipe dispatch witness", pipe(pipes) == 0);
   int result = 999;
   Check("file adapter leaves pipe I/O to the pipe backend", !NativeFileIo(pipes[0], bytes, 1, false, &result) && result == 999);
+  auto pipe_reader = gesher::Capture(pipes[0]), pipe_writer = gesher::Capture(pipes[1]);
+  Check("raw pipe zero read does not wait for data", gesher::ReadFileDescription(pipe_reader, nullptr, 0) == 0);
+  Check("raw nonblocking empty pipe reports EAGAIN", fcntl(pipes[0], F_SETFL, O_NONBLOCK) == 0 &&
+      gesher::ReadFileDescription(pipe_reader, bytes, 1) == -1 && errno == EAGAIN);
+  Check("raw pipe transfers actual bytes and wakes pollers", gesher::WriteFileDescription(pipe_writer, "pipe", 4) == 4 &&
+      gesher::poll_wakes == 1 && gesher::ReadFileDescription(pipe_reader, bytes, 4) == 4 && std::memcmp(bytes, "pipe", 4) == 0);
+  pipe_writer.reset(); close(pipes[1]); pipes[1] = -1;
+  Check("raw pipe EOF follows the real last writer", gesher::ReadFileDescription(pipe_reader, bytes, 1) == 0);
+  pipe_reader.reset();
   close(pipes[0]); close(pipes[1]);
   close(fd); close(alias); unlink(path); unlink("replacement");
   Check("all private native handles close", live_handles == 0);
