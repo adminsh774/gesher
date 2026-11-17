@@ -101,8 +101,9 @@ public final class Services {
                 StandIn.of(IActivityManager.class, am).asBinder());
         services.put(Context.ACTIVITY_TASK_SERVICE,
                 StandIn.of(IActivityTaskManager.class, atm).asBinder());
+        WindowManagerService wm = new WindowManagerService();
         services.put(Context.WINDOW_SERVICE,
-                StandIn.of(IWindowManager.class, new WindowManagerService()).asBinder());
+                StandIn.of(IWindowManager.class, wm).asBinder());
         services.put(Context.DISPLAY_SERVICE,
                 StandIn.of(IDisplayManager.class, new DisplayManager()).asBinder());
         services.put(Context.USER_SERVICE,
@@ -169,7 +170,7 @@ public final class Services {
         services.put(Context.SEARCH_SERVICE, StandIn.of(android.app.ISearchManager.class,
                 new DeviceServices.SearchService()).asBinder());
         services.put(Context.CLIPBOARD_SERVICE, StandIn.of(android.content.IClipboard.class,
-                new ClipboardService()).asBinder());
+                new ClipboardService(atm, wm, pm)).asBinder());
         // Device state from Windows (devsvc track, ADR 0038): jobs, the battery.
         services.put(Context.JOB_SCHEDULER_SERVICE, StandIn.of(android.app.job.IJobScheduler.class,
                 new JobSchedulerService(am, atm, pm)).asBinder());

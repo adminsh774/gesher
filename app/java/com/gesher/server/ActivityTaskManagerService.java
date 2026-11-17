@@ -2466,6 +2466,15 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                 mTopResumed.topSent = false;
             }
             mTopResumed = want;
+            if (want != null) {
+                int uid = want.app != null ? want.app.uid
+                        : (want.info != null && want.info.applicationInfo != null ? want.info.applicationInfo.uid
+                        : (mPm != null && want.info != null ? mPm.getPackageUid(want.info.packageName, 0, 0) : -1));
+                String pkg = want.info != null ? want.info.packageName : null;
+                WindowManagerService.setFocusedApp(uid, pkg);
+            } else {
+                WindowManagerService.clearFocusedApp();
+            }
             if (want != null && !want.topSent && want.state == State.RESUMED) {
                 want.topSent = true;
                 gain = want;
@@ -2482,6 +2491,41 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             t.addTransactionItem(new TopResumedActivityChangeItem(gain.token, true));
             schedule(gain, t, "TopResumedActivityChangeItem (the top resumed activity)");
         }
+    }
+
+    @Override
+    public void setFocusedTask(int taskId) {
+        synchronized (this) {
+            focusTaskLocked(taskId);
+        }
+        updateTopResumed();
+    }
+
+    @Override
+    public void setFocusedRootTask(int taskId) {
+        setFocusedTask(taskId);
+    }
+
+    public synchronized int getFocusedUid() {
+        if (mTopResumed == null) return -1;
+        if (mTopResumed.app != null) return mTopResumed.app.uid;
+        if (mTopResumed.info != null && mTopResumed.info.applicationInfo != null) {
+            return mTopResumed.info.applicationInfo.uid;
+        }
+        if (mPm != null && mTopResumed.info != null) {
+            try {
+                return mPm.getPackageUid(mTopResumed.info.packageName, 0, 0);
+            } catch (Exception ignored) {}
+        }
+        return -1;
+    }
+
+    public synchronized String getFocusedPackage() {
+        return mTopResumed != null && mTopResumed.info != null ? mTopResumed.info.packageName : null;
+    }
+
+    public boolean isUidFocused(int uid) {
+        return uid >= 0 && uid == getFocusedUid();
     }
 
     /**

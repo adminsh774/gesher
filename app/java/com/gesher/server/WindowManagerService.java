@@ -24,6 +24,41 @@ public final class WindowManagerService extends IWindowManager.Default {
     private static final java.util.Map<String, String> sWindowModes =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    private static volatile int sFocusedUid = -1;
+    private static volatile String sFocusedPackage;
+
+    /** Set the currently focused application identity. */
+    public static void setFocusedApp(int uid, String packageName) {
+        sFocusedUid = uid;
+        sFocusedPackage = packageName;
+    }
+
+    /** Clear the currently focused application identity. */
+    public static void clearFocusedApp() {
+        sFocusedUid = -1;
+        sFocusedPackage = null;
+    }
+
+    /** The UID of the currently focused application, or -1 if none. */
+    public static int getFocusedUid() {
+        return sFocusedUid;
+    }
+
+    /** The package name of the currently focused application, or null. */
+    public static String getFocusedPackage() {
+        return sFocusedPackage;
+    }
+
+    /** Whether the given UID is the currently focused application. */
+    public static boolean isFocused(int uid) {
+        return uid >= 0 && uid == sFocusedUid;
+    }
+
+    /** Instance check for caller UID focus. */
+    public boolean isUidFocused(int uid) {
+        return isFocused(uid);
+    }
+
     /**
      * The window mode of the package's processes started from now on (what the launcher
      * asked: {@code window}, {@code hidden} or {@code headless};

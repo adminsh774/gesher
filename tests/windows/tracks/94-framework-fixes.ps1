@@ -87,6 +87,14 @@ Check 'services: concurrent clipboard callbacks and native Windows clipboard upd
   $clipboardCallbacksOut
 } @('ClipboardCallbackTest all passed:')
 
+$clipboardSecurityOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'ClipboardSecurityContractTest') 90
+$clipboardSecurityCode = $LASTEXITCODE
+Check 'services: clipboard security caller focus check and default IME contract' {
+  $global:LASTEXITCODE = $clipboardSecurityCode
+  $clipboardSecurityOut
+} @('ClipboardSecurityContractTest all passed:')
+
 $contentObserverOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'ContentObserverLifecycleTest') 90
 $contentObserverCode = $LASTEXITCODE
