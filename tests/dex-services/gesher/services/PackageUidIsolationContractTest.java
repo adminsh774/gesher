@@ -193,28 +193,43 @@ public final class PackageUidIsolationContractTest {
             String[] systemPkgs = pms.getPackagesForUid(Process.SYSTEM_UID);
             check(systemPkgs != null && systemPkgs.length == 1 && "android".equals(systemPkgs[0]),
                     "getPackagesForUid(SYSTEM_UID) must return 'android'");
-            check("android.uid.system".equals(pms.getNameForUid(Process.SYSTEM_UID)),
-                    "getNameForUid(SYSTEM_UID) must return 'android.uid.system'");
+            check("android.uid.system:1000".equals(pms.getNameForUid(Process.SYSTEM_UID)),
+                    "getNameForUid(SYSTEM_UID) must return 'android.uid.system:1000'");
 
             check(pms.getPackageUid("com.android.shell", 0, 0) == Process.SHELL_UID,
                     "Shell package 'com.android.shell' must retain SHELL_UID (2000)");
             String[] shellPkgs = pms.getPackagesForUid(Process.SHELL_UID);
             check(shellPkgs != null && shellPkgs.length == 1 && "com.android.shell".equals(shellPkgs[0]),
                     "getPackagesForUid(SHELL_UID) must return 'com.android.shell'");
-            check("com.android.shell".equals(pms.getNameForUid(Process.SHELL_UID)),
-                    "getNameForUid(SHELL_UID) must return 'com.android.shell'");
+            check("android.uid.shell:2000".equals(pms.getNameForUid(Process.SHELL_UID)),
+                    "getNameForUid(SHELL_UID) must return 'android.uid.shell:2000'");
+            check("shared:android.uid.shell".equals(
+                            pms.getNamesForUids(new int[] {Process.SHELL_UID})[0]),
+                    "The bulk shell identity must use the shared: prefix");
 
             // Test 8: getNameForUid for single vs shared UID
             check("com.example.app1".equals(pms.getNameForUid(uid1)),
                     "getNameForUid for single app must return package name");
-            check(sharedGroup.equals(pms.getNameForUid(sharedUid1)),
-                    "getNameForUid for shared UID must return sharedUserId");
+            check((sharedGroup + ":" + sharedUid1).equals(pms.getNameForUid(sharedUid1)),
+                    "getNameForUid for shared UID must return sharedUserId:appId");
 
             String[] namesForUids = pms.getNamesForUids(new int[] {Process.SYSTEM_UID, uid1, sharedUid1});
             check(namesForUids != null && namesForUids.length == 3, "getNamesForUids must return 3 results");
             check("shared:android.uid.system".equals(namesForUids[0]), "Positional system UID must be shared:android.uid.system");
             check("com.example.app1".equals(namesForUids[1]), "Positional app1 name must match");
-            check(sharedGroup.equals(namesForUids[2]), "Positional shared group name must match");
+            check(("shared:" + sharedGroup).equals(namesForUids[2]),
+                    "Positional shared UID name must use the shared: prefix");
+
+            PackageManagerService oneSharedMember = new PackageManagerService(List.of(pkgSharedA));
+            check((sharedGroup + ":" + sharedUid1).equals(oneSharedMember.getNameForUid(sharedUid1)),
+                    "A shared UID retains its identity with only one installed member");
+            check(("shared:" + sharedGroup).equals(
+                            oneSharedMember.getNamesForUids(new int[] {sharedUid1})[0]),
+                    "A one-member shared UID retains the bulk shared: prefix");
+            check(pms.getNameForUid(19998) == null,
+                    "An unknown UID has no singular name");
+            check(pms.getNamesForUids(new int[] {19998, uid1})[0] == null,
+                    "An unknown UID retains its null position in bulk names");
 
             // Test 9: Permission isolation across distinct UIDs and sharing within sharedUserId
             android.system.Os.setenv("GESHER_MICROG_SPOOF", "1", true);
