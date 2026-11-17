@@ -102,81 +102,15 @@ final class DeviceServices {
     }
 
     /**
-     * {@code appops}: every operation is allowed (Gesher grants an app what it asks for,
-     * as the activity manager's permission checks do); noted and started operations
-     * answer MODE_ALLOWED. Environment.isExternalStorageManager asks it, among others.
+     * {@code appops}: real AppOps state machine and mode enforcement (Track F, ADR 0038).
      */
-    static final class AppOpsService extends IAppOpsService.Default {
-        @Override
-        public int checkOperation(int code, int uid, String packageName) {
-            return AppOpsManager.MODE_ALLOWED;
+    static final class AppOpsService extends com.gesher.server.AppOpsService {
+        public AppOpsService() {
+            super();
         }
 
-        @Override
-        public int checkOperationForDevice(int code, int uid, String packageName,
-                String attributionTag, int virtualDeviceId) {
-            return AppOpsManager.MODE_ALLOWED;
-        }
-
-        @Override
-        public int checkOperationRaw(int code, int uid, String packageName,
-                String attributionTag) {
-            return AppOpsManager.MODE_ALLOWED;
-        }
-
-        @Override
-        public int checkOperationRawForDevice(int code, int uid, String packageName,
-                String attributionTag, int virtualDeviceId) {
-            return AppOpsManager.MODE_ALLOWED;
-        }
-
-        @Override
-        public int checkAudioOperation(int code, int usage, int uid, String packageName) {
-            return AppOpsManager.MODE_ALLOWED;
-        }
-
-        @Override
-        public int checkPackage(int uid, String packageName) {
-            return AppOpsManager.MODE_ALLOWED;
-        }
-
-        @Override
-        public int permissionToOpCode(String permission) {
-            return AppOpsManager.OP_NONE;
-        }
-
-        @Override
-        public SyncNotedAppOp noteOperation(int code, int uid, String packageName,
-                String attributionTag, boolean shouldCollectAsyncNotedOp, String message,
-                boolean shouldCollectMessage) {
-            return new SyncNotedAppOp(AppOpsManager.MODE_ALLOWED, code, attributionTag,
-                    packageName);
-        }
-
-        @Override
-        public SyncNotedAppOp noteOperationForDevice(int code, int uid, String packageName,
-                String attributionTag, int virtualDeviceId, boolean shouldCollectAsyncNotedOp,
-                String message, boolean shouldCollectMessage) {
-            return new SyncNotedAppOp(AppOpsManager.MODE_ALLOWED, code, attributionTag,
-                    packageName);
-        }
-
-        @Override
-        public SyncNotedAppOp startOperation(IBinder clientId, int code, int uid,
-                String packageName, String attributionTag, boolean startIfModeDefault,
-                boolean shouldCollectAsyncNotedOp, String message, boolean shouldCollectMessage,
-                int attributionFlags, int attributionChainId) {
-            return new SyncNotedAppOp(AppOpsManager.MODE_ALLOWED, code, attributionTag,
-                    packageName);
-        }
-
-        @Override
-        public SyncNotedAppOp startOperationForDevice(IBinder clientId, int code, int uid,
-                String packageName, String attributionTag, int virtualDeviceId,
-                boolean startIfModeDefault, boolean shouldCollectAsyncNotedOp, String message,
-                boolean shouldCollectMessage, int attributionFlags, int attributionChainId) {
-            return new SyncNotedAppOp(AppOpsManager.MODE_ALLOWED, code, attributionTag,
-                    packageName);
+        public AppOpsService(IPackageManager pm) {
+            super(pm);
         }
     }
 

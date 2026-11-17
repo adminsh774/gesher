@@ -294,6 +294,14 @@ Check 'services: URI delegation, provider patterns, exact identities and scoped 
   $uriGrantsOut
 } @('UriGrantContractTest all passed: 138 checks; binder=true')
 
+$appOpsOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'AppOpsContractTest') 90
+$appOpsCode = $LASTEXITCODE
+Check 'services: real AppOps state machine, mode enforcement, callbacks and persistence' {
+  $global:LASTEXITCODE = $appOpsCode
+  $appOpsOut
+} @('AppOpsContractTest all passed:')
+
 # Caller identity and URI snapshots must survive actual ActivityThread delivery,
 # relaunch and results, including a PendingIntent holder cleared by its own send.
 . "$PSScriptRoot/../component-caller-contracts.ps1"

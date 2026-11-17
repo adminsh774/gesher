@@ -162,7 +162,7 @@ public final class Services {
                 new AlarmManagerService(am, pm)).asBinder());
         services.put(Context.APP_OPS_SERVICE, StandIn.of(
                 com.android.internal.app.IAppOpsService.class,
-                new DeviceServices.AppOpsService()).asBinder());
+                new AppOpsService(pm)).asBinder());
         services.put(Context.APPWIDGET_SERVICE, StandIn.of(
                 com.android.internal.appwidget.IAppWidgetService.class,
                 new DeviceServices.AppWidgetService()).asBinder());
