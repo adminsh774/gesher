@@ -154,6 +154,11 @@ final class AppOpsPermissionChecker extends android.permission.IPermissionChecke
                     && !permission(permission, node)) return PERMISSION_HARD_DENIED;
         }
         if (info != null && !appOpPermission && !runtime || op == OP_NONE) return PERMISSION_GRANTED;
+        // No virtual-device backend exists. Reject before linking any delivery token, creating
+        // accounting, or dispatching observer work, including the proxy side of a chain.
+        for (AttributionSourceState node : chain) if (node.deviceId != 0) {
+            return appOpPermission ? PERMISSION_HARD_DENIED : PERMISSION_SOFT_DENIED;
+        }
         if (attributedOp != OP_NONE) AppOpsService.validateOp(attributedOp);
         int blamedOp = attributedOp == OP_NONE ? op : attributedOp;
         boolean start = forDelivery && startDelivery && !appOpPermission;

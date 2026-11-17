@@ -80,6 +80,7 @@ public final class AppOpsService extends IAppOpsService.Default {
         mEvents.setRemoveOnCancelPolicy(true);
         pm.onPackageRemoval(this::packageRemoved);
         pm.onPackageChange(this::packageChanged);
+        pm.permissions().addRuntimeModeListener(this::permissionModesChanged);
     }
 
     void attach(CallerIdentity callers, Supplier<Map<Integer, UidState>> source) {
@@ -148,6 +149,8 @@ public final class AppOpsService extends IAppOpsService.Default {
         return !mPm.isRemovalPending(owner.name()) && owner.matches(mPm.get(owner.name()));
     }
     private int raw(State state, int op, int uid, String name) {
+        Integer runtime = mPm.permissions().runtimeOpMode(op, uid);
+        if (runtime != null) return runtime;
         int initial = AppOpsManager.opToDefaultMode(op);
         UidMode uidMode = state.uids().get(new UidOp(uid, op));
         if (uidMode != null && uidMode.mode() != initial
@@ -187,6 +190,8 @@ public final class AppOpsService extends IAppOpsService.Default {
     @Override public void setMode(int code, int uid, String name, int mode) {
         enforce(Manifest.permission.MANAGE_APP_OPS_MODES);
         int op = switchOp(code); validateMode(mode);
+        // Android 16's checking service ignores package modes for runtime permission ops.
+        if (mPm.permissions().runtimePermissionForOp(op) != null) return;
         List<Change> changes;
         synchronized (mMutationLock) {
             synchronized (mPm) {
@@ -217,6 +222,9 @@ public final class AppOpsService extends IAppOpsService.Default {
     private boolean setUidModeChecked(int code, int uid, ApkPackage expected, int mode) {
         int op = switchOp(code); validateMode(mode);
         if (uid < 0) throw new IllegalArgumentException("Invalid UID");
+        if (mPm.permissions().runtimePermissionForOp(op) != null) {
+            return mPm.permissions().setRuntimeAppOpMode(uid, expected, op, mode);
+        }
         List<Change> changes;
         synchronized (mMutationLock) {
             synchronized (mPm) {
@@ -268,6 +276,21 @@ public final class AppOpsService extends IAppOpsService.Default {
             } finally { Binder.restoreCallingIdentity(identity); }
             notifyMode(change.pkg, change.op, false);
         }
+    }
+    private void permissionModesChanged(int uid, Map<Integer, Integer> before, Map<Integer, Integer> after, Object publicationLock) {
+        List<Change> changes = new ArrayList<>();
+        for (ApkPackage pkg : packagesForUid(uid)) for (var entry : after.entrySet()) {
+            Integer old = before.get(entry.getKey());
+            if (old != null && !old.equals(entry.getValue())) {
+                changes.add(new Change(pkg, entry.getKey(), old, entry.getValue()));
+            }
+        }
+        // Permission publication can originate inside a package transaction. Enqueue without
+        // acquiring the operation monitor; active-state transitions and callbacks run afterward.
+        dispatch(() -> {
+            if (publicationLock != null) { synchronized (publicationLock) { } }
+            changed(changes);
+        });
     }
     @Override public void resetAllModes(int user, String name) {
         enforce(Manifest.permission.MANAGE_APP_OPS_MODES);
@@ -508,14 +531,16 @@ public final class AppOpsService extends IAppOpsService.Default {
     @Override public SyncNotedAppOp noteOperationForDevice(int code, int uid, String name, String tag, int device,
             boolean collect, String message, boolean collectMessage) {
         verifyIncomingUid(uid); verifyReadableOp(code);
+        if (device != 0) return new SyncNotedAppOp(MODE_IGNORED, code, tag, name);
         OpKey key = key(code, uid, name, tag, device);
         SyncNotedAppOp result = note(key, OP_FLAG_SELF, null);
         if (collect && result.getOpMode() == MODE_ALLOWED) collectAsync(key, message);
         return result;
     }
     private SyncNotedAppOp note(OpKey key, int flags, AppOpsManager.OpEventProxyInfo proxy) {
+        if (key.device != 0) return result(MODE_IGNORED, key);
         refreshUidStates();
-        int mode = key.device != 0 || restricted(key.op, key.uid, key.name, key.tag, false)
+        int mode = restricted(key.op, key.uid, key.name, key.tag, false)
                 ? MODE_IGNORED : effective(key.op, key.uid, key.name);
         synchronized (mLock) {
             if (packageFor(key.uid, key.name) != null) record(key, mode == MODE_ALLOWED, flags, proxy);
@@ -530,6 +555,7 @@ public final class AppOpsService extends IAppOpsService.Default {
     @Override public SyncNotedAppOp startOperationForDevice(IBinder token, int code, int uid, String name, String tag,
             int device, boolean startDefault, boolean collect, String message, boolean collectMessage, int flags, int chain) {
         verifyIncomingUid(uid); verifyReadableOp(code);
+        if (device != 0) return new SyncNotedAppOp(MODE_IGNORED, code, tag, name);
         OpKey key = key(code, uid, name, tag, device);
         int dependency = switch (code) {
             case OP_RECORD_AUDIO_HOTWORD, OP_RECEIVE_AMBIENT_TRIGGER_AUDIO, OP_RECORD_AUDIO_SANDBOXED -> OP_RECORD_AUDIO;
@@ -549,6 +575,7 @@ public final class AppOpsService extends IAppOpsService.Default {
     }
     private SyncNotedAppOp start(IBinder token, OpKey key, boolean startDefault, int flags, int chain,
             int operationFlags, AppOpsManager.OpEventProxyInfo proxy) {
+        if (key.device != 0) return result(MODE_IGNORED, key);
         Objects.requireNonNull(token, "AppOps client token");
         refreshUidStates();
         int mode = key.device != 0 || restricted(key.op, key.uid, key.name, key.tag, false)
@@ -718,7 +745,8 @@ public final class AppOpsService extends IAppOpsService.Default {
                         new AppOpsManager.AttributedOpEntry(key.op, history.active > 0, accessSnapshot(key, history), history.reject.clone()));
             }
         }
-        for (PackageOp key : mStore.state().packages().keySet()) if (key.uid() == uid && key.name().equals(name) && includes(requested, key.op())) {
+        for (PackageOp key : mStore.state().packages().keySet()) if (key.uid() == uid && key.name().equals(name)
+                && includes(requested, key.op()) && mPm.permissions().runtimePermissionForOp(key.op()) == null) {
             entries.computeIfAbsent(key.op(), ignored -> new HashMap<>());
         }
         List<AppOpsManager.OpEntry> list = new ArrayList<>();
@@ -742,8 +770,16 @@ public final class AppOpsService extends IAppOpsService.Default {
         enforce(Manifest.permission.GET_APP_OPS_STATS); validateOps(ops);
         List<AppOpsManager.OpEntry> entries = new ArrayList<>();
         for (var entry : mStore.state().uids().entrySet()) {
-            if (entry.getKey().uid() == uid && includes(ops, entry.getKey().op()) && entry.getValue().owners().stream().anyMatch(this::validOwner)) {
+            if (entry.getKey().uid() == uid && includes(ops, entry.getKey().op())
+                    && mPm.permissions().runtimePermissionForOp(entry.getKey().op()) == null
+                    && entry.getValue().owners().stream().anyMatch(this::validOwner)) {
                 entries.add(new AppOpsManager.OpEntry(entry.getKey().op(), entry.getValue().mode(), Map.of()));
+            }
+        }
+        if (!packagesForUid(uid).isEmpty()) for (int op = 0; op < _NUM_OP; op++) if (includes(ops, op)) {
+            Integer mode = mPm.permissions().runtimeOpMode(op, uid);
+            if (mode != null && mode != AppOpsManager.opToDefaultMode(op)) {
+                entries.add(new AppOpsManager.OpEntry(op, mode, Map.of()));
             }
         }
         return entries.isEmpty() ? null : List.of(new AppOpsManager.PackageOps(null, uid, entries));
@@ -781,6 +817,9 @@ public final class AppOpsService extends IAppOpsService.Default {
         for (Client client : empty) releaseEmpty(client);
         retireObservers(name, null);
         pruneModes(name);
+        // The installer cannot retire ownership durably while an old grant remains on disk.
+        // This explicit lifecycle boundary runs outside the package and operation monitors.
+        if (!mStore.flush()) throw new IllegalStateException("Cannot persist retired AppOps ownership");
     }
     private void packageChanged(ApkPackage pkg) {
         // Signed package generations own modes. A replaced APK cannot inherit an unrelated
@@ -885,6 +924,7 @@ public final class AppOpsService extends IAppOpsService.Default {
         List<AttributionSourceState> chain = AppOpsAttribution.chain(source);
         if (chain.size() < 2) throw new IllegalArgumentException("Proxy operation requires a receiver");
         AttributionSourceState receiver = chain.get(1);
+        if (source.deviceId != 0 || receiver.deviceId != 0) return result(MODE_IGNORED, key(op, receiver));
         boolean trusted = trustedProxy(source, receiver);
         OpKey proxied = key(op, receiver);
         if (!(skip && trustedSkip(source))) {
@@ -909,6 +949,7 @@ public final class AppOpsService extends IAppOpsService.Default {
         List<AttributionSourceState> chain = AppOpsAttribution.chain(source);
         if (chain.size() < 2) throw new IllegalArgumentException("Proxy operation requires a receiver");
         AttributionSourceState receiver = chain.get(1);
+        if (source.deviceId != 0 || receiver.deviceId != 0) return result(MODE_IGNORED, key(op, receiver));
         OpKey proxy = key(op, source), proxied = key(op, receiver);
         boolean omitProxy = skip && trustedSkip(source);
         refreshUidStates();
@@ -1222,7 +1263,9 @@ public final class AppOpsService extends IAppOpsService.Default {
     }
     @Override public void reloadNonHistoricalState() {
         enforce(Manifest.permission.MANAGE_APPOPS);
-        synchronized (mMutationLock) { mStore.commit(mStore.state()); mStore.reload(); }
+        // Android 16 AppOpService.readState is a no-op: published policy remains authoritative.
+        // Keep the explicit flush boundary without replacing it with an older on-disk state.
+        synchronized (mMutationLock) { mStore.flush(); }
     }
 
 }

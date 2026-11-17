@@ -503,7 +503,7 @@ final class Installer {
                     throw failure;
                 }
                 identity.acceptPublished();
-                mPm.publishPrepared(installed);
+                mPm.publishPrepared(installed, this);
             }
         }
     }
@@ -530,7 +530,7 @@ final class Installer {
                 installed.setSystemAddon(true);
             }
             installed.prepareInstalledDataDirectories();
-            mPm.add(installed);
+            mPm.add(installed, this);
         }
         return new String[] {pkg, "unchanged", old.codePath,
                 String.valueOf(parsed.versionCode())};

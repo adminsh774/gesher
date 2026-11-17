@@ -72,13 +72,28 @@ public final class PackageManagerService extends IPackageManager.Default {
         Map<String, ApkPackage> next = new LinkedHashMap<>(mRemoving);
         next.put(original.packageName, original); mRemoving = next;
     }
-    synchronized void endPackageRemoval(ApkPackage original) {
-        if (mRemoving.get(original.packageName) != original) return;
-        Map<String, ApkPackage> next = new LinkedHashMap<>(mRemoving);
-        next.remove(original.packageName); mRemoving = next;
+    void endPackageRemoval(ApkPackage original) {
+        boolean restored;
+        synchronized (this) {
+            if (mRemoving.get(original.packageName) != original) return;
+            Map<String, ApkPackage> next = new LinkedHashMap<>(mRemoving);
+            next.remove(original.packageName); mRemoving = next;
+            restored = mPermissions.finishPackageRemoval(original);
+        }
+        if (restored) mPermissions.packageRemovalRestored(original);
     }
     /** Installer holds its monitor and has restored every unresolved precommit journal. */
-    synchronized void recoveredPackageRemovals() { mRemoving = new LinkedHashMap<>(); }
+    void recoveredPackageRemovals() {
+        List<ApkPackage> restored = new ArrayList<>();
+        synchronized (this) {
+            List<ApkPackage> previous = new ArrayList<>(mRemoving.values());
+            mRemoving = new LinkedHashMap<>();
+            for (ApkPackage original : previous) {
+                if (mPermissions.finishPackageRemoval(original)) restored.add(original);
+            }
+        }
+        for (ApkPackage original : restored) mPermissions.packageRemovalRestored(original);
+    }
 
     /** Server-local capability cleanup; never callable through the package Binder. */
     synchronized void onPackageRemoval(Consumer<String> cleanup) { mPackageRemoval.add(cleanup); }
@@ -168,6 +183,7 @@ public final class PackageManagerService extends IPackageManager.Default {
             enabledStore();
             identity.accept();
         }
+        mPermissions.initializePackages();
     }
 
     private synchronized PackageEnabledStore enabledStore() {
@@ -195,21 +211,34 @@ public final class PackageManagerService extends IPackageManager.Default {
     }
 
     /** Adds or replaces a package (an install or an update). */
-    synchronized void add(ApkPackage p) {
+    void add(ApkPackage p) { add(p, this); }
+
+    synchronized void add(ApkPackage p, Object publicationLock) {
         try (PackageUids.Admission identity = prepareAdd(p)) {
             identity.commit();
             identity.accept();
-            publishPrepared(p);
+            publishPrepared(p, publicationLock);
         }
     }
 
     /** Caller already committed the durable identity and package registry together. */
-    synchronized void publishPrepared(ApkPackage p) {
+    void publishPrepared(ApkPackage p) { publishPrepared(p, this); }
+
+    synchronized void publishPrepared(ApkPackage p, Object publicationLock) {
         if (p.uidPending() || p.uid() < 0) throw new IllegalStateException("Package identity was not admitted");
         Map<String, ApkPackage> map = new LinkedHashMap<>(mPackages);
         map.put(p.packageName, p);
-        mPackages = map;
-        PackageManager.invalidatePackageInfoCache();
+        Runnable permissions = mPermissions.publishPackage(p, () -> {
+            mPackages = map;
+            PackageManager.invalidatePackageInfoCache();
+        }, publicationLock);
+        mPackageEventExecutor.execute(() -> {
+            synchronized (publicationLock) { }
+            synchronized (PackageManagerService.this) { }
+            long identity = Binder.clearCallingIdentity();
+            try { permissions.run(); }
+            finally { Binder.restoreCallingIdentity(identity); }
+        });
     }
 
     /** Removes a package (an uninstall); returns it, or null. */
