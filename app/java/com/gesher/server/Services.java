@@ -82,14 +82,14 @@ public final class Services {
         return create(packages, true);
     }
 
-    /** Stand-in services share no persistent account state with the real device. */
+    /** Stand-in services share no persistent account or enabled-state policy with the real device. */
     public static Map<String, IBinder> createInProcess(Collection<ApkPackage> packages) {
         return create(packages, false);
     }
 
     private static Map<String, IBinder> create(Collection<ApkPackage> packages, boolean persistentAccounts) {
         Map<String, IBinder> services = new LinkedHashMap<>();
-        PackageManagerService pm = new PackageManagerService(packages);
+        PackageManagerService pm = new PackageManagerService(packages, persistentAccounts);
         ActivityTaskManagerService atm = new ActivityTaskManagerService(pm);
         NotificationManagerService notifications = new NotificationManagerService();
         ActivityManagerService am = new ActivityManagerService(atm, pm, notifications);
@@ -162,7 +162,9 @@ public final class Services {
                 new AlarmManagerService(am, pm)).asBinder());
         services.put(Context.APP_OPS_SERVICE, StandIn.of(
                 com.android.internal.app.IAppOpsService.class,
-                new DeviceServices.AppOpsService()).asBinder());
+                pm.appOps()).asBinder());
+        services.put("permission_checker", StandIn.of(android.permission.IPermissionChecker.class,
+                new AppOpsPermissionChecker(pm)).asBinder());
         services.put(Context.APPWIDGET_SERVICE, StandIn.of(
                 com.android.internal.appwidget.IAppWidgetService.class,
                 new DeviceServices.AppWidgetService()).asBinder());
@@ -724,30 +726,6 @@ public final class Services {
         @Override
         public int getForceInvertState(int userId) {
             return UiModeManager.FORCE_INVERT_TYPE_OFF;
-        }
-    }
-
-    /** Permission checks follow the same package policy as PackageManager and AM. */
-    public static final class PermissionChecker extends android.permission.IPermissionChecker.Default {
-        private PermissionPolicy policy() {
-            Created created = sLast;
-            return created == null ? null : created.pm.permissions();
-        }
-        @Override public int checkPermission(String permission,
-                android.content.AttributionSourceState source, String message,
-                boolean forDataDelivery, boolean startDataDelivery, boolean fromDatasource,
-                int attributedOp) {
-            PermissionPolicy policy = policy();
-            return policy == null ? android.content.PermissionChecker.PERMISSION_HARD_DENIED
-                    : policy.checkAttribution(permission, source, fromDatasource);
-        }
-        @Override public void finishDataDelivery(int op,
-                android.content.AttributionSourceState source, boolean fromDatasource) { }
-        @Override public int checkOp(int op, android.content.AttributionSourceState source,
-                String message, boolean forDataDelivery, boolean startDataDelivery) {
-            PermissionPolicy policy = policy();
-            return policy == null ? android.content.PermissionChecker.PERMISSION_HARD_DENIED
-                    : policy.checkAttribution(android.app.AppOpsManager.opToPermission(op), source, false);
         }
     }
 

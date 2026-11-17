@@ -219,10 +219,13 @@ public final class Main {
             if (dataDir != null) {
                 pkg.setDataDir(new File(dataDir).getAbsolutePath());
             }
+            // Admission assigns the stable UID; snapshot application/component
+            // metadata only after the in-process package manager has accepted it.
+            Services.installInProcess(Services.createInProcess(List.of(pkg)));
+            pkg.prepareDataDirectories();
             appInfo = pkg.applicationInfo(PackageManager.GET_META_DATA
                     | PackageManager.GET_SHARED_LIBRARY_FILES);
             launch = pkg.launcherActivity(activity);
-            Services.installInProcess(Services.createInProcess(List.of(pkg)));
             com.gesher.server.ConnectivityService.applyInternetPermission(pkg);  // docs/network.md
             log("stand-in services in this process: "
                     + String.join(", ", ServiceManager.listServices()));
@@ -237,7 +240,6 @@ public final class Main {
             // The app's windows are Win32 windows drawn in this process (WindowSession).
             WindowMode.install(showWindow);
         }
-        new File(appInfo.dataDir).mkdirs();
         // The APK's lib/x86_64 (or, for an arm64-only APK, lib/arm64-v8a: run by the
         // arm64 translator) into nativeLibraryDir, for System.loadLibrary (NativeLibs).
         int libs = NativeLibs.extract(apk, appInfo.nativeLibraryDir);

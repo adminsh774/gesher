@@ -75,7 +75,8 @@ final class PermissionCatalog {
             PermissionInfo sea = new PermissionInfo();
             sea.name = "android.permission.SCHEDULE_EXACT_ALARM";
             sea.packageName = "android";
-            sea.protectionLevel = PermissionInfo.PROTECTION_NORMAL | PermissionInfo.PROTECTION_FLAG_APPOP;
+            sea.protectionLevel = PermissionInfo.PROTECTION_SIGNATURE
+                    | PermissionInfo.PROTECTION_FLAG_PRIVILEGED | PermissionInfo.PROTECTION_FLAG_APPOP;
             mFramework.put(sea.name, sea);
         }
         if (!mFramework.containsKey("android.permission.USE_EXACT_ALARM")) {

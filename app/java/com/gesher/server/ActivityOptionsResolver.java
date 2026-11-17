@@ -35,10 +35,17 @@ import java.util.Objects;
 final class ActivityOptionsResolver {
     private final Map<String, ApkPackage> mPackages;
     private final boolean mHostBrowser;
+    private final ExactAlarmAccessRequests mExactAlarmSettings;
 
     ActivityOptionsResolver(Map<String, ApkPackage> packages, boolean hostBrowser) {
+        this(packages, hostBrowser, null);
+    }
+
+    ActivityOptionsResolver(Map<String, ApkPackage> packages, boolean hostBrowser,
+            ExactAlarmAccessRequests exactAlarmSettings) {
         mPackages = packages;
         mHostBrowser = hostBrowser;
+        mExactAlarmSettings = exactAlarmSettings;
     }
 
     List<ResolveInfo> query(ComponentName caller, Intent[] specifics, String[] specificTypes,
@@ -130,8 +137,7 @@ final class ActivityOptionsResolver {
 
     private boolean matchesPackage(ApkPackage pkg, long flags) {
         return ((flags & PackageManager.MATCH_SYSTEM_ONLY) == 0 || pkg.isSystemAddon())
-                && ((flags & PackageManager.MATCH_DISABLED_COMPONENTS) != 0
-                        || pkg.parsed.isEnabled());
+                && pkg.matchesEnabledApplication(flags);
     }
 
     private static boolean matchesActivity(ActivityInfo activity, long flags) {
@@ -154,17 +160,17 @@ final class ActivityOptionsResolver {
             ActivityInfo activity = pkg.activityInfo(component.getClassName(),
                     flags & ~PackageManager.MATCH_SYSTEM_ONLY);
             if (activity == null || !matchesActivity(activity, flags)) return null;
-            activity.applicationInfo.enabled = pkg.parsed.isEnabled();
             return activity;
         }
         if (mHostBrowser && BrowserPackageSupport.isBrowserPackage(component.getPackageName())) {
             ActivityInfo activity = BrowserPackageSupport.activityInfo(component.getClassName(), flags);
             return activity != null && matchesActivity(activity, flags) ? activity : null;
         }
+        if (mExactAlarmSettings != null) return mExactAlarmSettings.activityInfo(component, flags);
         return null;
     }
 
-    private List<ResolveInfo> activities(Intent original, String type, long flags) {
+    List<ResolveInfo> activities(Intent original, String type, long flags) {
         // ComputerEngine selects its package-specific resolver before substituting a
         // selector. A selector's package still restricts candidates, but uses MIME cuts.
         boolean packageQuery = original.getPackage() != null;
@@ -195,7 +201,6 @@ final class ActivityOptionsResolver {
             }
             PackageInfo metadata = pkg.packageInfo((flags & ~PackageManager.MATCH_SYSTEM_ONLY)
                     | PackageManager.GET_ACTIVITIES);
-            metadata.applicationInfo.enabled = pkg.parsed.isEnabled();
             if (metadata.activities == null) continue;
             for (ParsedActivity parsed : pkg.parsed.getActivities()) {
                 ActivityInfo activity = null;
@@ -236,6 +241,10 @@ final class ActivityOptionsResolver {
             }
         }
         for (List<ResolveInfo> cut : cuts) results.addAll(cut);
+        if (mExactAlarmSettings != null) {
+            ResolveInfo nativeSettings = mExactAlarmSettings.resolve(original, type, flags);
+            if (nativeSettings != null) results.add(nativeSettings);
+        }
         results.sort(ORDER);
         return results;
     }
@@ -313,7 +322,7 @@ final class ActivityOptionsResolver {
         return cut;
     }
 
-    private static final Comparator<ResolveInfo> ORDER = (left, right) -> {
+    static final Comparator<ResolveInfo> ORDER = (left, right) -> {
         int order = Integer.compare(right.priority, left.priority);
         if (order == 0) order = Integer.compare(right.preferredOrder, left.preferredOrder);
         if (order == 0) order = Boolean.compare(right.isDefault, left.isDefault);
