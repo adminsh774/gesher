@@ -24,6 +24,7 @@ add_library(gesher_posix STATIC
   ${CMAKE_CURRENT_LIST_DIR}/src/misc.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/netdb.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/network_dns.cc
+  ${CMAKE_CURRENT_LIST_DIR}/src/ofd.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/path.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/process.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/record_lock_descriptors.cc

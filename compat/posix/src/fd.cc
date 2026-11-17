@@ -174,6 +174,7 @@ using gesher::SocketFd;
 namespace {
 int CloseFdBody(int fd, bool unpublished, SocketFd* deferred = nullptr) {
   gesher::ForgetEpollEntries(fd);
+  gesher::ForgetOfd(fd);
   SocketFd state;
   int result;
   bool last = false;
@@ -259,6 +260,15 @@ int read(int fd, void* buf, unsigned int count) {
     if (gesher::LookupDevice(fd, &device)) return gesher::ReadDevice(device, buf, count);
     int result;
     if (gesher::ReadEventObject(fd, buf, count, &result)) return result;
+    HANDLE h = gesher::HandleFromFd(fd);
+    if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE &&
+        gesher::IsNonBlockingMode(fd)) {
+      DWORD avail = 0;
+      if (PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
+        if (avail == 0) return errno = EAGAIN, -1;
+        if (count > avail) count = avail;
+      }
+    }
     return gesher::CrtResult(_read(fd, buf, count));
   }
   gesher::ws::Buffer buffer = {buf, count};
@@ -270,6 +280,9 @@ int write(int fd, const void* buf, unsigned int count) {
   if (!gesher::LookupSocket(fd, &state)) {
     int result;
     if (gesher::WriteEventObject(fd, buf, count, &result)) return result;
+    if (gesher::IsAppendMode(fd)) {
+      _lseeki64(fd, 0, SEEK_END);
+    }
     result = gesher::CrtResult(_write(fd, buf, count));
     if (result > 0) gesher::InotifyNoteWrite(fd);
     if (result > 0 && gesher::HasPollWaiters() &&
@@ -291,11 +304,20 @@ int dup(int fd) {
     if (fd2 >= 0 && gesher::LookupDevice(fd, &device)) gesher::RegisterDevice(fd2, device);
     if (fd2 >= 0) gesher::DupEventObject(fd, fd2);
     if (fd2 >= 0) gesher::DupBinder(fd, fd2);
+    if (fd2 >= 0) gesher::DupOfd(fd, fd2);
+    if (fd2 >= 0) {
+      HANDLE h2 = gesher::HandleFromFd(fd2);
+      if (h2 != INVALID_HANDLE_VALUE) {
+        SetHandleInformation(h2, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+      }
+    }
     return fd2;
   }
   // WSADuplicateSocket creates distinct native connect-error ownership.
   // POSIX aliases instead share the same native socket and last-close count.
-  return gesher::RegisterSocket(state);
+  int fd2 = gesher::RegisterSocket(state);
+  if (fd2 >= 0) gesher::DupOfd(fd, fd2);
+  return fd2;
 }
 
 int dup2(int fd, int fd2) {
@@ -326,12 +348,18 @@ int dup2(int fd, int fd2) {
     gesher::ForgetEventObject(fd2);
     gesher::ForgetEpollEntries(fd2);
     gesher::ForgetBinder(fd2);
+    gesher::ForgetOfd(fd2);
     Device device;
     if (!source_is_socket && gesher::LookupDevice(fd, &device)) {
       gesher::RegisterDevice(fd2, device);
     } else if (!source_is_socket) {
       gesher::DupEventObject(fd, fd2);
       gesher::DupBinder(fd, fd2);
+    }
+    gesher::DupOfd(fd, fd2);
+    HANDLE h2 = gesher::HandleFromFd(fd2);
+    if (h2 != INVALID_HANDLE_VALUE) {
+      SetHandleInformation(h2, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     }
   }
   // POSIX dup2 does not report the replaced endpoint's close error. A failed

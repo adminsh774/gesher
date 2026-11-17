@@ -144,4 +144,13 @@ bool DeviceFromFd(int fd, Device* device);
 // Takes over `fd`, which must be open on NUL.
 void RegisterDevice(int fd, Device device);
 
+// Open file description management and file status flags (ofd.cc).
+void RegisterOfd(int fd, int flags);
+void DupOfd(int old_fd, int new_fd);
+void ForgetOfd(int fd);
+int GetFileStatusFlags(int fd);
+int SetFileStatusFlags(int fd, int flags);
+bool IsAppendMode(int fd);
+bool IsNonBlockingMode(int fd);
+
 }  // namespace gesher

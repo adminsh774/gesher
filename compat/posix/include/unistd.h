@@ -162,6 +162,7 @@ pid_t fork(void);
 
 int pipe(int fds[2]);
 int pipe2(int fds[2], int flags);
+int dup3(int oldfd, int newfd, int flags);
 int fsync(int fd);
 int fdatasync(int fd);
 // Guest ftruncate, including Linux's cached partial-page invalidation for a

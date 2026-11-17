@@ -449,9 +449,9 @@ int fcntl(int fd, int cmd, ...) {
       }
       return 0;
     case F_GETFL:
-      return O_RDWR;
+      return gesher::GetFileStatusFlags(fd);
     case F_SETFL:
-      return 0;
+      return gesher::SetFileStatusFlags(fd, static_cast<int>(arg));
     case F_DUPFD:
     case F_DUPFD_CLOEXEC: {
       return gesher::record_locks::DuplicateAtLeast(fd, static_cast<int>(arg), cmd == F_DUPFD_CLOEXEC);
@@ -737,6 +737,7 @@ int memfd_create(const char* name, unsigned int flags) {
   int fd = gesher::CrtResult(_open_osfhandle(reinterpret_cast<intptr_t>(h),
                            _O_RDWR | _O_BINARY | ((flags & MFD_CLOEXEC) != 0 ? _O_NOINHERIT : 0)));
   if (fd < 0) CloseHandle(h);
+  else gesher::RegisterOfd(fd, O_RDWR);
   return fd;
 }
 

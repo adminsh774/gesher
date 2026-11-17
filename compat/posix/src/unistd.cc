@@ -287,12 +287,25 @@ pid_t getpgrp(void) { return static_cast<pid_t>(GetCurrentProcessId()); }
 pid_t fork(void) { return errno = ENOSYS, -1; }
 
 int pipe2(int fds[2], int flags) {
+  if ((flags & ~(O_CLOEXEC | O_NONBLOCK)) != 0) return errno = EINVAL, -1;
   int mode = _O_BINARY | ((flags & O_CLOEXEC) != 0 ? _O_NOINHERIT : 0);
   gesher::record_locks::DescriptorGuard descriptor_guard;
-  return gesher::CrtResult(_pipe(fds, 64 * 1024, mode));
+  int res = gesher::CrtResult(_pipe(fds, 64 * 1024, mode));
+  if (res < 0) return -1;
+  gesher::RegisterOfd(fds[0], O_RDONLY | (flags & O_NONBLOCK));
+  gesher::RegisterOfd(fds[1], O_WRONLY | (flags & O_NONBLOCK));
+  return 0;
 }
 
 int pipe(int fds[2]) { return pipe2(fds, 0); }
+
+int dup3(int oldfd, int newfd, int flags) {
+  if (oldfd == newfd) return errno = EINVAL, -1;
+  if ((flags & ~O_CLOEXEC) != 0) return errno = EINVAL, -1;
+  int r = dup2(oldfd, newfd);
+  if (r >= 0 && (flags & O_CLOEXEC) != 0) fcntl(r, F_SETFD, FD_CLOEXEC);
+  return r;
+}
 
 // Only files are flushed: FlushFileBuffers on a pipe waits until the reader
 // has read everything, where Linux fails at once with EINVAL (pipes, sockets,
