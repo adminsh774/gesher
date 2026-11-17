@@ -8,16 +8,24 @@ import android.app.IUriGrantsManager;
 import android.content.pm.ParceledListSlice;
 import android.net.Uri;
 import android.os.IBinder;
-import java.util.Collections;
 
 /** Explicit API outcomes for persistence/owner tokens beyond the ephemeral AM grants. */
-final class UriGrantsManagerService extends IUriGrantsManager.Default {
+public final class UriGrantsManagerService extends IUriGrantsManager.Default {
     private final CallerIdentity mCallers;
     private final UriGrants mGrants;
 
-    UriGrantsManagerService(PackageManagerService pm, ActivityTaskManagerService atm,
+    public UriGrantsManagerService(PackageManagerService pm, ActivityTaskManagerService atm,
             ActivityManagerService am) {
-        mCallers = new CallerIdentity(pm, atm); mGrants = am.uriGrants();
+        this(pm, atm, am != null ? am.uriGrants() : null);
+    }
+
+    public UriGrantsManagerService(PackageManagerService pm, ActivityTaskManagerService atm,
+            UriGrants uriGrants) {
+        mCallers = new CallerIdentity(pm, atm);
+        mGrants = uriGrants;
+        if (mGrants != null) {
+            mGrants.load();
+        }
     }
 
     private void user(int userId) {
@@ -31,12 +39,21 @@ final class UriGrantsManagerService extends IUriGrantsManager.Default {
     }
     @Override public void takePersistableUriPermission(Uri uri, int modes, String packageName, int userId) {
         user(userId);
-        if (packageName == null) { if (!mCallers.isSystem()) mCallers.callerPackage(); }
-        else target(packageName);
-        throw new UnsupportedOperationException("Persistable URI grants are not implemented");
+        if (packageName == null) {
+            if (!mCallers.isSystem()) packageName = mCallers.callerPackage();
+        } else {
+            target(packageName);
+        }
+        mGrants.takePersistable(packageName, uri, modes, userId);
     }
     @Override public void releasePersistableUriPermission(Uri uri, int modes, String packageName, int userId) {
-        takePersistableUriPermission(uri, modes, packageName, userId);
+        user(userId);
+        if (packageName == null) {
+            if (!mCallers.isSystem()) packageName = mCallers.callerPackage();
+        } else {
+            target(packageName);
+        }
+        mGrants.releasePersistable(packageName, uri, modes, userId);
     }
     @Override public void grantUriPermissionFromOwner(IBinder owner, int fromUid, String targetPackage,
             Uri uri, int modes, int sourceUserId, int targetUserId) {
@@ -45,8 +62,7 @@ final class UriGrantsManagerService extends IUriGrantsManager.Default {
     }
     @Override public ParceledListSlice getGrantedUriPermissions(String packageName, int userId) {
         host(); user(userId);
-        // Android's administration API lists persisted grants; none are implemented.
-        return new ParceledListSlice(Collections.emptyList());
+        return new ParceledListSlice(mGrants.list(packageName, false, true));
     }
     @Override public void clearGrantedUriPermissions(String packageName, int userId) {
         host(); user(userId);

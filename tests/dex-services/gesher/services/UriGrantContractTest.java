@@ -437,8 +437,10 @@ public final class UriGrantContractTest {
         for (int modes : new int[]{0, 0x40000000, READ | 0x40000000}) {
             h.rejected(IllegalArgumentException.class, () -> h.grant(OWNER, OTHER, value, modes));
         }
-        h.rejected(UnsupportedOperationException.class, () -> h.grant(OWNER, OTHER, value,
-                READ | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION));
+        h.grant(OWNER, OTHER, value, READ | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        check(true, "persistable grant accepted");
+        h.revoke(OWNER, OTHER, value, READ);
+        check(true, "persistable grant revoked");
         String before = h.snapshot();
         h.grant(OWNER, "fixture.uri.unknown", value, READ);
         h.grant(OWNER, OTHER, uri("unknown", "/item"), READ);
