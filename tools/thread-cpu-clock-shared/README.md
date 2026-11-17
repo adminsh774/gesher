@@ -17,7 +17,7 @@ different targets in separate static and DLL providers. Centralizing clock
 IDs cannot disambiguate an already ambiguous pthread ID.
 
 This component uses one DLL for the pthread namespace and clock registry.
-Both consumers explicitly link its import library. Linker maps reject static
+Both consumers explicitly link its import library. Actual linker inputs reject static
 winpthread inputs, PE tables identify the imported APIs, and runtime tests
 require both images to resolve the same functions and caller identity.
 It does not make arbitrary prebuilt static providers share a namespace.

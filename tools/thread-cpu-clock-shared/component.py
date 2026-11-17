@@ -138,16 +138,17 @@ def build(args):
         fixture_sources = ROOT / "tests/thread-cpu-clock-shared"
         common = ["-O2", "-Wall", "-Wextra", "-Werror", "-D_WIN32_WINNT=0x0A00", "-I" + str(install / "include")]
         peer_command = [cc, "-std=c11", *common, "-shared", fixture_sources / "peer.c", import_library,
-                        "-Wl,-Map," + str(role / "peer.map"),
+                        "-Wl,--verbose", "-Wl,-Map," + str(role / "peer.map"),
                         "-o", fixture / "clock-peer.dll"]
         host_command = [cxx, "-std=c++20", *common, "-static-libstdc++", "-static-libgcc",
-                        fixture_sources / "windows.cc", import_library, "-Wl,-Map," + str(role / "host.map"),
+                        fixture_sources / "windows.cc", import_library, "-Wl,--verbose", "-Wl,-Map," + str(role / "host.map"),
                         "-o", fixture / "clock-shared.exe"]
         run(peer_command, ROOT, role / "peer-build.log", env)
         run(host_command, ROOT, role / "host-build.log", env)
-        for name in ["peer.map", "host.map"]:
+        for name in ["peer-build.log", "host-build.log"]:
             linked = (role / name).read_text()
-            require("libwinpthread.dll.a" in linked and "libwinpthread.a(" not in linked and "libpthread.a(" not in linked,
+            require("Reading " + str(import_library) in linked and
+                    not re.search(r"(?:^|[/\s])lib(?:win)?pthread\.a(?:[\s(]|$)", linked, re.MULTILINE),
                     "a consumer embedded a static pthread provider")
         binary = {}
         readobj = llvm / "bin/llvm-readobj"
