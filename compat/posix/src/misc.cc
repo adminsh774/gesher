@@ -290,11 +290,8 @@ ssize_t sendfile(int out_fd, int in_fd, off_t* offset, size_t count) {
   }
   if (count == 0) return 0;
   auto seek_input = [in_fd](off_t position, int whence) {
-    off_t result = lseek(in_fd, position, whence);
-    // lseek is the CRT's 64-bit entry under _FILE_OFFSET_BITS=64. Do not
-    // narrow its result through the int-sized CrtResult helper.
-    if (result < 0) errno = gesher_errno_from_crt(errno);
-    return result;
+    // The descriptor adapter returns Linux errno and a full-width offset.
+    return lseek(in_fd, position, whence);
   };
   off_t position = offset != nullptr ? *offset : seek_input(0, SEEK_CUR);
   if (position < 0) {

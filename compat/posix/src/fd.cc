@@ -14,7 +14,9 @@
 #include <unistd.h>
 #include <windows.h>
 #include <bcrypt.h>
+#include <gesher/file_description.h>
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -78,24 +80,16 @@ bool ReplaceSocket(int fd, const SocketFd* source, SocketFd* previous, bool* las
   return existed;
 }
 
-// /dev/zero and /dev/random fds (path.cc), also guarded by table_mutex.
-std::unordered_map<int, Device> devices;
-std::atomic<size_t> device_count{0};
-
+// Stateless logical devices live in the executable-owned description table,
+// so all modules and explicitly inherited descriptors agree on their type.
 bool LookupDevice(int fd, Device* device) {
-  if (device_count.load(std::memory_order_acquire) == 0) return false;
-  std::lock_guard<std::mutex> lock(table_mutex);
-  auto it = devices.find(fd);
-  if (it == devices.end()) return false;
-  *device = it->second;
+  DescriptorKind kind = GetDescriptorKind(fd);
+  if (kind != DescriptorKind::kZero && kind != DescriptorKind::kRandom) return false;
+  *device = kind == DescriptorKind::kZero ? Device::kZero : Device::kRandom;
   return true;
 }
 
-void ForgetDevice(int fd) {
-  if (device_count.load(std::memory_order_acquire) == 0) return;
-  std::lock_guard<std::mutex> lock(table_mutex);
-  if (devices.erase(fd) != 0) device_count.fetch_sub(1, std::memory_order_release);
-}
+void ForgetDevice(int) {}  // retiring the OFD retires its logical device kind
 
 int ReadDevice(Device device, void* buf, unsigned int count) {
   if (device == Device::kZero) {
@@ -116,6 +110,11 @@ int ReserveFd() {
   record_locks::DescriptorGuard descriptor_guard;
   int fd = CrtResult(_open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDWR | _O_NOINHERIT));
   if (fd < 0) CloseHandle(h);
+  else if (SetDescriptorKind(fd, DescriptorKind::kUnshareable) < 0) {
+    int error = errno;
+    _close(fd);
+    return errno = error, -1;
+  }
   return fd;
 }
 
@@ -138,6 +137,7 @@ int RegisterSocket(const SocketFd& state) {
     if (datagram < 0) {
       const int saved = errno;
       _close(fd);
+      ForgetOfd(fd);
       ws::Close(state.socket);
       return errno = saved, -1;
     }
@@ -158,10 +158,8 @@ bool LookupSocket(int fd, SocketFd* state) {
 
 
 void RegisterDevice(int fd, Device device) {
-  std::lock_guard<std::mutex> lock(table_mutex);
-  if (devices.insert_or_assign(fd, device).second) {
-    device_count.fetch_add(1, std::memory_order_release);
-  }
+  // The OFD was allocated by FdFromHandle before this descriptor is published.
+  SetDescriptorKind(fd, device == Device::kZero ? DescriptorKind::kZero : DescriptorKind::kRandom);
 }
 
 bool DeviceFromFd(int fd, Device* device) { return LookupDevice(fd, device); }
@@ -172,9 +170,83 @@ using gesher::Device;
 using gesher::SocketFd;
 
 namespace {
+// A regular-file operation pins one native object and reads its status in the
+// same descriptor transaction. The CRT's fd-number lookup after a separate
+// F_GETFL can otherwise use a replacement fd during close/dup2. Append uses
+// one kernel write-to-end operation, including independent processes.
+bool NativeFileIo(int fd, void* buffer, unsigned int count, bool writing, int* result) {
+  HANDLE file = nullptr;
+  bool append = false;
+  {
+    gesher::record_locks::DescriptorGuard descriptor_guard;
+    HANDLE source = gesher::HandleFromFd(fd);
+    if (source == INVALID_HANDLE_VALUE) {
+      *result = (errno = EBADF, -1);
+      return true;
+    }
+    if (GetFileType(source) != FILE_TYPE_DISK) return false;
+    int flags = gesher::GetFileStatusFlags(fd);
+    if (flags < 0) { *result = -1; return true; }
+    if ((flags & O_PATH) != 0 ||
+        (flags & O_ACCMODE) == (writing ? O_RDONLY : O_WRONLY)) {
+      *result = (errno = EBADF, -1);
+      return true;
+    }
+    // A zero-length append must not move the shared cursor to EOF.
+    if (writing && count == 0) { *result = 0; return true; }
+    append = writing && (flags & O_APPEND) != 0;
+    // Pin this exact object before close/dup2 can recycle either its fd or
+    // native HANDLE. Do not hold the global descriptor lock during file I/O.
+    if (!DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(), &file,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      *result = gesher::FailWithLastError();
+      return true;
+    }
+  }
+  HANDLE event = nullptr;
+  OVERLAPPED operation{};
+  if (append) {
+    event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!event) {
+      DWORD error = GetLastError();
+      CloseHandle(file);
+      *result = (errno = gesher::ErrnoFromWin32(error), -1);
+      return true;
+    }
+    operation.hEvent = event;
+    operation.Offset = operation.OffsetHigh = MAXDWORD;
+  }
+  const DWORD want = std::min<DWORD>(count, 0x7ffff000u);
+  DWORD transferred = 0;
+  BOOL done = writing ? WriteFile(file, buffer, want, &transferred, append ? &operation : nullptr)
+                      : ReadFile(file, buffer, want, &transferred, nullptr);
+  DWORD error = done ? ERROR_SUCCESS : GetLastError();
+  if (append && !done && error == ERROR_IO_PENDING) {
+    done = GetOverlappedResult(file, &operation, &transferred, TRUE);
+    error = done ? ERROR_SUCCESS : GetLastError();
+  }
+  int native_error = 0;
+  if (!done && !writing && error == ERROR_ACCESS_DENIED) {
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (GetFileInformationByHandle(file, &information) &&
+        (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) native_error = EISDIR;
+  }
+  if (done && writing && transferred != 0) gesher::InotifyNoteWrite(file);
+  if (event) CloseHandle(event);
+  CloseHandle(file);
+  if (!done && !writing && error == ERROR_HANDLE_EOF) {
+    *result = 0;
+  } else if (!done) {
+    *result = (errno = native_error ? native_error :
+        error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER ? EFAULT : gesher::ErrnoFromWin32(error), -1);
+  } else {
+    *result = static_cast<int>(transferred);
+  }
+  return true;
+}
+
 int CloseFdBody(int fd, bool unpublished, SocketFd* deferred = nullptr) {
   gesher::ForgetEpollEntries(fd);
-  gesher::ForgetOfd(fd);
   SocketFd state;
   int result;
   bool last = false;
@@ -186,6 +258,11 @@ int CloseFdBody(int fd, bool unpublished, SocketFd* deferred = nullptr) {
     const bool pipe = gesher::HasPollWaiters() &&
                       GetFileType(gesher::HandleFromFd(fd)) == FILE_TYPE_PIPE;
     result = gesher::CrtResult(_close(fd));
+    const int close_errno = errno;
+    if (result == 0 || gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) {
+      gesher::ForgetOfd(fd);
+    }
+    errno = close_errno;
     if (pipe) gesher::WakePollers();
   } else {
     // Only the last descriptor closes the native socket. Shared metadata
@@ -206,7 +283,11 @@ int CloseFdBody(int fd, bool unpublished, SocketFd* deferred = nullptr) {
       return errno = socket_errno, -1;
     }
     int crt_closed = gesher::CrtResult(_close(fd));
-    if (unpublished && crt_closed < 0) return -1;
+    const int crt_errno = errno;
+    if (crt_closed == 0 || gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) {
+      gesher::ForgetOfd(fd);
+    }
+    if (unpublished && crt_closed < 0) return errno = crt_errno, -1;
     errno = socket_errno;
   }
   return result;
@@ -256,12 +337,17 @@ int close(int fd) { return CloseDescriptor(fd); }
 int read(int fd, void* buf, unsigned int count) {
   SocketFd state;
   if (!gesher::LookupSocket(fd, &state)) {
+    int flags = gesher::GetFileStatusFlags(fd);
+    if (flags < 0) return -1;
+    if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_WRONLY) return errno = EBADF, -1;
+    count = std::min(count, 0x7ffff000u);
     Device device;
     if (gesher::LookupDevice(fd, &device)) return gesher::ReadDevice(device, buf, count);
     int result;
+    if (NativeFileIo(fd, buf, count, false, &result)) return result;
     if (gesher::ReadEventObject(fd, buf, count, &result)) return result;
     HANDLE h = gesher::HandleFromFd(fd);
-    if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE &&
+    if (count != 0 && h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE &&
         gesher::IsNonBlockingMode(fd)) {
       DWORD avail = 0;
       if (PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
@@ -278,11 +364,13 @@ int read(int fd, void* buf, unsigned int count) {
 int write(int fd, const void* buf, unsigned int count) {
   SocketFd state;
   if (!gesher::LookupSocket(fd, &state)) {
+    int flags = gesher::GetFileStatusFlags(fd);
+    if (flags < 0) return -1;
+    if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_RDONLY) return errno = EBADF, -1;
+    count = std::min(count, 0x7ffff000u);
     int result;
+    if (NativeFileIo(fd, const_cast<void*>(buf), count, true, &result)) return result;
     if (gesher::WriteEventObject(fd, buf, count, &result)) return result;
-    if (gesher::IsAppendMode(fd)) {
-      _lseeki64(fd, 0, SEEK_END);
-    }
     result = gesher::CrtResult(_write(fd, buf, count));
     if (result > 0) gesher::InotifyNoteWrite(fd);
     if (result > 0 && gesher::HasPollWaiters() &&
@@ -297,6 +385,8 @@ int write(int fd, const void* buf, unsigned int count) {
 
 int dup(int fd) {
   gesher::record_locks::DescriptorGuard descriptor_guard;
+  // Resolve/allocate the source description before publishing any new fd.
+  if (gesher::GetFileStatusFlags(fd) < 0) return -1;
   SocketFd state;
   if (!gesher::LookupSocket(fd, &state)) {
     int fd2 = gesher::CrtResult(_dup(fd));
@@ -304,11 +394,15 @@ int dup(int fd) {
     if (fd2 >= 0 && gesher::LookupDevice(fd, &device)) gesher::RegisterDevice(fd2, device);
     if (fd2 >= 0) gesher::DupEventObject(fd, fd2);
     if (fd2 >= 0) gesher::DupBinder(fd, fd2);
-    if (fd2 >= 0) gesher::DupOfd(fd, fd2);
     if (fd2 >= 0) {
+      int error = gesher::DupOfd(fd, fd2) < 0 ? errno : 0;
       HANDLE h2 = gesher::HandleFromFd(fd2);
-      if (h2 != INVALID_HANDLE_VALUE) {
-        SetHandleInformation(h2, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+      if (!error && !SetHandleInformation(h2, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+        error = gesher::ErrnoFromWin32(GetLastError());
+      }
+      if (error) {
+        gesher::CloseUnpublishedDuplicate(fd2);
+        return errno = error, -1;
       }
     }
     return fd2;
@@ -316,18 +410,23 @@ int dup(int fd) {
   // WSADuplicateSocket creates distinct native connect-error ownership.
   // POSIX aliases instead share the same native socket and last-close count.
   int fd2 = gesher::RegisterSocket(state);
-  if (fd2 >= 0) gesher::DupOfd(fd, fd2);
+  if (fd2 >= 0 && gesher::DupOfd(fd, fd2) < 0) {
+    int error = errno;
+    gesher::CloseUnpublishedDuplicate(fd2);
+    return errno = error, -1;
+  }
   return fd2;
 }
 
-int dup2(int fd, int fd2) {
+static int DupTo(int fd, int fd2, bool cloexec) {
   SocketFd target;
   bool close_target = false;
   int saved, metadata_error;
   {
     gesher::record_locks::DescriptorGuard descriptor_guard;
-    if (fd == fd2) return _get_osfhandle(fd) != -1 ? fd : (errno = EBADF, -1);
-    if (gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
+    if (fd2 < 0 || fd2 >= 8192) return errno = EBADF, -1;
+    if (fd == fd2) return gesher::HandleFromFd(fd) != INVALID_HANDLE_VALUE ? fd : (errno = EBADF, -1);
+    if (gesher::GetFileStatusFlags(fd) < 0) return -1;
     gesher::record_locks::ClosingDescriptor transaction(fd2);
     if (transaction.Error()) return errno = transaction.Error(), -1;
     SocketFd source;
@@ -356,10 +455,15 @@ int dup2(int fd, int fd2) {
       gesher::DupEventObject(fd, fd2);
       gesher::DupBinder(fd, fd2);
     }
-    gesher::DupOfd(fd, fd2);
+    if (gesher::DupOfd(fd, fd2) < 0 && !metadata_error) metadata_error = errno;
     HANDLE h2 = gesher::HandleFromFd(fd2);
-    if (h2 != INVALID_HANDLE_VALUE) {
-      SetHandleInformation(h2, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    if (h2 == INVALID_HANDLE_VALUE) {
+      if (!metadata_error) metadata_error = EBADF;
+    } else if (!SetHandleInformation(h2, HANDLE_FLAG_INHERIT,
+                                     cloexec ? 0 : HANDLE_FLAG_INHERIT)) {
+      // Do not publish a successful dup3 when close-on-exec was not applied.
+      // Keep this inside the same descriptor transaction as replacement.
+      if (!metadata_error) metadata_error = gesher::ErrnoFromWin32(GetLastError());
     }
   }
   // POSIX dup2 does not report the replaced endpoint's close error. A failed
@@ -368,6 +472,13 @@ int dup2(int fd, int fd2) {
   if (metadata_error) return errno = metadata_error, -1;
   errno = saved;
   return fd2;
+}
+
+int dup2(int fd, int fd2) { return DupTo(fd, fd2, false); }
+
+int dup3(int oldfd, int newfd, int flags) {
+  if (oldfd == newfd || (flags & ~O_CLOEXEC) != 0) return errno = EINVAL, -1;
+  return DupTo(oldfd, newfd, (flags & O_CLOEXEC) != 0);
 }
 
 // The CRT calls any character device a terminal, NUL included, and so every

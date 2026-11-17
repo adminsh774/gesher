@@ -2,31 +2,46 @@
 #pragma once
 
 #include <fcntl.h>
+#include <gesher/file_description.h>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <windows.h>
 
 namespace gesher {
 
 struct OpenFileDescription {
-  std::atomic<int> status_flags{0};
+  struct Shared {
+    uint64_t magic;
+    uint32_t version;
+    volatile LONG flags;
+  };
+  std::atomic<DescriptorKind> kind{DescriptorKind::kFile};
+  std::atomic<int> local_flags{0};
+  std::atomic<Shared*> shared{nullptr};
+  HANDLE mapping = nullptr;
   std::mutex mutex;
+  ~OpenFileDescription();
+  int Flags() const;
+  void SetFlags(int flags);
+  HANDLE Share();  // caller holds mutex; borrowed handle, nullptr on error
+  bool Adopt(HANDLE inherited);  // takes ownership only on success
 };
 
-// Flags mask for OFD storage: access mode, O_PATH, and status flags.
+// Flags retained by Linux F_GETFL, excluding creation-only options.
 inline constexpr int kFileStatusFlagsMask =
     O_APPEND | O_NONBLOCK | O_SYNC | O_DSYNC | O_DIRECT | O_NOATIME | O_ASYNC | O_LARGEFILE;
 inline constexpr int kOpenDescriptionFlagsMask =
-    O_ACCMODE | O_PATH | kFileStatusFlagsMask;
+    O_ACCMODE | O_PATH | O_DIRECTORY | O_NOFOLLOW | kFileStatusFlagsMask;
 inline constexpr int kModifiableStatusFlags =
     O_APPEND | O_NONBLOCK | O_DIRECT | O_NOATIME | O_ASYNC;
 
 // Registers an OFD for fd with the given initial flags.
-void RegisterOfd(int fd, int flags);
-void RegisterOfd(int fd, int flags, std::shared_ptr<OpenFileDescription> existing);
+int RegisterOfd(int fd, int flags);
 
 // Duplicates the OFD from old_fd to new_fd (shared ownership).
-void DupOfd(int old_fd, int new_fd);
+int DupOfd(int old_fd, int new_fd);
 
 // Drops the OFD mapping for fd (decrements shared ownership).
 void ForgetOfd(int fd);

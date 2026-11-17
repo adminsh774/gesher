@@ -47,6 +47,13 @@ static std::string TempTestFile(const char* name) {
   return path;
 }
 
+static void check(const char* name, int ok) {
+  CHECK(ok);
+  if (!ok) std::printf("  contract: %s\n", name);
+}
+
+#include "file_description_contract_test.inc"
+
 // 1. dup() shares O_NONBLOCK, O_APPEND across descriptors pointing to the same OFD.
 // Modifying F_SETFL on fd1 modifies F_GETFL on fd2 immediately.
 static void TestDupSharesFlags() {
@@ -278,6 +285,9 @@ static void TestAppendModeSemantics() {
 
   // With O_APPEND, seeking to 0 and writing must still append at EOF
   CHECK_EQ(lseek(fd1, 0, SEEK_SET), 0);
+  // A zero-length write must not reposition the shared open description.
+  CHECK_EQ(write(fd1, "", 0), 0);
+  CHECK_EQ(lseek(fd2, 0, SEEK_CUR), 0);
   CHECK_EQ(write(fd1, "BBBB", 4), 4);
 
   // File should now be 8 bytes: "AAAABBBB"
@@ -382,6 +392,7 @@ static void TestPipeOfdSharing() {
 
   // Nonblocking read on empty pipe returns EAGAIN
   char buf[16] = {};
+  CHECK_EQ(read(p0_dup, buf, 0), 0);
   CHECK_EQ(read(p0_dup, buf, sizeof(buf)), -1);
   CHECK_EQ(errno, EAGAIN);
 
@@ -425,6 +436,7 @@ int main() {
   TestAccessModeImmutable();
   TestPipeOfdSharing();
   TestInvalidFdHandling();
+  test_file_description_contracts();
 
   std::printf("file_flags_ofd_test: %d assertions, %d failures\n", g_assertions, g_failures);
   return g_failures == 0 ? 0 : 1;

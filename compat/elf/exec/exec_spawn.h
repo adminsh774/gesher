@@ -24,6 +24,7 @@
 #pragma once
 
 #include <windows.h>
+#include <gesher/file_description.h>
 
 #include <string>
 #include <vector>
@@ -103,19 +104,24 @@ int RunTool(const std::string& name, const std::vector<std::string>& args);
 struct ChildFd {
   int fd;
   HANDLE handle;
+  // Present for descriptor-table snapshots; keeps the exact object and its
+  // shared status alive through close/reuse and process creation.
+  gesher::DescriptorSnapshotPtr snapshot{};
 };
 
 // CreateProcessW for `launch` with exactly `fds` as the child's file
 // descriptors: 0-2 are its standard handles, and every fd also goes into the
-// C runtime's inherited-fd block (STARTUPINFO's lpReserved2), from which a
-// UCRT program (gesher-exec, dalvikvm) gets fds 3 and above at the same
-// numbers. Handles are duplicated inheritable for the call only; nothing else
-// is inherited. A missing 0-2 is NUL. Returns 0 or the Win32 error.
+// C runtime's inherited-fd block and Gesher's versioned startup manifest.
+// Gesher programs retain descriptor numbers, kernel offsets and shared status
+// across exec/spawn, including descriptors above the UCRT block's size limit.
+// Only pinned, inheritable duplicates are supplied to CreateProcess. Missing
+// standard descriptors are closed before Gesher application code runs.
+// Returns 0 or the Win32 error.
 DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::wstring& cwd,
                    const std::vector<ChildFd>& fds, PROCESS_INFORMATION* info, DWORD extra_flags = 0);
 
 // CreateProcessW for `launch` with exactly the three standard handles
-// inherited (they must be inheritable; duplicates and null are fine), no
+// inherited (borrowed handles are duplicated; null means closed), no
 // console window, `environment` a UTF-16 block (or null: this process's) and
 // `cwd` (or empty: this process's). Returns 0 or the Win32 error.
 DWORD Spawn(const Launch& launch, const wchar_t* environment, const std::wstring& cwd,

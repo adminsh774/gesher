@@ -292,20 +292,19 @@ int pipe2(int fds[2], int flags) {
   gesher::record_locks::DescriptorGuard descriptor_guard;
   int res = gesher::CrtResult(_pipe(fds, 64 * 1024, mode));
   if (res < 0) return -1;
-  gesher::RegisterOfd(fds[0], O_RDONLY | (flags & O_NONBLOCK));
-  gesher::RegisterOfd(fds[1], O_WRONLY | (flags & O_NONBLOCK));
+  if (gesher::RegisterOfd(fds[0], O_RDONLY | (flags & O_NONBLOCK)) < 0 ||
+      gesher::RegisterOfd(fds[1], O_WRONLY | (flags & O_NONBLOCK)) < 0) {
+    int saved = errno;
+    gesher::ForgetOfd(fds[0]);
+    gesher::ForgetOfd(fds[1]);
+    _close(fds[0]);
+    _close(fds[1]);
+    return errno = saved, -1;
+  }
   return 0;
 }
 
 int pipe(int fds[2]) { return pipe2(fds, 0); }
-
-int dup3(int oldfd, int newfd, int flags) {
-  if (oldfd == newfd) return errno = EINVAL, -1;
-  if ((flags & ~O_CLOEXEC) != 0) return errno = EINVAL, -1;
-  int r = dup2(oldfd, newfd);
-  if (r >= 0 && (flags & O_CLOEXEC) != 0) fcntl(r, F_SETFD, FD_CLOEXEC);
-  return r;
-}
 
 // Only files are flushed: FlushFileBuffers on a pipe waits until the reader
 // has read everything, where Linux fails at once with EINVAL (pipes, sockets,
@@ -446,6 +445,7 @@ static ssize_t PositionedIo(int fd, void* buf, size_t count, off_t offset, bool 
   if (offset < 0) return errno = EINVAL, -1;
   PositionedHandle anchor, positioned, event;
   DWORD type, access;
+  bool append = false;
   // Linux's MAX_RW_COUNT for the 4 KiB pages exposed by this Windows backend.
   const DWORD want = count > 0x7ffff000 ? 0x7ffff000 : static_cast<DWORD>(count);
   {
@@ -463,6 +463,13 @@ static ssize_t PositionedIo(int fd, void* buf, size_t count, off_t offset, bool 
     if (type == FILE_TYPE_PIPE) return errno = ESPIPE, -1;
     DWORD console_mode;
     if (type == FILE_TYPE_CHAR && GetConsoleMode(file, &console_mode)) return errno = ESPIPE, -1;
+    const int status_flags = gesher::GetFileStatusFlags(fd);
+    if (status_flags < 0) return -1;
+    if ((status_flags & O_PATH) != 0 ||
+        (status_flags & O_ACCMODE) == (writing ? O_RDONLY : O_WRONLY)) return errno = EBADF, -1;
+    // Android uses Linux's pwrite behavior: O_APPEND overrides the explicit
+    // offset, but the caller's shared ordinary file position stays unchanged.
+    append = writing && type == FILE_TYPE_DISK && (status_flags & O_APPEND) != 0;
     uint32_t granted = 0;
     int error = gesher::record_locks::HandleAccess(file, &granted);
     if (error) return errno = error, -1;
@@ -532,8 +539,8 @@ static ssize_t PositionedIo(int fd, void* buf, size_t count, off_t offset, bool 
   if (event.value == nullptr) return gesher::FailWithLastError();
   OVERLAPPED ov{};
   ov.hEvent = event.value;
-  ov.Offset = static_cast<DWORD>(static_cast<unsigned long long>(offset));
-  ov.OffsetHigh = static_cast<DWORD>(static_cast<unsigned long long>(offset) >> 32);
+  ov.Offset = append ? MAXDWORD : static_cast<DWORD>(static_cast<unsigned long long>(offset));
+  ov.OffsetHigh = append ? MAXDWORD : static_cast<DWORD>(static_cast<unsigned long long>(offset) >> 32);
   DWORD transferred = 0;
   BOOL done = writing ? WriteFile(file, buf, want, &transferred, &ov)
                       : ReadFile(file, buf, want, &transferred, &ov);
@@ -566,6 +573,58 @@ ssize_t pread64(int fd, void* buf, size_t count, off_t offset) {
 }
 ssize_t pwrite64(int fd, const void* buf, size_t count, off_t offset) {
   return pwrite(fd, buf, count, offset);
+}
+
+// MinGW declares lseek as the lseek64 symbol under _FILE_OFFSET_BITS=64.
+// Every host caller and the bionic bridge therefore use this same policy.
+off_t lseek(int fd, off_t offset, int whence) {
+  PositionedHandle anchor;
+  {
+    gesher::record_locks::DescriptorGuard descriptor_guard;
+    HANDLE file = gesher::HandleFromFd(fd);
+    if (file == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
+    int flags = gesher::GetFileStatusFlags(fd);
+    if (flags < 0) return -1;
+    if ((flags & O_PATH) != 0) return errno = EBADF, -1;
+    if (whence < SEEK_SET || whence > SEEK_HOLE) return errno = EINVAL, -1;
+    if (gesher_is_socket(fd) || gesher::IsBinderFd(fd)) return errno = ESPIPE, -1;
+    short ready;
+    // Linux anon-inode event descriptors and these memory devices use
+    // noop_llseek: they have no byte position and return zero even for a
+    // negative offset. A NUL placeholder alone is not evidence of this kind.
+    gesher::Device device;
+    if (gesher::LookupEventFd(fd) || gesher::PollEpoll(fd, 0, &ready) ||
+        gesher::DeviceFromFd(fd, &device)) return 0;
+    SetLastError(ERROR_SUCCESS);
+    DWORD type = GetFileType(file);
+    if (type == FILE_TYPE_UNKNOWN && GetLastError() != ERROR_SUCCESS) return gesher::FailWithLastError();
+    if (type == FILE_TYPE_PIPE) return errno = ESPIPE, -1;
+    if (type == FILE_TYPE_CHAR) {
+      DWORD console_mode;
+      if (GetConsoleMode(file, &console_mode)) return errno = ESPIPE, -1;
+      bool is_null = false;
+      int error = PositionedNullDevice(file, &is_null);
+      if (error) return errno = error, -1;
+      return is_null ? 0 : (errno = ESPIPE, -1);
+    }
+    if (!DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(), &anchor.value,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) return gesher::FailWithLastError();
+  }
+  DWORD origin = static_cast<DWORD>(whence);
+  LARGE_INTEGER distance{}, result{};
+  distance.QuadPart = offset;
+  if (whence == SEEK_DATA || whence == SEEK_HOLE) {
+    // Linux's generic filesystem fallback may treat every byte before EOF as
+    // data. This backend does not claim finer sparse-extent information.
+    if (offset < 0) return errno = EINVAL, -1;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(anchor.value, &size)) return gesher::FailWithLastError();
+    if (offset >= size.QuadPart) return errno = ENXIO, -1;
+    if (whence == SEEK_HOLE) distance = size;
+    origin = FILE_BEGIN;
+  }
+  if (!SetFilePointerEx(anchor.value, distance, &result, origin)) return gesher::FailWithLastError();
+  return static_cast<off_t>(result.QuadPart);
 }
 
 int nice(int inc) {

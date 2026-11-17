@@ -391,6 +391,7 @@ int fcntl(int fd, int cmd, ...) {
     va_end(pointers);
     return gesher::record_locks::DescriptorFcntl(fd, cmd, argument);
   }
+  gesher::record_locks::DescriptorGuard descriptor_guard;
   HANDLE h = gesher::HandleFromFd(fd);
   if (h == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
   int arg = 0;
@@ -737,7 +738,11 @@ int memfd_create(const char* name, unsigned int flags) {
   int fd = gesher::CrtResult(_open_osfhandle(reinterpret_cast<intptr_t>(h),
                            _O_RDWR | _O_BINARY | ((flags & MFD_CLOEXEC) != 0 ? _O_NOINHERIT : 0)));
   if (fd < 0) CloseHandle(h);
-  else gesher::RegisterOfd(fd, O_RDWR);
+  else if (gesher::RegisterOfd(fd, O_RDWR | O_LARGEFILE) < 0) {
+    int saved = errno;
+    _close(fd);
+    return errno = saved, -1;
+  }
   return fd;
 }
 

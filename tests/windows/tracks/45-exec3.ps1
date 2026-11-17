@@ -119,7 +119,7 @@ if (-not (Test-Path "$Dir/exec3.apk")) {
     $result.Text
   } @('exec2: SUMMARY pass=9 fail=0',
       'Exec4DeviceTest PASS host environment changes reach native environ and spawned children',
-      'Exec3DeviceTest PASS native fork/exec, spawn, popen, system, signals and waitpid in an app',
+      'Exec3DeviceTest PASS native exec, spawn, popen, system, signals and waitpid in an app',
       'Exec3DeviceTest PASS shell, Java process signals, tools and shared properties on the device',
       'Exec3LogTest PASS clear removes old records and a live follower observes new records after clear')
   $exec3SavedEnvironment = @{}
@@ -144,7 +144,7 @@ if (-not (Test-Path "$Dir/exec3.apk")) {
       'exec2: SUMMARY pass=9 fail=0',
       'Exec4DeviceTest PASS host environment changes reach native environ and spawned children',
       'gesher-app: app process for com.gesher.exec3',
-      'Exec3DeviceTest PASS native fork/exec, spawn, popen, system, signals and waitpid in an app',
+      'Exec3DeviceTest PASS native exec, spawn, popen, system, signals and waitpid in an app',
       'Exec3LogTest PASS clear removes old records and a live follower observes new records after clear',
       'Exec3CommandsTest PASS pm list packages and path query the actual device package manager',
       'Exec3CommandsTest PASS am start resumes a separate app and broadcast reaches its real receiver',

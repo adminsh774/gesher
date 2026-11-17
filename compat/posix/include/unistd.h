@@ -6,6 +6,13 @@
 #include <errno.h>
 #include <sys/types.h>
 
+#ifndef SEEK_DATA
+#define SEEK_DATA 3
+#endif
+#ifndef SEEK_HOLE
+#define SEEK_HOLE 4
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

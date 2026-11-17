@@ -415,14 +415,14 @@ int RunArguments(const std::vector<std::string>& args) {
     }
     // PE/batch programs keep the existing wait-and-propagate convention.
     std::vector<ex::ChildFd> fds;
-    for (int fd = 0; fd < 2048; ++fd) {
-      intptr_t value = _get_osfhandle(fd);
-      if (value != -1 && value != -2 && value != 0) {
-        fds.push_back({fd, reinterpret_cast<HANDLE>(value)});
-      }
+    std::vector<std::pair<int, gesher::DescriptorSnapshotPtr>> captured;
+    if (gesher::CaptureDescriptors(&captured, false) != 0) return 127;
+    for (auto& [fd, snapshot] : captured) {
+      fds.push_back({fd, snapshot->handle, std::move(snapshot)});
     }
     PROCESS_INFORMATION process{};
     if (ex::SpawnWithFds(launch, nullptr, L"", fds, &process) != 0) return 127;
+    fds.clear();
     CloseHandle(process.hThread);
     DWORD status = 127;
     if (WaitForSingleObject(process.hProcess, INFINITE) == WAIT_OBJECT_0) {

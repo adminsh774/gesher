@@ -8,6 +8,7 @@ add_library(gesher_exec_spawn STATIC
   ${CMAKE_CURRENT_LIST_DIR}/exec_spawn.cc
   ${CMAKE_CURRENT_LIST_DIR}/gesher_tools.cc)
 target_include_directories(gesher_exec_spawn PUBLIC ${CMAKE_CURRENT_LIST_DIR})
+target_link_libraries(gesher_exec_spawn PUBLIC gesher_posix)
 target_compile_options(gesher_exec_spawn PRIVATE -Wall -Wextra -Werror)
 
 add_executable(gesher-exec

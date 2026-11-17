@@ -1,5 +1,6 @@
 // Actual production vector + scalar + virtual-object dispatch. Real Linux file,
 // pipe, socket and eventfd operations stand at the declared Windows OS boundary.
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
@@ -48,6 +49,7 @@ static bool LookupSocket(int fd, SocketFd* state) {
 }
 static intptr_t HandleFromFd(int fd) { return fcntl(fd, F_GETFD) < 0 ? -1 : fd; }
 static int CrtResult(int value) { return value; }
+static int GetFileStatusFlags(int fd) { return ::fcntl(fd, F_GETFL); }
 namespace record_locks {
 // The native Windows boundary queries the held handle's GrantedAccess with
 // NtQueryObject. Linux's real descriptor access mode supplies that boundary.
@@ -78,6 +80,17 @@ static int GetFileType(intptr_t fd) { struct stat info{}; return fstat(int(fd), 
 static int _write(int fd, const void* bytes, unsigned count) {
   if (gesher::objects.count(fd)) return int(count);
   return ::write(fd, bytes, count);
+}
+// File I/O is an OS boundary in this vector-routing fixture. The exact native
+// file adapter is separately exercised by test_file_io_contracts.py and the
+// Windows process fixture; this suite owns vector/virtual-object dispatch.
+static bool NativeFileIo(int fd, void* bytes, unsigned count, bool writing, int* result) {
+  struct stat info{};
+  if (::fstat(fd, &info) < 0 || !S_ISREG(info.st_mode)) return false;
+  if (!writing) std::abort();
+  *result = static_cast<int>(::write(fd, bytes, count));
+  if (*result > 0) gesher::InotifyNoteWrite(fd);
+  return true;
 }
 using gesher::SocketFd;
 #define write routed_write

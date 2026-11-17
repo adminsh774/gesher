@@ -1,3 +1,4 @@
+#include <gesher/clocks.h>
 #include "internal.h"
 
 #include <io.h>
@@ -77,19 +78,15 @@ int ErrnoFromWin32(DWORD error) {
 }
 
 HANDLE HandleFromFd(int fd) {
-  return reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+  intptr_t handle = _get_osfhandle(fd);
+  // UCRT uses -2 for an unbound standard descriptor. It is not a native
+  // resource (and must never be mistaken for Win32's current-thread handle).
+  return handle == -1 || handle == -2 || handle == 0
+      ? INVALID_HANDLE_VALUE : reinterpret_cast<HANDLE>(handle);
 }
 
 ULONGLONG MonotonicMicros() {
-  static const LONGLONG frequency = [] {
-    LARGE_INTEGER f;
-    QueryPerformanceFrequency(&f);
-    return f.QuadPart;
-  }();
-  LARGE_INTEGER now;
-  QueryPerformanceCounter(&now);
-  return static_cast<ULONGLONG>(now.QuadPart / frequency * 1000000 +
-                                now.QuadPart % frequency * 1000000 / frequency);
+  return static_cast<ULONGLONG>(MonotonicNanos() / 1000);
 }
 
 ULONGLONG DeadlineAfter(int timeout_ms) {

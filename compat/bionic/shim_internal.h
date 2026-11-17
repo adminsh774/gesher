@@ -149,8 +149,7 @@ void RegisterSyscall(SymbolTable& table);  // syscall_bionic.cc
 // handler for `syscall` instructions in loaded code (ADR 0084), and
 // syscall(2)'s for numbers it has no special case for. syscall_bionic.cc.
 int64_t RawSyscallX64(int64_t nr, const int64_t args[6]);
-// Last: fork/exec/spawn/wait, and the vfork-style child's view of fds, the
-// environment and the working directory over the entries already there.
+// Last: exec/spawn/wait and unsupported fork/vfork entry points.
 void RegisterProcess(SymbolTable& table);  // process_bionic.cc
 
 // kill() of another pid: the shim's own children (also those that exited
@@ -171,6 +170,9 @@ bool InterruptibleSleep(uint32_t ms, uint32_t* left_ms);
 // observer is an internal host callback, never loaded application code; it
 // runs without the signal-state lock and must only record the wake instant.
 bool InterruptibleSleepObserved(uint32_t ms, void (*observe)(void*), void* context);
+// Absolute Android BOOTTIME deadline. Resume notification wakes the signal
+// transport to recheck it; returns 0, EINTR, or a registration error number.
+int InterruptibleBoottimeSleepObserved(int64_t deadline, void (*observe)(void*), void* context);
 
 // Runs the handlers of signals sent to this thread that it no longer blocks
 // (signal_bionic.cc). Called where Linux would deliver them: blocking waits
