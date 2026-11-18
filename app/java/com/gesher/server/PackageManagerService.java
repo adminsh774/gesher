@@ -551,6 +551,16 @@ public final class PackageManagerService extends IPackageManager.Default {
             if (isRemovalPending(p.packageName)) continue;
             result.addAll(p.queryIntentContentProviders(intent, resolvedType, flags));
         }
+        if (android.provider.DocumentsContract.PROVIDER_INTERFACE.equals(intent.getAction())
+                && (intent.getPackage() == null || "android".equals(intent.getPackage()))
+                && intent.getComponent() == null) {
+            ProviderInfo docProvider = hostedProvider(DocumentsStorageProvider.AUTHORITY);
+            if (docProvider != null) {
+                ResolveInfo info = new ResolveInfo();
+                info.providerInfo = docProvider;
+                result.add(info);
+            }
+        }
         return new ParceledListSlice<>(result);
     }
 
@@ -570,7 +580,25 @@ public final class PackageManagerService extends IPackageManager.Default {
 
     @Override
     public ProviderInfo resolveContentProvider(String name, long flags, int userId) {
+        if (userId != 0) return null;
+        ProviderInfo hosted = hostedProvider(name);
+        if (hosted != null) return hosted;
         return provider(name, flags);
+    }
+
+    private volatile ContentProviders mHostedProviders;
+
+    void setHostedProviders(ContentProviders providers) { mHostedProviders = providers; }
+
+    private ProviderInfo hostedProvider(String authority) {
+        ContentProviders providers = mHostedProviders;
+        ContentProviders.RegisteredProvider registration = providers == null ? null
+                : providers.registeredProvider(authority);
+        if (registration == null) return null;
+        if (ContentProviders.declaredProvider(this, authority) != null) {
+            throw new SecurityException("Conflicting hosted provider authority");
+        }
+        return new ProviderInfo(registration.info);
     }
 
     @Override
