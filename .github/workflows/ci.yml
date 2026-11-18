@@ -1,8 +1,7 @@
 name: ci
 
 on:
-  push:
-    branches: [main]
+  # Temporarily pause CI on main pushes; restore push: branches: [main] to resume.
   pull_request:
   workflow_dispatch:
     inputs:
