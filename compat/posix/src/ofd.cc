@@ -15,6 +15,7 @@
 #include <bcrypt.h>
 
 #include <array>
+#include <charconv>
 #include <cstring>
 #include <new>
 #include <string>
@@ -763,9 +764,13 @@ struct StartupImport {
     if (InitializeInheritedFileDescriptions() == 0) return;
     // Starting guest code without its descriptions would fabricate status and
     // destroy sharing. A failed runtime bootstrap must remain a failed start.
-    static constexpr char message[] = "gesher: cannot import inherited file descriptions\n";
+    char message[96] = "gesher: cannot import inherited file descriptions errno=";
+    const size_t prefix = std::strlen(message);
+    auto formatted = std::to_chars(message + prefix, message + sizeof(message) - 1, errno);
+    char* end = formatted.ec == std::errc{} ? formatted.ptr : message + prefix;
+    *end++ = '\n';
     DWORD written = 0;
-    WriteFile(GetStdHandle(STD_ERROR_HANDLE), message, sizeof(message) - 1, &written, nullptr);
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), message, static_cast<DWORD>(end - message), &written, nullptr);
     ExitProcess(127);
   }
 };
