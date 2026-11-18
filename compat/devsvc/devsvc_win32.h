@@ -135,7 +135,10 @@ struct DocumentSelection {
 DocumentSelection PickDocuments(int mode, const std::u16string& title,
     const std::u16string& suggested_name, const std::u16string& initial_directory,
     const std::u16string& filter, const std::u16string& extension, bool multiple,
-    uint32_t owner_pid, bool (*active)(void*), void* context);
+    bool local_only, uint32_t owner_pid, bool (*active)(void*), void* context);
+// False includes an unavailable/unverifiable target. Follows reparse points and
+// requires a resolved local volume and locally available data.
+bool IsLocalDocument(const std::u16string& path);
 
 }  // namespace devsvc
 }  // namespace gesher

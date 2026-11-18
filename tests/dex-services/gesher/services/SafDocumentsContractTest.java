@@ -169,8 +169,15 @@ public final class SafDocumentsContractTest {
         String[] selected;Throwable failure;Object request;int ownerPid;
         boolean available=true,holdAfterRetirement;
         volatile BooleanSupplier active;
+        interface Locality { boolean check(String windowsPath) throws IOException; }
+        Locality locality = path -> { throw new AssertionError("Unexpected locality query: " + path); };
+        final List<String> localityPaths = java.util.Collections.synchronizedList(new ArrayList<>());
         void install(Harness h)throws Exception{Class<?> backend=type("DocumentPicker$Backend");Object proxy=Proxy.newProxyInstance(backend.getClassLoader(),new Class<?>[]{backend},(o,m,a)->{
-            if(m.getName().equals("available"))return available;if(!m.getName().equals("pick"))throw new AssertionError(m);
+            if(m.getName().equals("available"))return available;
+            // Explicit native locality boundary only. Production selection,
+            // file creation, result publication and grants remain unmodified.
+            if(m.getName().equals("isLocal")){localityPaths.add((String)a[0]);return locality.check((String)a[0]);}
+            if(!m.getName().equals("pick"))throw new AssertionError(m);
             request=a[0];ownerPid=(int)a[1];active=(BooleanSupplier)a[2];opened.countDown();long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);
             while(!finish.await(10,TimeUnit.MILLISECONDS)){
                 if(!holdAfterRetirement&&!active.getAsBoolean())return null;
@@ -184,6 +191,7 @@ public final class SafDocumentsContractTest {
     static final class ChoiceDialog {
         final CountDownLatch opened = new CountDownLatch(1), finish = new CountDownLatch(1);
         volatile BooleanSupplier active;
+        int selected = -1;
         void install(Harness h) throws Exception {
             Class<?> api = type("IntentChooser$Dialog");
             Object dialog = Proxy.newProxyInstance(api.getClassLoader(), new Class<?>[]{api}, (o, m, a) -> {
@@ -191,7 +199,7 @@ public final class SafDocumentsContractTest {
                 if (!m.getName().equals("choose")) throw new AssertionError(m);
                 active = (BooleanSupplier)a[4]; opened.countDown();
                 if (!finish.await(8, TimeUnit.SECONDS)) throw new AssertionError("Choice fixture was not closed");
-                return -1;
+                return selected;
             });
             set(h.atm, "mIntentChooserDialog", dialog);
         }
@@ -206,6 +214,10 @@ public final class SafDocumentsContractTest {
         ProviderInfo info=h.pm.resolveContentProvider(AUTH,0,0);
         check(info!=null&&info.exported&&info.grantUriPermissions&&info.applicationInfo.uid==1000,"Registered real provider identity");
         check(android.Manifest.permission.MANAGE_DOCUMENTS.equals(info.readPermission)&&info.readPermission.equals(info.writePermission),"MANAGE_DOCUMENTS protects both operations");
+        try (Cursor roots = h.provider.queryRoots(new String[]{DocumentsContract.Root.COLUMN_FLAGS})) {
+            check(roots.moveToFirst() && (roots.getInt(0) & DocumentsContract.Root.FLAG_LOCAL_ONLY) == 0,
+                    "Aggregate Windows root does not claim that network mounts are local");
+        }
         check(DocumentsContract.isDocumentUri(h.context,doc),"Framework provider-aware verification");
         check(!DocumentsContract.isDocumentUri(h.context,DocumentsContract.buildDocumentUri("not.registered",f.getPath())),"Unregistered authority is not a document provider");
         rejects(SecurityException.class,()->h.query(doc,null));rejects(SecurityException.class,()->h.operation(DocumentsContract.METHOD_CREATE_DOCUMENT,parent,"denied.txt"));
@@ -395,6 +407,111 @@ public final class SafDocumentsContractTest {
         return results.get(0);
     }
 
+    static void selectionCounts(File dir) throws Exception {
+        File documents = Files.createDirectory(new File(dir, "selection-counts").toPath()).toFile();
+        String[] paths = new String[257];
+        for (int i = 0; i < paths.length; i++) {
+            File file = new File(documents, i + ".txt");
+            Files.writeString(file.toPath(), "owned document " + i);
+            paths[i] = file.getPath();
+        }
+        String[] mimes = new String[65];
+        for (int i = 0; i < mimes.length - 1; i++) mimes[i] = "application/x-fixture-" + i;
+        mimes[64] = "text/plain"; // The accepting filter must survive past entry 64.
+        Harness h = new Harness(new File(dir, "selection-counts.xml"));
+        Object origin = h.activity("Origin", "RESUMED");
+        Dialog dialog = new Dialog(); dialog.install(h);
+        try {
+            check(h.start(open().putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    .putExtra(Intent.EXTRA_MIME_TYPES, mimes), origin) == ActivityManager.START_SUCCESS,
+                    "All 65 valid MIME filters are accepted");
+            ResultInfo result = finishSelection(h, dialog, paths);
+            check(((String[])get(dialog.request, "mimeTypes")).length == 65,
+                    "Native request retains every MIME filter");
+            check(result.mResultCode == Activity.RESULT_OK && result.mData.getData() == null
+                    && result.mData.getClipData().getItemCount() == paths.length,
+                    "AOSP multiple selection returns all 257 ordinary short-path documents");
+            for (int i = 0; i < paths.length; i++) {
+                Uri uri = document(new File(paths[i]));
+                check(result.mData.getClipData().getItemAt(i).getUri().equals(uri)
+                        && h.grants.canAccess(h.client, uri, READ | WRITE, 0),
+                        "Selected URI and permission are preserved at index " + i);
+            }
+            check(dialog.localityPaths.isEmpty(), "Ordinary requests do not impose LOCAL_ONLY");
+        } finally { dialog.finish.countDown(); h.settled(); h.grants.flush(); }
+    }
+
+    static void localOnly(File dir) throws Exception {
+        for (String action : List.of(Intent.ACTION_OPEN_DOCUMENT, Intent.ACTION_GET_CONTENT,
+                Intent.ACTION_CREATE_DOCUMENT, Intent.ACTION_OPEN_DOCUMENT_TREE)) {
+            boolean create = Intent.ACTION_CREATE_DOCUMENT.equals(action);
+            boolean treeRequest = Intent.ACTION_OPEN_DOCUMENT_TREE.equals(action);
+            for (String locality : create ? List.of("local", "remote", "unverifiable", "changed")
+                    : List.of("local", "remote", "unverifiable")) {
+                File location = Files.createTempDirectory(dir.toPath(), "locality-").toFile().getCanonicalFile();
+                File chosen = treeRequest ? location : new File(location, "document.txt");
+                if (!create && !treeRequest) Files.writeString(chosen.toPath(), "owned existing content");
+                Harness h = new Harness(new File(location.getParentFile(), location.getName() + ".xml"));
+                Object origin = h.activity("Origin", "RESUMED");
+                Dialog dialog = new Dialog();
+                int[] queries = {0};
+                dialog.locality = path -> {
+                    queries[0]++;
+                    if (create && queries[0] == 1) check(!chosen.exists(),
+                            "Locality is checked before CREATE_DOCUMENT has filesystem side effects");
+                    if (locality.equals("unverifiable")) throw new IOException("Explicit unavailable Windows locality query");
+                    return locality.equals("local") || locality.equals("changed") && queries[0] == 1;
+                };
+                dialog.install(h);
+                try {
+                    Intent request = new Intent(action).putExtra(Intent.EXTRA_LOCAL_ONLY, true);
+                    if (!treeRequest) request.setType("text/plain");
+                    check(h.start(request, origin) == ActivityManager.START_SUCCESS,
+                            "LOCAL_ONLY request starts with native validation: " + action + "/" + locality);
+                    ResultInfo result = finishSelection(h, dialog, chosen.getPath());
+                    check((boolean)get(dialog.request, "localOnly"), "EXTRA_LOCAL_ONLY reaches the native request");
+                    boolean accepted = locality.equals("local");
+                    Uri expected = treeRequest ? tree(chosen) : document(chosen);
+                    if (accepted) {
+                        check(result.mResultCode == Activity.RESULT_OK && result.mData.getData().equals(expected),
+                                "Actual available local selection is returned: " + action);
+                        check(h.grants.canAccess(h.client, expected, READ, 0), "Local result owns its real URI grant");
+                        if (create) check(chosen.isFile() && chosen.length() == 0, "Local CREATE_DOCUMENT creates the requested file");
+                    } else {
+                        check(result.mResultCode == Activity.RESULT_CANCELED && result.mData == null,
+                                "Remote/unverifiable final validation cannot report success: " + locality);
+                        check(!h.grants.canAccess(h.client, expected, READ, 0), "Rejected selection has no URI permission");
+                        if (create) check(!chosen.exists(), "Rejected CREATE_DOCUMENT leaves no new document");
+                    }
+                    check(queries[0] == (create && (accepted || locality.equals("changed")) ? 2 : 1),
+                            "Create checks its parent before mutation and its actual result before publication");
+                    check(get(origin, "state") == state("RESUMED"), "Locality failure/cancellation releases native UI coverage");
+                    if (!create && !treeRequest) check(Files.readString(chosen.toPath()).equals("owned existing content"),
+                            "Selection validation preserves existing content");
+                } finally { dialog.finish.countDown(); h.settled(); h.grants.flush(); }
+            }
+        }
+
+        // Canonicalization must pass the resolved target to the host query, not
+        // classify a local-looking alias by its display name. Skip only on the
+        // Windows ART track where creating symlinks may require administrator rights.
+        if (!nativeFiles) {
+            File target = new File(dir, "locality-target.txt"); Files.writeString(target.toPath(), "target");
+            File alias = new File(dir, "local-looking-alias.txt");
+            Files.createSymbolicLink(alias.toPath(), target.toPath());
+            Harness h = new Harness(new File(dir, "locality-alias.xml"));
+            Object origin = h.activity("Origin", "RESUMED");
+            Dialog dialog = new Dialog(); dialog.locality = path -> false; dialog.install(h);
+            try {
+                h.start(open().putExtra(Intent.EXTRA_LOCAL_ONLY, true), origin);
+                ResultInfo result = finishSelection(h, dialog, alias.getPath());
+                String resolved = (String)call(type("Zygote"), "windowsPath", new Class<?>[]{String.class}, target.getCanonicalPath());
+                check(dialog.localityPaths.equals(List.of(resolved)) && result.mResultCode == Activity.RESULT_CANCELED,
+                        "A local-looking symlink is checked using its resolved target and cannot bypass locality");
+            } finally { dialog.finish.countDown(); h.settled(); h.grants.flush(); }
+        }
+    }
+
     static void actions(File dir) throws Exception {
         File existing = new File(dir, "save-existing.txt");
         Files.writeString(existing.toPath(), "keep existing bytes");
@@ -536,6 +653,83 @@ public final class SafDocumentsContractTest {
     static Intent chooser() {
         return Intent.createChooser(new Intent().setComponent(new ComponentName(CLIENT, CLIENT + ".Top")),
                 "Native UI fixture").putExtra(Intent.EXTRA_AUTO_LAUNCH_SINGLE_CHOICE, false);
+    }
+
+    /** Real AppTask admission must retain its exact task across asynchronous native UI. */
+    static void appTaskNativeUi(File dir) throws Exception {
+        for (boolean choose : new boolean[]{false, true}) for (boolean retire : new boolean[]{false, true}) {
+            String name = "app-task-" + (choose ? "chooser" : "document") + "-" + retire;
+            Harness h = new Harness(new File(dir, name + ".xml"));
+            Object origin = h.activity("Origin", "RESUMED");
+            // Seed the same task metadata that normal activity publication records.
+            synchronized (h.atm) {
+                call(h.atm, "recordAppTaskLocked", new Class<?>[]{origin.getClass(), boolean.class}, origin, false);
+            }
+            if (retire) {
+                // Another live task keeps the caller process alive. The pending
+                // request must retire because its task disappeared, independently
+                // of process death or package replacement.
+                Object keeper = h.activity("Origin", "PAUSED"); set(keeper, "taskId", 2);
+                @SuppressWarnings("unchecked") List<Integer> order = (List<Integer>)get(h.atm, "mTaskOrder");
+                order.add(2);
+            }
+            IAppTask[] handle = new IAppTask[1];
+            as(UID, PID, () -> handle[0] = IAppTask.Stub.asInterface(h.atm.getAppTasks(CLIENT).get(0)));
+            Dialog documents = new Dialog(); documents.holdAfterRetirement = true; documents.install(h);
+            ChoiceDialog choices = new ChoiceDialog(); choices.selected = 0; choices.install(h);
+            File created = new File(dir, name + ".txt");
+            documents.selected = new String[]{created.getPath()};
+            try {
+                Intent request = choose ? chooser() : new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("text/plain");
+                as(UID, PID, () -> check(handle[0].startActivity(h.thread.asBinder(), CLIENT, null,
+                        request, request.getType(), null) == ActivityManager.START_SUCCESS,
+                        "AppTask admits the requested native UI: " + name));
+                check((choose ? choices.opened : documents.opened).await(3, TimeUnit.SECONDS),
+                        "Native UI opens in the explicit task without an activity result token");
+                BooleanSupplier active = choose ? choices.active : documents.active;
+                check(active.getAsBoolean() && get(origin, "state") == state("PAUSED"),
+                        "Explicit task is genuinely covered while its native UI is active");
+                Object replacement = null;
+                if (retire) {
+                    as(UID, PID, () -> handle[0].finishAndRemoveTask());
+                    check(!active.getAsBoolean(), "Removing the task retires the pending native session");
+                    as(UID, PID, () -> h.thread.controller.activityDestroyed((IBinder)get(origin, "token")));
+                    as(UID, PID, () -> check(handle[0].getTaskInfo() == null,
+                            "Destroy acknowledgment completes removal before the fixture reuses its id"));
+                    check(!(boolean)get(h.process, "exiting") && !(boolean)get(h.process, "dead"),
+                            "The caller process remains live while its selected task is removed");
+                    replacement = h.activity("Origin", "RESUMED");
+                    synchronized (h.atm) {
+                        call(h.atm, "recordAppTaskLocked", new Class<?>[]{replacement.getClass(), boolean.class}, replacement, false);
+                    }
+                    check(!active.getAsBoolean(), "Reusing the numeric task id cannot revive the old native session");
+                }
+                documents.finish.countDown(); choices.finish.countDown();
+                h.settled(); workersRetired("intent-chooser"); awaitPending(h, 0, 0);
+                check(h.thread.results().isEmpty(), "AppTask launch does not invent an activity-result recipient");
+                check((int)get(origin, "documentPickers") == 0 && (int)get(origin, "chooserCoverCount") == 0,
+                        "Native session releases exactly its own coverage");
+                if (retire) {
+                    check(!created.exists() && get(replacement, "state") == state("RESUMED")
+                                    && ((List<?>)get(h.atm, "mActivities")).stream().noneMatch(record -> {
+                                        try { return ((ActivityInfo)get(record, "info")).name.endsWith(".Top"); }
+                                        catch (Exception failure) { throw new AssertionError(failure); }
+                                    }), "Retired session cannot create a document or launch into the replacement task");
+                } else if (choose) {
+                    ActivityManager.RecentTaskInfo[] task = new ActivityManager.RecentTaskInfo[1];
+                    as(UID, PID, () -> task[0] = handle[0].getTaskInfo());
+                    check(task[0].taskId == 1 && task[0].numActivities == 2
+                                    && task[0].topActivity.equals(new ComponentName(CLIENT, CLIENT + ".Top")),
+                            "Chosen activity starts inside the exact original AppTask");
+                } else {
+                    check(created.isFile() && get(origin, "state") == state("RESUMED"),
+                            "Active explicit-task document request creates its selected file and uncovers the task");
+                }
+            } finally {
+                documents.finish.countDown(); choices.finish.countDown();
+                h.settled(); workersRetired("intent-chooser"); h.grants.flush();
+            }
+        }
     }
 
     static void idleOwnership(File dir) throws Exception {
@@ -692,7 +886,7 @@ public final class SafDocumentsContractTest {
     public static void contracts(boolean descriptors)throws Exception{
         nativeFiles=descriptors;field(Class.forName("com.gesher.app.locale.SystemLocale"),"sIs24Hour").set(null,Boolean.TRUE);
         File dir=Files.createTempDirectory("gesher-saf-production-").toFile().getCanonicalFile();
-        try{provider(dir);persistence(dir);deletionLifecycle(dir);selection(dir);failures(dir);actions(dir);lifecycle(dir);idleOwnership(dir);combinedNativeUi(dir);System.out.println("SafDocumentsContractTest passed: "+checks+" checks; nativeFiles="+nativeFiles);}
+        try{provider(dir);persistence(dir);deletionLifecycle(dir);selection(dir);selectionCounts(dir);localOnly(dir);failures(dir);actions(dir);lifecycle(dir);idleOwnership(dir);combinedNativeUi(dir);appTaskNativeUi(dir);System.out.println("SafDocumentsContractTest passed: "+checks+" checks; nativeFiles="+nativeFiles);}
         finally{try(var paths=Files.walk(dir.toPath())){for(var p:paths.sorted(Comparator.reverseOrder()).toList())Files.deleteIfExists(p);}}
     }
     public static void main(String[] args)throws Exception{

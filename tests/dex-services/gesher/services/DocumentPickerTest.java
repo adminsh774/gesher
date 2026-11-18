@@ -60,7 +60,7 @@ public final class DocumentPickerTest {
             try {
                 selected.set(pick.invoke(null, mode, "Gesher document picker cancellation fixture",
                         "new-fixture-file.txt", null, "*.txt", "txt", multiple,
-                        android.os.Process.myPid(), lifetime));
+                        true, android.os.Process.myPid(), lifetime));
             } catch (InvocationTargetException error) { failure.set(error.getCause()); }
             catch (Throwable error) { failure.set(error); }
         }, "native-document-dialog-fixture");
@@ -75,12 +75,34 @@ public final class DocumentPickerTest {
         System.out.println("DocumentPickerTest: native mode " + mode + " cancelled and worker retired");
     }
 
+    private static void locality(Class<?> host, String[] nonlocalPaths) throws Exception {
+        Method local = host.getDeclaredMethod("isLocalDocument", String.class); local.setAccessible(true);
+        Method windows = Class.forName("com.gesher.server.Zygote").getDeclaredMethod("windowsPath", String.class);
+        java.nio.file.Path directory = java.nio.file.Files.createTempDirectory("gesher-local-document-");
+        java.nio.file.Path file = directory.resolve("owned.txt");
+        try {
+            java.nio.file.Files.writeString(file, "real local test document");
+            require((boolean)local.invoke(null, windows.invoke(null, directory.toString())),
+                    "Actual local temporary directory was not verified by Windows");
+            require((boolean)local.invoke(null, windows.invoke(null, file.toString())),
+                    "Actual local file was not verified by Windows");
+            require(!(boolean)local.invoke(null, windows.invoke(null, directory.resolve("absent.txt").toString())),
+                    "Missing target cannot be declared locally available");
+            // Optional caller-owned UNC, mapped-share and local-reparse-to-share
+            // fixtures use the same real kernel query; no network fixture is invented.
+            for (String path : nonlocalPaths) require(!(boolean)local.invoke(null, path),
+                    "Nonlocal or unverifiable Windows target was accepted: " + path);
+        } finally { java.nio.file.Files.deleteIfExists(file); java.nio.file.Files.deleteIfExists(directory); }
+        System.out.println("DocumentPickerTest: actual Windows locality and absence queries passed");
+    }
+
     public static void main(String[] args) throws Exception {
         System.loadLibrary("android_runtime");
         fromWindowsPath();
         Class<?> host = Class.forName("com.gesher.server.WindowsHost");
+        locality(host, args);
         Method pick = host.getDeclaredMethod("pickDocuments", int.class, String.class, String.class,
-                String.class, String.class, String.class, boolean.class, int.class, BooleanSupplier.class);
+                String.class, String.class, String.class, boolean.class, boolean.class, int.class, BooleanSupplier.class);
         pick.setAccessible(true);
         // Repeat all modes: every COM instance, timer and hidden lifetime window
         // must retire so the next request starts and closes on its own STA thread.
@@ -90,7 +112,7 @@ public final class DocumentPickerTest {
             cancelDialog(pick, 2, false);
         }
         require(pick.invoke(null, 1, "Already retired fixture", "unused.txt", null, "*.txt",
-                "txt", false, 0, (BooleanSupplier)() -> false) == null,
+                "txt", false, true, 0, (BooleanSupplier)() -> false) == null,
                 "Retired owner must not open another dialog");
         System.out.println("DocumentPickerTest passed: real open/save/tree cancellation and Windows path mapping");
     }

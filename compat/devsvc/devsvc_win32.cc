@@ -20,7 +20,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <map>
+#include <new>
 #include <string>
 #include <utility>
 
@@ -258,6 +260,44 @@ bool PopActivation(std::u16string* app_id, std::u16string* tag, std::u16string* 
   return any;
 }
 
+bool IsLocalDocument(const std::u16string& path) {
+  if (path.empty()) return false;
+  // OPEN_EXISTING cannot create anything. Do not use OPEN_REPARSE_POINT: the
+  // actual target must be local, including mapped drives and directory junctions.
+  HANDLE file = CreateFileW(W(path), FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  FILE_ATTRIBUTE_TAG_INFO attributes{};
+  bool available = GetFileInformationByHandleEx(file, FileAttributeTagInfo,
+      &attributes, sizeof(attributes))
+      && !(attributes.FileAttributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS));
+  std::wstring final_path;
+  if (available) {
+    // Network shares have no volume GUID. Windows resolves reparse targets before
+    // returning this path; an input such as C:\\link or X:\\file is not evidence of locality.
+    DWORD size = GetFinalPathNameByHandleW(file, nullptr, 0, VOLUME_NAME_GUID | FILE_NAME_NORMALIZED);
+    available = size != 0;
+    if (available) {
+      final_path.resize(size);
+      DWORD length = GetFinalPathNameByHandleW(file, final_path.data(), size,
+          VOLUME_NAME_GUID | FILE_NAME_NORMALIZED);
+      available = length != 0 && length < size;
+      if (available) final_path.resize(length);
+    }
+  }
+  CloseHandle(file);
+  if (!available || final_path.rfind(L"\\\\?\\Volume{", 0) != 0) return false;
+  size_t end = final_path.find(L"}\\", 11);
+  if (end == std::wstring::npos) return false;
+  std::wstring volume = final_path.substr(0, end + 2);
+  switch (GetDriveTypeW(volume.c_str())) {
+    case DRIVE_FIXED: case DRIVE_REMOVABLE: case DRIVE_CDROM: case DRIVE_RAMDISK:
+      return true;
+    default: return false;
+  }
+}
+
 namespace {
 
 struct DocumentLifetime {
@@ -310,12 +350,108 @@ HRESULT DocumentPath(IShellItem* item, std::vector<std::u16string>* paths) {
   return status;
 }
 
+HRESULT DocumentPaths(IFileDialog* dialog, int mode, bool multiple,
+    std::vector<std::u16string>* paths) {
+  paths->clear();
+  if (mode == 1) {
+    IShellItem* item = nullptr;
+    HRESULT status = dialog->GetResult(&item);
+    if (SUCCEEDED(status)) { status = DocumentPath(item, paths); item->Release(); }
+    return status;
+  }
+  IFileOpenDialog* open = nullptr;
+  HRESULT status = dialog->QueryInterface(IID_PPV_ARGS(&open));
+  if (SUCCEEDED(status)) {
+    IShellItemArray* items = nullptr;
+    status = open->GetResults(&items);
+    if (SUCCEEDED(status)) {
+      DWORD count = 0;
+      status = items->GetCount(&count);
+      if (SUCCEEDED(status) && (count == 0 || (!multiple && count != 1))) status = E_INVALIDARG;
+      // JNI arrays use signed 32-bit sizes. There is no Android selection-count
+      // policy below that representation limit (nor a provider-specific 256 cap).
+      if (SUCCEEDED(status) && (count > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())
+          || count > paths->max_size())) status = E_OUTOFMEMORY;
+      for (DWORD i = 0; SUCCEEDED(status) && i < count; ++i) {
+        IShellItem* item = nullptr;
+        status = items->GetItemAt(i, &item);
+        if (SUCCEEDED(status)) { status = DocumentPath(item, paths); item->Release(); }
+      }
+      items->Release();
+    }
+    open->Release();
+  }
+  return status;
+}
+
+bool DocumentPathsAreLocal(int mode, const std::vector<std::u16string>& paths) {
+  if (paths.empty()) return false;
+  for (const auto& path : paths) {
+    if (mode == 1) {
+      // A save target need not exist. Query its existing parent without creating
+      // even a test file; the provider alone performs atomic document creation.
+      size_t slash = path.find_last_of(u"\\/");
+      if (slash == std::u16string::npos || !IsLocalDocument(path.substr(0, slash + 1))) return false;
+    } else if (!IsLocalDocument(path)) return false;
+  }
+  return true;
+}
+
+// OnFileOk returns S_FALSE to keep an invalid selection in the real dialog, so
+// the user can choose a local target or cancel. No alternate document is returned.
+class DocumentLocalEvents final : public IFileDialogEvents {
+ public:
+  DocumentLocalEvents(int mode, bool multiple, IFileDialogCustomize* custom,
+      DocumentLifetime* lifetime) : mode_(mode), multiple_(multiple), custom_(custom), lifetime_(lifetime) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+    if (!result) return E_POINTER;
+    *result = nullptr;
+    if (iid == IID_IUnknown || iid == IID_IFileDialogEvents) {
+      *result = static_cast<IFileDialogEvents*>(this); AddRef(); return S_OK;
+    }
+    return E_NOINTERFACE;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&references_); }
+  ULONG STDMETHODCALLTYPE Release() override {
+    ULONG result = InterlockedDecrement(&references_);
+    if (!result) delete this;
+    return result;
+  }
+  HRESULT STDMETHODCALLTYPE OnFileOk(IFileDialog* dialog) override {
+    if (!lifetime_->active(lifetime_->context)) {
+      dialog->Close(HRESULT_FROM_WIN32(ERROR_CANCELLED)); return S_FALSE;
+    }
+    std::vector<std::u16string> paths;
+    HRESULT status = DocumentPaths(dialog, mode_, multiple_, &paths);
+    if (SUCCEEDED(status) && DocumentPathsAreLocal(mode_, paths)) return S_OK;
+    custom_->SetControlLabel(1, L"This selection is not available locally. Choose a local file or folder.");
+    return S_FALSE;
+  }
+  HRESULT STDMETHODCALLTYPE OnFolderChanging(IFileDialog*, IShellItem*) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE OnFolderChange(IFileDialog*) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE OnSelectionChange(IFileDialog*) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE OnShareViolation(IFileDialog*, IShellItem*, FDE_SHAREVIOLATION_RESPONSE* response) override {
+    *response = FDESVR_DEFAULT; return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE OnTypeChange(IFileDialog*) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE OnOverwrite(IFileDialog*, IShellItem*, FDE_OVERWRITE_RESPONSE* response) override {
+    *response = FDEOR_DEFAULT; return S_OK;
+  }
+ private:
+  LONG references_ = 1;
+  int mode_;
+  bool multiple_;
+  // Both outlive the Advise registration and this object on the same STA thread.
+  IFileDialogCustomize* custom_;
+  DocumentLifetime* lifetime_;
+};
+
 }  // namespace
 
 DocumentSelection PickDocuments(int mode, const std::u16string& title,
     const std::u16string& suggested_name, const std::u16string& initial_directory,
     const std::u16string& filter, const std::u16string& extension, bool multiple,
-    uint32_t owner_pid, bool (*active)(void*), void* context) {
+    bool local_only, uint32_t owner_pid, bool (*active)(void*), void* context) {
   DocumentSelection selection;
   if (mode < 0 || mode > 2 || !active || (mode != 0 && multiple)) {
     selection.error = E_INVALIDARG; return selection;
@@ -328,6 +464,10 @@ DocumentSelection PickDocuments(int mode, const std::u16string& title,
       nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
   HWND lifetime_window = nullptr;
   DocumentLifetime lifetime{dialog, active, context};
+  IFileDialogCustomize* custom = nullptr;
+  DocumentLocalEvents* events = nullptr;
+  DWORD cookie = 0;
+  bool advised = false;
   if (SUCCEEDED(status)) {
     FILEOPENDIALOGOPTIONS options = 0;
     status = dialog->GetOptions(&options);
@@ -339,6 +479,7 @@ DocumentSelection PickDocuments(int mode, const std::u16string& title,
       if (mode != 1) options |= FOS_FILEMUSTEXIST;
       if (mode == 2) options |= FOS_PICKFOLDERS;
       if (multiple) options |= FOS_ALLOWMULTISELECT;
+      if (mode == 1 && local_only) options |= FOS_NOTESTFILECREATE;
       status = dialog->SetOptions(options);
     }
     if (SUCCEEDED(status) && !title.empty()) status = dialog->SetTitle(W(title));
@@ -359,6 +500,15 @@ DocumentSelection PickDocuments(int mode, const std::u16string& title,
         initial->Release();
       }
     }
+    if (SUCCEEDED(status) && local_only) {
+      status = dialog->QueryInterface(IID_PPV_ARGS(&custom));
+      if (SUCCEEDED(status)) status = custom->AddText(1, L"Choose files or folders available on this computer.");
+      if (SUCCEEDED(status)) {
+        events = new (std::nothrow) DocumentLocalEvents(mode, multiple, custom, &lifetime);
+        if (!events) status = E_OUTOFMEMORY;
+        else { status = dialog->Advise(events, &cookie); advised = SUCCEEDED(status); }
+      }
+    }
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
     if (SUCCEEDED(status) && !InitOnceExecuteOnce(&once, RegisterDocumentLifetime, nullptr, nullptr)) {
       status = HRESULT_FROM_WIN32(GetLastError());
@@ -377,34 +527,17 @@ DocumentSelection PickDocuments(int mode, const std::u16string& title,
       if (owner_pid) EnumWindows(FindDocumentOwner, reinterpret_cast<LPARAM>(&owner));
       status = dialog->Show(owner.window);
       if (SUCCEEDED(status) && active(context)) {
-        if (mode == 1) {
-          IShellItem* item = nullptr;
-          status = dialog->GetResult(&item);
-          if (SUCCEEDED(status)) { status = DocumentPath(item, &selection.paths); item->Release(); }
-        } else {
-          IFileOpenDialog* open = nullptr;
-          status = dialog->QueryInterface(IID_PPV_ARGS(&open));
-          if (SUCCEEDED(status)) {
-            IShellItemArray* items = nullptr;
-            status = open->GetResults(&items);
-            if (SUCCEEDED(status)) {
-              DWORD count = 0;
-              status = items->GetCount(&count);
-              if (SUCCEEDED(status) && (count == 0 || count > 256 || (!multiple && count != 1))) status = E_INVALIDARG;
-              for (DWORD i = 0; SUCCEEDED(status) && i < count; ++i) {
-                IShellItem* item = nullptr;
-                status = items->GetItemAt(i, &item);
-                if (SUCCEEDED(status)) { status = DocumentPath(item, &selection.paths); item->Release(); }
-              }
-              items->Release();
-            }
-            open->Release();
-          }
+        status = DocumentPaths(dialog, mode, multiple, &selection.paths);
+        if (SUCCEEDED(status) && local_only && !DocumentPathsAreLocal(mode, selection.paths)) {
+          status = HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
         }
       }
     }
   }
   if (lifetime_window) { KillTimer(lifetime_window, 1); DestroyWindow(lifetime_window); }
+  if (advised) dialog->Unadvise(cookie);
+  if (events) events->Release();
+  if (custom) custom->Release();
   if (dialog) dialog->Release();
   CoUninitialize();
   if (!active(context)) selection.paths.clear();

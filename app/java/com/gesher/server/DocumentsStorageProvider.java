@@ -202,7 +202,9 @@ public final class DocumentsStorageProvider extends DocumentsProvider {
         for (String column : result.getColumnNames()) {
             switch (column) {
                 case Root.COLUMN_ROOT_ID: row.add(ROOT_ID); break;
-                case Root.COLUMN_FLAGS: row.add(Root.FLAG_LOCAL_ONLY | Root.FLAG_SUPPORTS_IS_CHILD
+                // This aggregate root includes network mounts; locality is a
+                // property of each resolved selection, not of the whole root.
+                case Root.COLUMN_FLAGS: row.add(Root.FLAG_SUPPORTS_IS_CHILD
                         | (root.canWrite() ? Root.FLAG_SUPPORTS_CREATE : 0)); break;
                 case Root.COLUMN_TITLE: row.add("Windows files"); break;
                 case Root.COLUMN_DOCUMENT_ID: row.add(root.getPath()); break;

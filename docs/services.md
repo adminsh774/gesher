@@ -66,6 +66,24 @@ atomically with Android's unique-name rules, preserving existing contents.
 read/write access; trees also carry a prefix grant. Persisting and releasing each
 mode uses the shared durable URI-grant store.
 
+Multiple selection and `EXTRA_MIME_TYPES` retain all valid entries; there is no
+256-document or 64-filter policy. Native results are checked against the actual
+JNI array and C++ container representation limits before conversion, following
+Android 16's [selection predicate](https://android.googlesource.com/platform/packages/apps/DocumentsUI/+/android-16.0.0_r4/src/com/android/documentsui/dirlist/DocsSelectionPredicate.java),
+[picked-document delivery](https://android.googlesource.com/platform/packages/apps/DocumentsUI/+/android-16.0.0_r4/src/com/android/documentsui/picker/PickActivity.java)
+and [MIME state](https://android.googlesource.com/platform/packages/apps/DocumentsUI/+/android-16.0.0_r4/src/com/android/documentsui/base/State.java).
+
+`EXTRA_LOCAL_ONLY` is preserved through the Java/JNI/native request. Windows opens
+the existing target for attributes without recall, follows reparse points, and
+queries its [resolved volume GUID](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
+and actual drive type. Network, offline and unverifiable targets are rejected,
+including remote mapped drives and local paths that resolve onto a remote share.
+The dialog's [OnFileOk validation](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifiledialogevents-onfileok)
+keeps an invalid selection open with an explanation. A local-only save dialog
+does not create test files; its existing parent is checked again before atomic
+creation, and the selected target is checked before grants or success. The
+aggregate `/` root includes network mounts and does not advertise `FLAG_LOCAL_ONLY`.
+
 Each request belongs to its authenticated activity/process and current package
 installation. The actual covered activity pauses while the native UI runs; a
 paused result recipient retains its pending result until normal resume.
@@ -95,10 +113,15 @@ Validation: `tools/test_saf_documents.py` runs the production Java provider
 transport, activity-manager lifecycle and real filesystem/grant store, including
 recursive deletion and partial-failure grant retirement, headless idle ownership,
 overlapping native dialogs, delayed pause acknowledgment,
-and three separate JVMs for retained-mode reload and release. It declares its host
-Binder/native initialization boundaries. Windows track 94 runs the same service
+257-document/65-filter requests, locality rejection before creation, and exact
+AppTask retirement across native UI. Three separate JVMs cover retained-mode
+reload and release. It declares its host Binder/native initialization, user-input
+and locality-query boundaries. Windows track 94 runs the same service
 fixture through actual provider Binder parcels and file descriptors, then
-`DocumentPickerTest` opens and cancels real open/save/tree dialogs repeatedly.
+`DocumentPickerTest` checks real local and absent targets and opens and cancels
+real local-only open/save/tree dialogs repeatedly. Optional Windows path arguments
+to that test must be caller-owned nonlocal fixtures, such as a mapped share or a
+local reparse point to that share; the actual Windows query must reject each one.
 Unavailable native dialogs fail that check. Neither suite substitutes document
 operations or reports a selected path when an operation fails.
 
