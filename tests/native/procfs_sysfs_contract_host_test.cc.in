@@ -21,7 +21,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -101,7 +103,7 @@ static inline int open(const char* p, int f, int m = 0) {
 }
 #pragma clang diagnostic pop
 
-static inline int fcntl(int fd, int /*cmd*/, int /*arg*/) {
+[[maybe_unused]] static inline int fcntl(int fd, int /*cmd*/, int /*arg*/) {
   return _dup(fd);
 }
 
@@ -152,6 +154,21 @@ static inline int ErrnoFromWin32(DWORD error) {
 // This fixture tests procfs contents and actual native access reduction. The
 // canonical OFD table is exercised by its separate production transfer suite.
 static inline int RegisterOfd(int, int) { return 0; }
+struct DescriptorSnapshot {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  ~DescriptorSnapshot() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+};
+static std::unique_ptr<DescriptorSnapshot> CaptureDescriptor(int fd) {
+  auto snapshot = std::unique_ptr<DescriptorSnapshot>(new (std::nothrow) DescriptorSnapshot);
+  if (!snapshot) { errno = ENOMEM; return nullptr; }
+  if (!DuplicateHandle(GetCurrentProcess(), HandleFromFd(fd), GetCurrentProcess(),
+          &snapshot->handle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+    snapshot->handle = INVALID_HANDLE_VALUE;
+    errno = ErrnoFromWin32(GetLastError());
+    return nullptr;
+  }
+  return snapshot;
+}
 namespace record_locks {
 static std::recursive_mutex descriptor_mutex;
 struct DescriptorGuard { std::lock_guard<std::recursive_mutex> lock{descriptor_mutex}; };
