@@ -843,7 +843,7 @@ try {
   CheckTimed 'services: actual storage volumes, capacity, credential state and file allocation' "$Dir/dalvikvm.exe" `
     ($dvmContracts + 'gesher.services.StorageQueryContractTest') @('StorageQueryContractTest all passed:') 45
   CheckTimed 'services: DNS-SD state, cache expiry and cancellation ownership' "$Dir/dalvikvm.exe" `
-    ($dvmContracts + 'gesher.services.NsdBrowseTransportTest') @('NsdBrowseTransportTest all passed: 182') 30
+    ($dvmContracts + 'gesher.services.NsdBrowseTransportTest') @('NsdBrowseTransportTest all passed: 189') 30
   . (Join-Path $PSScriptRoot '../run-nsd-browse-contract.ps1')
   . (Join-Path $PSScriptRoot '../run-nsd-resolve-contract.ps1')
   . (Join-Path $PSScriptRoot '../run-nsd-subscription-contract.ps1')

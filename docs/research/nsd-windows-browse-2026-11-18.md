@@ -184,13 +184,17 @@ The gate requires real found/lost, silent expiry, goodbye, subtype discovery, Un
 identity, explicit-network isolation, permissions, 50 immediate-stop races, no callbacks
 after successful stop, and zero retained native containers. IPv4 is required. IPv6 runs
 when the selected adapter has a preferred IPv6 address; otherwise it is explicitly
-reported as unexercised. Missing APIs or callbacks fail. This gate has not run, and no
-canceled workflow was restarted to obtain its evidence.
+reported as unexercised. Missing APIs or callbacks fail. Earlier Windows Server
+CI reached the subtype PTR on Server 2022 and timed out waiting for the base-only
+goodbye. Server 2025 timed out at the subtype response.
 
-The gate also sends a base-only goodbye while browsing a subtype. The native parser
-handles such a record if supplied, but delivery to that subscription must be established
-on Windows. If the API filters it out, an additional base subscription or a different
-transport is required before claiming the corresponding lifecycle behavior.
+The gate also sends a base-only goodbye while browsing a subtype. A direct
+`DnsStartMulticastQuery` check on Windows desktop delivered the zero-TTL base PTR
+to the exact base query. The subtype query received the earlier positive subtype
+PTR and did not receive that goodbye. Each subtype browse now owns a separate base
+query on the same interface. Its callback enqueues only base PTR deletions into
+the same native FIFO, and both queries must retire before successful stop. This
+direct API check does not establish end-to-end ART or Windows Server behavior.
 
 ## Remaining N46 work
 
@@ -225,3 +229,27 @@ remains required; Android reference coverage must extend to the future responder
 [rfc6335]: https://www.rfc-editor.org/rfc/rfc6335.html#section-5.1
 [rfc6763]: https://www.rfc-editor.org/rfc/rfc6763.html#section-7.2
 [jmdns]: https://github.com/jmdns/jmdns/releases
+
+
+## Companion follow-up validation
+
+The shared native FIFO and grouped cancellation in the current repair are
+preserved. A companion base query now also accepts an actual requested-subtype
+PTR when Windows includes that record in its callback. A positive base PTR still
+cannot establish or refresh subtype membership, and unrelated subtype records
+are ignored. A base goodbye in the same batch suppresses subtype membership
+from that batch; base withdrawal remains owned by the companion and shares the
+same ordered queue as the primary query.
+
+The production PTR classifier has host regressions for base positives, actual
+subtype positives, base withdrawals, subtype-only withdrawals, unrelated owners,
+case and trailing-dot spelling. The Java fixture additionally tests failed
+companion start combined with failed cancellation, callback detachment, backoff
+and eventual release. The real Windows gate now first publishes base-only
+positive records and requires zero discovery, then retains the existing subtype
+positive and three-second base-goodbye checks. Timeout diagnostics include native
+callback/record/membership/goodbye/error/status counters and listener counts.
+
+These source and fixture improvements do not establish that Windows 2022 delivers
+the requested subtype. The actual IPv4/IPv6 gate still needs to run on both Windows
+versions; no successful Windows outcome is claimed for this candidate.

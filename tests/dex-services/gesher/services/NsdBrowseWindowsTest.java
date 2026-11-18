@@ -15,12 +15,14 @@ import java.nio.file.StandardCopyOption;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.Arrays;
 
 /** Required Windows production gate with an independent raw-wire fixture peer. */
 public final class NsdBrowseWindowsTest {
     private static int checks;
     private static int command;
     private static final AtomicReference<String> failure = new AtomicReference<>();
+    private static Listener diagnosticListener;
     private static void check(boolean ok, String text) {
         if (!ok) throw new AssertionError(text);
         checks++;
@@ -31,8 +33,8 @@ public final class NsdBrowseWindowsTest {
     private static void await(BooleanSupplier ready, String text, long timeoutMillis) throws Exception {
         long deadline = System.nanoTime() + timeoutMillis * 1_000_000L;
         while (!ready.getAsBoolean()) {
-            if (failure.get() != null) throw new AssertionError(failure.get());
-            if (System.nanoTime() >= deadline) throw new AssertionError("Timeout: " + text);
+            if (failure.get() != null) throw new AssertionError(failure.get() + " " + diagnostics());
+            if (System.nanoTime() >= deadline) throw new AssertionError("Timeout: " + text + " " + diagnostics());
             Thread.sleep(10);
         }
         check(failure.get() == null, text);
@@ -75,6 +77,18 @@ public final class NsdBrowseWindowsTest {
         method.setAccessible(true);
         return (Long) method.invoke(null);
     }
+    private static String diagnostics() {
+        try {
+            Method method = WindowsNsd.class.getDeclaredMethod("nativeDiagnostics");
+            method.setAccessible(true);
+            Listener current = diagnosticListener;
+            return "native[callbacks,records,membership,baseGoodbyes,errors,lastStatus]="
+                    + Arrays.toString((long[]) method.invoke(null)) + " active=" + active()
+                    + (current == null ? "" : " started=" + current.started.get()
+                    + " found=" + current.found.get() + " lost=" + current.lost.get()
+                    + " stopped=" + current.stopped.get());
+        } catch (Exception error) { return "diagnostics unavailable: " + error; }
+    }
     private static void longObservation(Listener listener, String name) throws Exception {
         check(listener.info.getServiceName().equals(name), "Fresh owned long-lived observation");
         Method method = WindowsNsd.class.getDeclaredMethod("nativeLastPtrTtl");
@@ -95,6 +109,7 @@ public final class NsdBrowseWindowsTest {
         NsdManager manager = new NsdManager(null);
         check(active() == 0, "Initially no requests");
         Listener browse = new Listener();
+        diagnosticListener = browse;
         manager.discoverServices(type, 1, new Network(100 + index), Runnable::run, browse);
         await(() -> browse.started.get() == 1, "Windows accepted browse");
         check(active() == 1, "One native request for explicit network");
@@ -127,6 +142,7 @@ public final class NsdBrowseWindowsTest {
         check(browse.found.get() == count && browse.stopped.get() == 1, "No events after acknowledged stop");
         String longType = type.replace("_gs", "_gl");
         Listener longBrowse = new Listener();
+        diagnosticListener = longBrowse;
         manager.discoverServices(longType, 1, new Network(100 + index), Runnable::run, longBrowse);
         await(() -> longBrowse.started.get() == 1, "long-lived browse accepted");
         peer(control, "announce-long");
@@ -137,9 +153,16 @@ public final class NsdBrowseWindowsTest {
         stop(manager, longBrowse);
         String subtypeType = type.replace("_gs", "_gu");
         Listener subtype = new Listener();
+        diagnosticListener = subtype;
         manager.discoverServices(new DiscoveryRequest.Builder(1, subtypeType).setSubtype("_printer")
                 .setNetwork(new Network(100 + index)).build(), Runnable::run, subtype);
         await(() -> subtype.started.get() == 1, "subtype browse accepted");
+        check(active() == 2, "Subtype membership and base withdrawal have separate owned requests");
+        peer(control, "announce-base-only-long");
+        Thread.sleep(1200);
+        check(subtype.found.get() == 0 && subtype.lost.get() == 0,
+                "Base PTR and SRV records do not invent the requested subtype membership");
+        System.out.println("Subtype before membership announcement: " + diagnostics());
         peer(control, "announce-subtype-long");
         await(() -> subtype.found.get() == 1, "subtype PTR browse");
         check(subtype.info.getServiceType().equals(subtypeType + "."), "Subtype result base type");
@@ -154,6 +177,7 @@ public final class NsdBrowseWindowsTest {
         stop(manager, subtype);
         peer(control, "announce-subtype-long");
         Listener absent = new Listener();
+        diagnosticListener = absent;
         manager.discoverServices(subtypeType, 1, new Network(Integer.MAX_VALUE), Runnable::run, absent);
         await(() -> absent.started.get() == 1, "Absent network observation");
         Thread.sleep(1200);
@@ -162,6 +186,7 @@ public final class NsdBrowseWindowsTest {
         peer(control, "goodbye");
         for (int n = 0; n < 50; n++) {
             Listener race = new Listener();
+            diagnosticListener = race;
             manager.discoverServices(type, 1, new Network(100 + index), Runnable::run, race);
             manager.stopServiceDiscovery(race);
             await(() -> race.stopped.get() == 1, "immediate cancel " + n);
