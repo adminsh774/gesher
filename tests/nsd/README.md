@@ -267,6 +267,13 @@ pinned Android 16 r4 source, candidate runtime, ordinary APK permission evidence
 and the pending Windows gate. Its complete scope is recorded in the
 [registration research note](../../docs/research/nsd-windows-registration-2026-11-18.md).
 
+## Continuing service-info subscriptions
+
+The separate [subscription instructions](README-subscription.md) cover genuine
+full-artifact host checks, deterministic pinned-source/provider audits, the
+ordinary SDK36 reference APK and the explicit real Windows transport gate. Their
+results keep host seams, stock Android and candidate Windows execution separate.
+
 ## Native Windows import/link regression
 
 The normal native build also builds `nsd_windows_link_test`. It links the complete
