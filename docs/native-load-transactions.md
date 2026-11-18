@@ -54,6 +54,18 @@ per-thread state intact. Rollback does not reverse arbitrary resolver actions.
 Committed objects retain the existing `Close` lifecycle; this change does not
 introduce general unloading of successful mappings.
 
+Published x86 TLS addresses use a thread-owned cache. A warmed lookup does not
+acquire the process-wide module registry mutex, so unrelated allocation,
+publication or rollback cannot serialize every TLS access. Provisional entries
+remain in a separate locked map with the owner check; their existing map nodes
+move into the published cache on first use after publication. Rollback never
+touches the published cache. This depends on the current published-module
+lifetime and nonreused IDs, and does not add successful unloading. Any later
+unload implementation must supply cache invalidation before retiring storage.
+The pinned Bionic `__tls_get_addr` similarly keeps a validated cached path
+outside its registry lock; its broader DTV generation/unload machinery is not
+claimed here.
+
 ### IFUNC reentry into a pending object
 
 A request for an object still pending in an outer transaction returns an
@@ -103,6 +115,15 @@ host tests compile production sections with explicit platform/Jit seams; these
 tests alone are not ARM translation execution. Sanitizers cover compiled host
 code, not uninstrumented ELF fixture instructions. The atomic runner disables
 LeakSanitizer under ptrace; resource counts and reuse remain explicit checks.
+
+The TLS host fixture also pauses a real production allocation at its explicit
+Win32 boundary while the registry lock is held. An existing thread must still
+read its warmed static and dynamic published TLS before that pause is released.
+The prior implementation fails this bounded control. A separate concurrent
+case interleaves published reads with 32 pending rollbacks, publications and
+thread teardown. Timing a Linux adapter remains distinct from Windows timing;
+these controls establish cache independence and preservation, not an application
+throughput guarantee.
 
 The historical negative control uses the complete old implementation and the
 current graph/boundary, stopping before a partial handle can execute:

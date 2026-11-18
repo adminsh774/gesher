@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +43,16 @@ int fail_commit_after = -1;
 DWORD tls_count = 0;
 DWORD fls_count = 0;
 std::atomic<DWORD> next_thread_id{1};
+
+// Pause an actual allocation call made while the production registry lock is
+// held. Cached published TLS must remain usable on another existing thread.
+struct CommitGate {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool armed = false;
+  bool entered = false;
+  bool released = false;
+} commit_gate;
 
 struct ThreadState {
   DWORD id = next_thread_id.fetch_add(1);
@@ -157,6 +168,15 @@ BOOL InitOnceExecuteOnce(PINIT_ONCE once, InitCallback callback, PVOID param, PV
   return TRUE;
 }
 void* VirtualAlloc(void* address, size_t size, DWORD type, DWORD) {
+  if (type == MEM_COMMIT) {
+    std::unique_lock<std::mutex> lock(commit_gate.mutex);
+    if (commit_gate.armed) {
+      commit_gate.armed = false;
+      commit_gate.entered = true;
+      commit_gate.condition.notify_all();
+      commit_gate.condition.wait(lock, [] { return commit_gate.released; });
+    }
+  }
   std::lock_guard<std::mutex> lock(platform_mutex);
   REQUIRE(size != 0 && size % kPage == 0);
   if (type == MEM_RESERVE) {
@@ -463,5 +483,95 @@ int main() {
   REQUIRE(DynamicCount() == 2 && Address(dynamic)[0] == 0x5a);
   existing.Run([&] { REQUIRE(Address(dynamic)[0] == 0x6b); });
   Pass("published dynamic TLS retains per-thread state across unrelated rollback");
+
+  {
+    std::mutex completed_mutex;
+    std::condition_variable completed_condition;
+    bool completed = false;
+    {
+      std::lock_guard<std::mutex> lock(commit_gate.mutex);
+      commit_gate.armed = true;
+      commit_gate.entered = commit_gate.released = false;
+    }
+    std::thread allocator([&] {
+      auto blocked = Module(image.data(), image.size(), kStaticReserve / 2);
+      REQUIRE(elf::TlsAssignModule(&blocked) && blocked.is_static);
+      REQUIRE(elf::TlsRollbackModule(&blocked));
+    });
+    bool entered;
+    {
+      std::unique_lock<std::mutex> lock(commit_gate.mutex);
+      entered = commit_gate.condition.wait_for(lock, std::chrono::seconds(5),
+                                               [] { return commit_gate.entered; });
+    }
+    std::thread lookup([&] {
+      existing.Run([&] {
+        REQUIRE(Address(stable)[0] == 0xb2);
+        REQUIRE(Address(dynamic)[0] == 0x6b);
+        REQUIRE(elf::TlsGetAddr(stable.module_id, 3) == Address(stable) + 3);
+      });
+      std::lock_guard<std::mutex> lock(completed_mutex);
+      completed = true;
+      completed_condition.notify_all();
+    });
+    bool independent;
+    {
+      std::unique_lock<std::mutex> lock(completed_mutex);
+      independent = completed_condition.wait_for(lock, std::chrono::seconds(5),
+                                                  [&] { return completed; });
+    }
+    // Always release and join, including the old-source negative control.
+    {
+      std::lock_guard<std::mutex> lock(commit_gate.mutex);
+      commit_gate.armed = false;
+      commit_gate.released = true;
+      commit_gate.condition.notify_all();
+    }
+    lookup.join();
+    allocator.join();
+    REQUIRE(entered && independent);
+  }
+  Pass("cached published static/dynamic lookup does not wait for unrelated registry work");
+
+  {
+    static std::array<elf::TlsModule, 32> concurrent_survivors;
+    std::atomic<bool> running{false}, stop{false};
+    size_t reads = 0;
+    std::thread reader([&] {
+      REQUIRE(elf::TlsSetupThread());
+      CheckImage(stable);
+      CheckImage(dynamic);
+      uint8_t* static_address = Address(stable);
+      uint8_t* dynamic_address = Address(dynamic);
+      static_address[0] = 0x91;
+      dynamic_address[0] = 0x82;
+      running.store(true);
+      running.notify_one();
+      do {
+        REQUIRE(Address(stable) == static_address && static_address[0] == 0x91);
+        REQUIRE(Address(dynamic) == dynamic_address && dynamic_address[0] == 0x82);
+        ++reads;
+      } while (!stop.load());
+    });
+    running.wait(false);
+    for (size_t i = 0; i < concurrent_survivors.size(); ++i) {
+      auto failed = Module(image.data(), image.size(), 64, i % 2 ? 2 * kPage : 16);
+      REQUIRE(elf::TlsAssignModule(&failed));
+      CheckImage(failed);
+      const size_t retired_id = failed.module_id;
+      auto& survivor = concurrent_survivors[i];
+      survivor = Module(image.data(), image.size(), 64);
+      REQUIRE(elf::TlsAssignModule(&survivor));
+      elf::TlsPublishModule(&survivor);
+      REQUIRE(elf::TlsRollbackModule(&failed));
+      REQUIRE(elf::TlsGetAddr(retired_id, 0) == nullptr);
+      Worker transient;
+      transient.Run([&] { CheckImage(survivor); });
+    }
+    stop.store(true);
+    reader.join();
+    REQUIRE(reads > 0);
+  }
+  Pass("published cache survives concurrent rollback, publication and thread teardown");
   std::puts("ELF TLS rollback host contracts passed (complete production tls.cc; simulated Win32 boundary)");
 }
