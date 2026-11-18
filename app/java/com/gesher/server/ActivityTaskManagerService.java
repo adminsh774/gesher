@@ -188,6 +188,15 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         }
     }
 
+    /** Server-side origin retained until a result is delivered or forwarded. */
+    private static final class PendingActivityResult extends ResultInfo {
+        final ActivityRecord source;
+        PendingActivityResult(ActivityRecord source, int code, Intent data, IBinder callerToken) {
+            super(source.resultWho, source.requestCode, code, data, callerToken);
+            this.source = source;
+        }
+    }
+
     /** An activity: what ActivityRecord and its Task keep. */
     final class ActivityRecord {
         final IBinder token;
@@ -201,7 +210,9 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         final int launchedFromPid;
         final String launchedFromPackage;
         /** startActivityForResult: who gets the result, and with which request code. */
-        final ActivityRecord resultTo;
+        // Result ownership can be transferred by FLAG_ACTIVITY_FORWARD_RESULT.
+        // Writes hold the lifecycle monitor; snapshots outside it remain visible.
+        volatile ActivityRecord resultTo;
         final String resultWho;
         final int requestCode;
         final long startTime = SystemClock.uptimeMillis();
@@ -1216,17 +1227,51 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                             // Also a VIEW for the Windows default browser's package
                             // (BrowserPackageSupport, of which resolve() runs nothing).
                             final ActivityRecord resultSource;
-                            final ProcessRecord resultProcess;
+                            final ProcessRecord expectedResultProcess;
+                            final String resultTargetWho;
+                            final int resultTargetCode;
                             synchronized (this) {
-                                ActivityRecord source = requestCode >= 0 ? forToken(resultToToken) : null;
+                                ActivityRecord source = forToken(resultToToken);
                                 // IntentSender already authenticated its holder before clearing
                                 // Binder identity. The creator is not the result recipient.
                                 boolean authenticated = internalCreator
                                         ? publication != null && publication.getAsBoolean()
                                         : originalProcess != null && source != null
                                             && source.app == originalProcess;
-                                resultSource = authenticated ? source : null;
-                                resultProcess = resultSource == null ? null : resultSource.app;
+                                if (authenticated && source != null
+                                        && (intent.getFlags() & Intent.FLAG_ACTIVITY_FORWARD_RESULT) != 0) {
+                                    if (requestCode >= 0) {
+                                        return ActivityManager.START_FORWARD_AND_REQUEST_CONFLICT;
+                                    }
+                                    // The trusted source owns this route even when its
+                                    // recipient belongs to another application process.
+                                    ActivityRecord recipient = source.resultTo;
+                                    resultSource = recipient != null && !isActivityRetired(recipient)
+                                            ? recipient : null;
+                                    resultTargetWho = source.resultWho;
+                                    resultTargetCode = source.requestCode;
+                                    source.resultTo = null;
+                                    if (resultSource != null) {
+                                        // A finishing trampoline may already have queued a
+                                        // result. Remove only its result, not another child's
+                                        // result that happens to use the same request code.
+                                        resultSource.pendingResults.removeIf(result ->
+                                                result instanceof PendingActivityResult pending
+                                                        && pending.source == source
+                                                        && result.mRequestCode == source.requestCode
+                                                        && java.util.Objects.equals(result.mResultWho,
+                                                                source.resultWho));
+                                    }
+                                    // A forwarded result belongs to the original activity
+                                    // record, whose saved state can outlive its process.
+                                    // Its current record/code lifetime is checked at delivery.
+                                    expectedResultProcess = null;
+                                } else {
+                                    resultSource = authenticated && requestCode >= 0 ? source : null;
+                                    resultTargetWho = resultWho;
+                                    resultTargetCode = requestCode;
+                                    expectedResultProcess = resultSource == null ? null : resultSource.app;
+                                }
                             }
                             boolean externalTarget = canDelegateExternalUrl(intent, resolvedType);
                             boolean opened = externalTarget && sOpenExternalUrl.test(data.toString());
@@ -1237,9 +1282,10 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                             // result-producing activity finished; do not fabricate that completion.
                             boolean cancelResult = !opened
                                     || (intent.getFlags() & Intent.FLAG_ACTIVITY_NEW_TASK) != 0;
-                            if (cancelResult && resultSource != null && resultProcess != null) {
-                                deliverResult(resultSource, new ResultInfo(resultWho, requestCode,
-                                        android.app.Activity.RESULT_CANCELED, null, null), null, null, resultProcess);
+                            if (cancelResult && resultSource != null) {
+                                deliverResult(resultSource, new ResultInfo(resultTargetWho, resultTargetCode,
+                                        android.app.Activity.RESULT_CANCELED, null, null), null, null,
+                                        expectedResultProcess);
                             }
                             return opened ? ActivityManager.START_SUCCESS
                                     : !externalTarget && resolutionIntent(intent).getComponent() != null
@@ -1522,13 +1568,14 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             return ActivityManager.START_DELIVERED_TO_TOP;
         }
         started[0] = r;
+        ActivityRecord launchResultTarget = r.resultTo;
         SystemServer.log("START u0 {" + launch.toShortString(false, true, true, false) + "} from "
                 + callerName(callingPackage, callingPid) + ": task " + r.taskId
                 + (r.app != null ? ", in " + r.app : ", waiting for a process")
                 + (r.waitingFor != null ? ", after pausing " + r.waitingFor.name() : "")
                 + (r.translucent ? ", translucent or floating (the activity below stays"
                         + " visible)" : "")
-                + (r.resultTo != null ? ", result to " + r.resultTo.name() + " (request "
+                + (launchResultTarget != null ? ", result to " + launchResultTarget.name() + " (request "
                         + r.requestCode + ")" : ""));
         if (!clearTop.isEmpty()) finishTogether(clearTop.get(0), clearTop, "clear-task-history",
                 android.app.Activity.RESULT_CANCELED, null);
@@ -3406,7 +3453,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                     || processByPid(expectedProcess.pid) != expectedProcess)) return;
             if (callerToken != null) r.callerState.add(callerToken, snapshot);
             resumed = (r.state == State.RESUMED || r.state == State.LAUNCHING || r.state == State.RESUMING);
-            if (!resumed) {
+            if (!resumed || r.app == null || r.app.thread == null) {
                 r.pendingResults.add(info);
                 return;
             }
@@ -3425,6 +3472,17 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                 recipientThread.scheduleTransaction(t);
             } catch (RemoteException e) {
                 SystemServer.log("scheduleTransaction to " + recipient + " failed: " + e);
+                synchronized (this) {
+                    // AOSP retains a result when the attached recipient could not
+                    // accept it. A saved activity may already be waiting for a
+                    // replacement process, but a retired record must not revive.
+                    if (mActivities.contains(r) && !r.finishing && r.state != State.DESTROYED
+                            && activityCodeCurrent(r)
+                            && (expectedProcess == null || r.app == expectedProcess
+                                && processByPid(expectedProcess.pid) == expectedProcess)) {
+                        r.pendingResults.add(info);
+                    }
+                }
             }
         }
     }
@@ -3567,8 +3625,9 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             for (ActivityRecord r : selected) {
                 int code = r == source ? resultCode : android.app.Activity.RESULT_CANCELED;
                 Intent data = r == source ? resultData : null;
-                if (r.resultTo != null) data = normalizeMicrogCredentialResult(r.info.packageName,
-                        r.info.name, r.resultTo.info.name, code, data);
+                ActivityRecord resultTarget = r.resultTo;
+                if (resultTarget != null) data = normalizeMicrogCredentialResult(r.info.packageName,
+                        r.info.name, resultTarget.info.name, code, data);
                 ActivityCallerState.Snapshot caller = r.resultTo == null || !activityCodeCurrent(r)
                         ? null : ActivityCallerState.capture(new ActivityCallerState.Origin(r.targetCode,
                                 r.info.applicationInfo.uid, r.info.packageName, false, false),
@@ -3595,7 +3654,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                 if (pending.resultCaller != null && !isActivityRetired(recipient) && !recipient.finishing) {
                     IBinder callerToken = new Binder("Activity result caller");
                     recipient.callerState.add(callerToken, pending.resultCaller);
-                    recipient.pendingResults.add(new ResultInfo(r.resultWho, r.requestCode,
+                    recipient.pendingResults.add(new PendingActivityResult(r,
                             pending.resultCode, pending.resultData, callerToken));
                     if (recipient.state == State.RESUMED && recipient.app != null) {
                         immediateResults.computeIfAbsent(recipient, ignored -> new ArrayList<>())
@@ -3635,8 +3694,9 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
 
     private boolean finish(ActivityRecord r, String reason, int resultCode, Intent resultData,
             boolean requireCurrentCode) {
-        if (r.resultTo != null) resultData = normalizeMicrogCredentialResult(r.info.packageName,
-                r.info.name, r.resultTo.info.name, resultCode, resultData);
+        ActivityRecord resultTarget = r.resultTo;
+        if (resultTarget != null) resultData = normalizeMicrogCredentialResult(r.info.packageName,
+                r.info.name, resultTarget.info.name, resultCode, resultData);
         final ActivityCallerState.Snapshot resultCaller;
         synchronized (mPm) {
             // Compute before taking the lifecycle monitor. URI grants and provider
@@ -3660,12 +3720,12 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                     && r.resultTo.state != State.DESTROYED && !r.resultTo.finishing) {
                 IBinder callerToken = new Binder("Activity result caller");
                 r.resultTo.callerState.add(callerToken, resultCaller);
-                r.resultTo.pendingResults.add(new ResultInfo(r.resultWho, r.requestCode,
+                r.resultTo.pendingResults.add(new PendingActivityResult(r,
                         resultCode, resultData, callerToken));
             }
         }
         SystemServer.log("finishing " + r.name() + " (" + reason + ")"
-                + (r.resultTo != null ? ", result " + resultCode + " to " + r.resultTo.name()
+                + (resultTarget != null ? ", result " + resultCode + " to " + resultTarget.name()
                         : ""));
         updateTopResumed();
         completeFinish(r);

@@ -123,11 +123,17 @@ public final class ActivityFinishFixture {
         final ArrayDeque<Event> pending = new ArrayDeque<>();
         IActivityClientController controller;
         boolean autoAck = true;
+        boolean rejectNextResult;
         Operation beforeTransaction;
         int exits;
         @Override public IBinder asBinder() { return binder; }
         @Override public void scheduleExit() { exits++; }
-        @Override public void scheduleTransaction(ClientTransaction transaction) {
+        @Override public void scheduleTransaction(ClientTransaction transaction) throws RemoteException {
+            if (rejectNextResult && transaction.getTransactionItems().stream()
+                    .anyMatch(ActivityResultItem.class::isInstance)) {
+                rejectNextResult = false;
+                throw new RemoteException("Fixture recipient disconnected before result delivery");
+            }
             try {
                 if (beforeTransaction != null) beforeTransaction.run();
                 for (ClientTransactionItem item : transaction.getTransactionItems()) {
@@ -473,6 +479,183 @@ public final class ActivityFinishFixture {
         System.out.println("External URL results: Windows launch status and canceled result routing passed");
     }
 
+    @SuppressWarnings("unchecked")
+    private static void externalForwardedResults() throws Exception {
+        for (int mode = 0; mode < 5; mode++) {
+            Harness h = new Harness();
+            Object parent = h.record("Parent", 61, "a", "RESUMED");
+            Object child = h.record("Child", 61, "a", "RESUMED", parent, "original-route", 71);
+            AppThread recipientThread = h.thread;
+            if (mode == 4) {
+                recipientThread = new AppThread();
+                recipientThread.controller = h.controller;
+                Object parentProcess = construct(h.processType,
+                        new Class<?>[]{h.atmType, int.class, IApplicationThread.class},
+                        h.atm, PID + 1, recipientThread);
+                set(parentProcess, "packageName", OWNER); set(parentProcess, "processName", OWNER + ":parent");
+                set(parentProcess, "uid", UID); set(parentProcess, "ready", true);
+                ((List<Object>) get(h.atm, "mProcesses")).add(parentProcess);
+                ((List<Object>) get(h.process, "activities")).remove(parent);
+                ((List<Object>) get(parentProcess, "activities")).add(parent);
+                set(parent, "app", parentProcess);
+            }
+            ActivityTaskManagerService atm = (ActivityTaskManagerService) h.atm;
+            Field opener = field(h.atmType, "sOpenExternalUrl");
+            Object previous = opener.get(null);
+            List<String> attempts = new ArrayList<>();
+            final int which = mode;
+            int[] status = {Integer.MIN_VALUE};
+            try {
+                opener.set(null, (Predicate<String>) url -> {
+                    attempts.add(url); return which != 0 && which != 4;
+                });
+                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com/forwarded"))
+                        .addFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT);
+                if (mode == 2) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                h.asApp(() -> status[0] = atm.startActivity(h.thread, OWNER, null, intent, null,
+                        token(child), "new-route", which == 1 ? 72 : -1, 0, null, null));
+                List<ResultInfo> results = recipientThread.results(parent);
+                if (mode == 1) {
+                    check(status[0] == ActivityManager.START_FORWARD_AND_REQUEST_CONFLICT,
+                            "Forwarding plus a new request did not reject the conflict");
+                    check(attempts.isEmpty() && results.isEmpty() && h.thread.results(child).isEmpty(),
+                            "Conflicting request invoked the shell or sent a result");
+                    check(get(child, "resultTo") == parent, "Rejected forwarding consumed the original route");
+                } else {
+                    boolean failed = mode == 0 || mode == 4;
+                    boolean canceled = failed || mode == 2;
+                    check(status[0] == (failed ? ActivityManager.START_INTENT_NOT_RESOLVED
+                            : ActivityManager.START_SUCCESS), "Forwarded launch lost the actual shell status");
+                    check(attempts.size() == 1 && results.size() == (canceled ? 1 : 0),
+                            "Forwarded route lost or fabricated a result");
+                    if (canceled) {
+                        ResultInfo result = results.get(0);
+                        check(result.mRequestCode == 71 && "original-route".equals(result.mResultWho)
+                                        && result.mResultCode == Activity.RESULT_CANCELED
+                                        && result.mCallerToken == null && result.mData == null,
+                                "Forwarding replaced the original recipient fields");
+                    }
+                    check(get(child, "resultTo") == null, "Forwarding did not detach the intermediate route");
+                    check(h.controller.getCallingActivity(token(child)) == null
+                                    && h.controller.getCallingPackage(token(child)) == null,
+                            "Calling activity queries retained a transferred result route");
+                    h.asApp(() -> h.controller.finishActivity(token(child), Activity.RESULT_OK, null, 0));
+                    check(recipientThread.results(parent).size() == (canceled ? 1 : 0),
+                            "Finishing the intermediate activity sent a duplicate result");
+                }
+            } finally { opener.set(null, previous); }
+        }
+
+        Harness h = new Harness();
+        Object parent = h.record("Parent", 62, "a", "STOPPED");
+        Object child = h.record("Child", 62, "a", "RESUMED", parent, "same-route", 73);
+        Object sibling = h.record("Sibling", 62, "a", "RESUMED", parent, "same-route", 73);
+        h.thread.autoAck = false;
+        h.asApp(() -> {
+            h.controller.finishActivity(token(child), Activity.RESULT_OK, null, 0);
+            h.controller.finishActivity(token(sibling), Activity.RESULT_OK, null, 0);
+        });
+        List<ResultInfo> pending = (List<ResultInfo>) get(parent, "pendingResults");
+        check(pending.size() == 2, "Fixture did not queue both ordinary child results");
+        Field opener = field(h.atmType, "sOpenExternalUrl");
+        Object previous = opener.get(null);
+        try {
+            opener.set(null, (Predicate<String>) url -> false);
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com/forwarded-pending"))
+                    .addFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT);
+            h.asApp(() -> ((ActivityTaskManagerService) h.atm).startActivity(h.thread, OWNER, null,
+                    intent, null, token(child), null, -1, 0, null, null));
+            check(pending.size() == 2, "Forwarding retained its stale result or removed another child's result");
+            check(pending.get(0).mResultCode == Activity.RESULT_OK
+                            && pending.get(1).mResultCode == Activity.RESULT_CANCELED,
+                    "Pending result replacement changed the sibling's result or order");
+        } finally { opener.set(null, previous); }
+        System.out.println("External URL forwarding: original route, conflicts, ownership and pending results passed");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void externalForwardedLifecycle() throws Exception {
+        for (boolean accepted : new boolean[]{false, true}) {
+            // Parent process dies before/during the shell call, reattaches during it,
+            // loses its activity record, or rejects the result transaction.
+            for (int mode = 0; mode < 5; mode++) {
+                Harness h = new Harness();
+                Object parent = h.record("Parent", 63, "a", mode == 4 ? "RESUMED" : "STOPPED");
+                Object child = h.record("Child", 63, "a", "RESUMED", parent, "saved-route", 74);
+                AppThread parentThread = new AppThread();
+                parentThread.controller = h.controller;
+                Object parentProcess = construct(h.processType,
+                        new Class<?>[]{h.atmType, int.class, IApplicationThread.class},
+                        h.atm, PID + 1, parentThread);
+                set(parentProcess, "packageName", OWNER); set(parentProcess, "processName", OWNER + ":parent");
+                set(parentProcess, "uid", UID); set(parentProcess, "ready", true);
+                ((List<Object>) get(h.atm, "mProcesses")).add(parentProcess);
+                ((List<Object>) get(h.process, "activities")).remove(parent);
+                ((List<Object>) get(parentProcess, "activities")).add(parent);
+                set(parent, "app", parentProcess);
+                if (mode != 3) ((ActivityInfo) get(parent, "info")).flags |= ActivityInfo.FLAG_STATE_NOT_NEEDED;
+                var died = h.atmType.getDeclaredMethod("processDied", h.processType);
+                died.setAccessible(true);
+                if (mode == 0) died.invoke(h.atm, parentProcess);
+                parentThread.rejectNextResult = mode == 4;
+                Field opener = field(h.atmType, "sOpenExternalUrl");
+                Object previous = opener.get(null);
+                final int which = mode;
+                try {
+                    opener.set(null, (Predicate<String>) url -> {
+                        try {
+                            if (which >= 1 && which <= 3) {
+                                died.invoke(h.atm, parentProcess);
+                                if (which == 2) {
+                                    set(parent, "app", h.process);
+                                    ((List<Object>) get(h.process, "activities")).add(parent);
+                                }
+                            }
+                        } catch (Exception failure) { throw new AssertionError(failure); }
+                        return accepted;
+                    });
+                    Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com/saved-parent"))
+                            .addFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT);
+                    if (accepted) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    int[] status = {Integer.MIN_VALUE};
+                    h.asApp(() -> status[0] = ((ActivityTaskManagerService) h.atm).startActivity(h.thread,
+                            OWNER, null, intent, null, token(child), null, -1, 0, null, null));
+                    check(status[0] == (accepted ? ActivityManager.START_SUCCESS
+                                    : ActivityManager.START_INTENT_NOT_RESOLVED),
+                            "Parent lifecycle changed the actual shell launch status");
+                    check(get(child, "resultTo") == null, "Parent lifecycle retained the forwarded route");
+                    List<ResultInfo> pending = (List<ResultInfo>) get(parent, "pendingResults");
+                    check(parentThread.results(parent).isEmpty() && h.thread.results(parent).isEmpty(),
+                            "Unattached or disconnected parent received an immediate result");
+                    if (mode == 3) {
+                        check(!h.records.contains(parent) && pending.isEmpty(),
+                                "A retired parent retained a forwarded cancellation");
+                        continue;
+                    }
+                    check(h.records.contains(parent) && pending.size() == 1,
+                            "Saved parent lost its pending cancellation: mode=" + mode);
+                    ResultInfo result = pending.get(0);
+                    check(result.mRequestCode == 74 && "saved-route".equals(result.mResultWho)
+                                    && result.mResultCode == Activity.RESULT_CANCELED
+                                    && result.mData == null && result.mCallerToken == null,
+                            "Saved parent cancellation lost its routing fields");
+                    if (mode == 4) died.invoke(h.atm, parentProcess);
+                    if (get(parent, "app") != h.process) {
+                        set(parent, "app", h.process);
+                        ((List<Object>) get(h.process, "activities")).add(parent);
+                    }
+                    var resume = h.atmType.getDeclaredMethod("resume", h.recordType);
+                    resume.setAccessible(true);
+                    h.asApp(() -> resume.invoke(h.atm, parent));
+                    check(pending.isEmpty() && h.thread.results(parent).size() == 1
+                                    && h.thread.results(parent).get(0) == result,
+                            "Restored parent did not consume the retained cancellation exactly once");
+                } finally { opener.set(null, previous); }
+            }
+        }
+        System.out.println("External URL forwarding: process death, reattachment, retired records and failed delivery passed");
+    }
+
     private static void externalIntentSenderResults() throws Exception {
         Harness h = new Harness();
         Object source = h.record("Caller", 52, "a", "RESUMED");
@@ -725,6 +908,8 @@ public final class ActivityFinishFixture {
         if (group.equals("all") || group.equals("affinity")) affinity();
         if (group.equals("all") || group.equals("sub")) subActivities();
         if (group.equals("all")) externalUrlResults();
+        if (group.equals("all")) externalForwardedResults();
+        if (group.equals("all")) externalForwardedLifecycle();
         if (group.equals("all")) externalIntentSenderResults();
         if (group.equals("all")) externalUrlTargets();
         if (group.equals("all")) externalResultOwnership();
