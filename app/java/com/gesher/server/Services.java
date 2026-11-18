@@ -41,6 +41,7 @@ import com.android.internal.view.IInputMethodManager;
 
 import com.gesher.app.DeviceProfile;
 import com.gesher.app.input.VirtualKeyboard;
+import com.gesher.net.INsdRegistration;
 
 import java.lang.reflect.Field;
 import java.util.Collection;
@@ -94,6 +95,11 @@ public final class Services {
         NotificationManagerService notifications = new NotificationManagerService();
         ActivityManagerService am = new ActivityManagerService(atm, pm, notifications);
         sLast = new Created(pm, atm, am);
+        // In the isolated device this owner lives in SystemServer and can finish
+        // value-only goodbyes after an application dies. The collapsed profile
+        // shares the application's process and cannot promise that lifetime.
+        services.put(INsdRegistration.SERVICE_NAME,
+                new NsdRegistrationService(pm, atm, am, persistentAccounts));
         services.put("uri_grants", StandIn.of(android.app.IUriGrantsManager.class,
                 new UriGrantsManagerService(pm, atm, am)).asBinder());
         services.put("package", StandIn.of(IPackageManager.class, pm).asBinder());
@@ -170,9 +176,12 @@ public final class Services {
                 new DeviceServices.SearchService()).asBinder());
         services.put(Context.CLIPBOARD_SERVICE, StandIn.of(android.content.IClipboard.class,
                 new ClipboardService()).asBinder());
+        // Construct the network provider before jobs subscribe to its changes.
+        ConnectivityService connectivity = new ConnectivityService(pm, atm);
+        services.put(Context.CONNECTIVITY_SERVICE, connectivity);  // docs/network.md
         // Device state from Windows (devsvc track, ADR 0038): jobs, the battery.
         services.put(Context.JOB_SCHEDULER_SERVICE, StandIn.of(android.app.job.IJobScheduler.class,
-                new JobSchedulerService(am, atm, pm)).asBinder());
+                new JobSchedulerService(am, atm, pm, connectivity)).asBinder());
         services.put("batteryproperties", StandIn.of(android.os.IBatteryPropertiesRegistrar.class,
                 new BatteryService(am).properties()).asBinder());
         // No StandIn proxy: IBatteryStats names android.bluetooth and android.telephony
@@ -223,7 +232,6 @@ public final class Services {
                         user(userId); return Configuration.GRAMMATICAL_GENDER_NOT_SPECIFIED;
                     }
                 }).asBinder());
-        services.put(Context.CONNECTIVITY_SERVICE, new ConnectivityService(pm, atm));  // docs/network.md
         // Accounts: a dummy Google account (microG / GMS compat) and apps' own, through
         // their authenticators.
         AccountManagerService accounts = new AccountManagerService(am, pm, persistentAccounts);

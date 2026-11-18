@@ -261,27 +261,18 @@ public final class NsdContractTest {
         for (Request accepted : cappedBackend.requests) accepted.callback.stopped();
         service.drain(); app.drain();
         NsdServiceInfo info = new NsdServiceInfo(); info.setServiceName("owned"); info.setServiceType("_gesher._tcp"); info.setPort(42);
-        final int[] failures = {0};
-        final NsdServiceInfo[] registrationInfo = {null};
+        // Registration now has a real system-owned transport. This browse-only
+        // fixture retains argument validation; its former unavailable-backend
+        // expectation is covered by the separate old-source negative control.
+        // Positive registration/retirement belongs to the installed-client gate.
         NsdManager.RegistrationListener registration = new NsdManager.RegistrationListener() {
             public void onRegistrationFailed(NsdServiceInfo value, int code) {
-                check(code == 0, "Unavailable registration reports real failure");
-                failures[0]++; registrationInfo[0] = value;
+                throw new AssertionError("Argument-only fixture reached registration backend");
             }
-            public void onServiceRegistered(NsdServiceInfo value) { throw new AssertionError("Fabricated registration"); }
+            public void onServiceRegistered(NsdServiceInfo value) { throw new AssertionError("Unexpected registration"); }
             public void onUnregistrationFailed(NsdServiceInfo value, int code) { throw new AssertionError("Unexpected unregistration"); }
-            public void onServiceUnregistered(NsdServiceInfo value) { throw new AssertionError("Fabricated unregistration"); }
+            public void onServiceUnregistered(NsdServiceInfo value) { throw new AssertionError("Unexpected unregistration"); }
         };
-        manager.registerService(new AdvertisingRequest.Builder(info)
-                .setFlags(AdvertisingRequest.FLAG_SKIP_PROBING).build(), app, registration);
-        info.setServiceName("mutated after submission");
-        check(failures[0] == 0, "Unsupported registration also uses dispatcher");
-        service.drain(); app.drain();
-        check(failures[0] == 1, "Exactly one registration failure");
-        check(registrationInfo[0] != info && registrationInfo[0].getServiceName().equals("owned")
-                && registrationInfo[0].getPort() == 42, "Unavailable advertising retains submitted service snapshot");
-        manager.unregisterService(registration);
-        check(app.tasks.isEmpty() && service.tasks.isEmpty(), "Failed advertising cleanup creates no success callback");
         expect(NullPointerException.class, () -> manager.registerService((AdvertisingRequest) null, app, registration));
         expect(IllegalArgumentException.class, () -> manager.registerService(
                 new AdvertisingRequest.Builder(info).setProtocolType(-1).build(), app, registration));

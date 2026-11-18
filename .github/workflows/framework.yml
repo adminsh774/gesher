@@ -473,6 +473,26 @@ jobs:
           mkdir -p work/sdk-36
           unzip -p "$RUNNER_TEMP/platform-36_r02.zip" android-36/android.jar > work/sdk-36/android.jar
 
+      - name: Build installed NSD registration fixture against SDK 36
+        env:
+          R8_JAR: ${{ runner.temp }}/gesher-r8.jar
+        run: |
+          BUILD_TOOLS_DIR="$PWD/work/build-tools-36.1" bash tests/apps/nsdregistration/build.sh out/app \
+            --framework-res out/framework-res/framework-res.apk \
+            --framework-classes work/sdk-36/android.jar
+
+      - name: NSD registration ownership and protocol contracts
+        run: |
+          mkdir -p work/nsd-registration-classes
+          unzip -q out/app/gesher-app-classes.jar -d work/nsd-registration-classes
+          python3 tools/test_nsd_registration_contracts.py --java-home "$JAVA_HOME" \
+            --framework-classes out/framework/classes --core-classes out/coremod \
+            --app-classes work/nsd-registration-classes --output out/nsd-registration-contracts
+          python3 tools/test_nsd_registration_service.py --java-home "$JAVA_HOME" \
+            --framework-classes out/framework/classes --core-classes out/coremod \
+            --app-classes work/nsd-registration-classes --apksig-jar "$RUNNER_TEMP/gesher-apksig.jar" \
+            --output out/nsd-registration-service
+
       - name: Durable Settings provider contracts
         run: |
           python3 tools/test_settings_provider.py --java-home "$JAVA_HOME" \
@@ -559,6 +579,7 @@ jobs:
           python3 tools/test_webmessage_ports.py --java-home "$JAVA_HOME" \
             --sdk-jar work/sdk-36/android.jar --framework-classes out/framework/classes \
             --core-classes out/coremod
+          python3 tools/test_webmessage_page_script.py
           "$JAVA_HOME/bin/javac" -cp work/sdk-36/android.jar \
             -d "$RUNNER_TEMP/codec-lifecycle-sdk" \
             tests/dex-services/gesher/services/CodecLifecycleContractTest.java
@@ -604,6 +625,7 @@ jobs:
           cp out/app/winapp.apk dist-framework/
           cp out/app/winlegacy.apk dist-framework/
           cp out/app/netapp.apk out/app/nonetapp.apk dist-framework/
+          cp out/app/nsdregistration.apk dist-framework/
           cp out/app/web3app.apk dist-framework/
           cp out/app/services-tests.dex dist-framework/
           cp out/app/microgprobe.apk dist-framework/

@@ -12,6 +12,8 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import com.gesher.net.WindowsNsd;
 import com.gesher.net.WindowsNsdResolver;
+import com.gesher.net.NsdRegistrationClient;
+import com.gesher.net.NsdRegistrationContract;
 
 import java.io.IOException;
 import java.util.IdentityHashMap;
@@ -21,9 +23,9 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 
 /**
- * Android 16 NSD browsing and one-shot resolution over actual Windows networks.
- * Resolution uses raw DNS packets to preserve binary TXT. Registration and
- * service-info subscriptions remain explicitly unavailable.
+ * Android 16 NSD browsing, registration and one-shot resolution over actual
+ * Windows networks. Registration is owned by the system service process; raw
+ * DNS packets preserve binary TXT. Service-info subscriptions remain unavailable.
  */
 public final class NsdManager {
     public static final String ACTION_NSD_STATE_CHANGED = "android.net.nsd.STATE_CHANGED";
@@ -89,11 +91,32 @@ public final class NsdManager {
     private final Executor mServiceExecutor;
     private final WindowsNsd.Factory mBackend;
     private final WindowsNsdResolver.Factory mResolverBackend;
+    private final NsdRegistrationClient.Factory mRegistrationBackend;
     private final Context mContext;
     private final Map<DiscoveryListener, Discovery> mDiscoveries = new IdentityHashMap<>();
-    // Both identity maps use mDiscoveries as their common lock: an object that
-    // implements both interfaces cannot be active in both operation kinds.
+    // All listener identity maps use mDiscoveries as their common lock.
     private final Map<ResolveListener, Resolution> mResolutions = new IdentityHashMap<>();
+    private final Map<RegistrationListener, Registration> mRegistrations = new IdentityHashMap<>();
+
+    private static final class Registration {
+        NsdServiceInfo original;
+        Executor executor;
+        NsdRegistrationClient.Session session;
+        boolean stopPending;
+        boolean draining;
+        final java.util.ArrayDeque<RegistrationCommand> commands = new java.util.ArrayDeque<>();
+        Registration(NsdServiceInfo original, Executor executor) {
+            this.original = original; this.executor = executor;
+        }
+    }
+
+    private static final class RegistrationCommand {
+        final AdvertisingRequest update; // null denotes logical unregister
+        final int otherActiveRequests;
+        RegistrationCommand(AdvertisingRequest update, int otherActiveRequests) {
+            this.update = update; this.otherActiveRequests = otherActiveRequests;
+        }
+    }
 
     private static final class Resolution {
         final NsdServiceInfo original;
@@ -144,6 +167,7 @@ public final class NsdManager {
         mServiceExecutor = CallbackThread.EXECUTOR;
         mBackend = WindowsNsd.factory();
         mResolverBackend = WindowsNsdResolver.factory();
+        mRegistrationBackend = NsdRegistrationClient.factory();
     }
 
     // Explicit fixture injection; ordinary construction always selects WindowsNsd.
@@ -157,10 +181,17 @@ public final class NsdManager {
 
     private NsdManager(Context context, Executor serviceExecutor, WindowsNsd.Factory backend,
             WindowsNsdResolver.Factory resolverBackend) {
+        this(context, serviceExecutor, backend, resolverBackend, NsdRegistrationClient.factory());
+    }
+
+    private NsdManager(Context context, Executor serviceExecutor, WindowsNsd.Factory backend,
+            WindowsNsdResolver.Factory resolverBackend,
+            NsdRegistrationClient.Factory registrationBackend) {
         mContext = context;
         mServiceExecutor = Objects.requireNonNull(serviceExecutor);
         mBackend = Objects.requireNonNull(backend);
         mResolverBackend = Objects.requireNonNull(resolverBackend);
+        mRegistrationBackend = Objects.requireNonNull(registrationBackend);
     }
 
     // --- registering ---------------------------------------------------------------
@@ -172,24 +203,167 @@ public final class NsdManager {
 
     public void registerService(NsdServiceInfo serviceInfo, int protocolType,
             Executor executor, RegistrationListener listener) {
-        checkServiceInfo(serviceInfo);
-        checkProtocol(protocolType);
-        Objects.requireNonNull(executor, "executor cannot be null");
-        Objects.requireNonNull(listener, "listener cannot be null");
-        NsdServiceInfo info = new NsdServiceInfo(serviceInfo);
-        mServiceExecutor.execute(() -> executor.execute(() ->
-                listener.onRegistrationFailed(info, FAILURE_INTERNAL_ERROR)));
+        NsdRegistrationContract.checkServiceInfoForRegistration(serviceInfo);
+        NsdRegistrationContract.checkProtocol(protocolType);
+        AdvertisingRequest.Builder builder = new AdvertisingRequest.Builder(serviceInfo, protocolType);
+        synchronized (mDiscoveries) {
+            Registration existing = mRegistrations.get(listener);
+            if (existing != null && NsdRegistrationContract.isSubtypeUpdate(
+                    existing.original, serviceInfo)) {
+                builder.setFlags(AdvertisingRequest.NSD_ADVERTISING_UPDATE_ONLY);
+            }
+        }
+        registerService(builder.build(), executor, listener);
     }
 
-    public void registerService(AdvertisingRequest advertisingRequest, Executor executor,
+    /** Additional pinned-source profile: preserve every supplied advertising option. */
+    public void registerService(AdvertisingRequest request, Executor executor,
             RegistrationListener listener) {
-        Objects.requireNonNull(advertisingRequest, "AdvertisingRequest cannot be null");
-        registerService(advertisingRequest.getServiceInfo(), advertisingRequest.getProtocolType(),
-                executor, listener);
+        Objects.requireNonNull(request, "AdvertisingRequest cannot be null");
+        NsdServiceInfo original = request.getServiceInfo();
+        NsdRegistrationContract.checkServiceInfoForRegistration(original);
+        NsdRegistrationContract.checkProtocol(request.getProtocolType());
+        Objects.requireNonNull(listener, "listener cannot be null");
+        // The r4 manager does not add an explicit executor-null check here.
+        // Preserve original request identity for failure/unregister callbacks;
+        // the real Binder-equivalent boundary owns the independent byte snapshot.
+        AdvertisingRequest owned = new AdvertisingRequest.Builder(
+                NsdRegistrationContract.copyForTransport(original), request.getProtocolType())
+                .setFlags(request.getFlags()).setTtl(request.getTtl()).build();
+        boolean update = (request.getFlags() & AdvertisingRequest.NSD_ADVERTISING_UPDATE_ONLY) != 0;
+        Registration registration;
+        int other;
+        synchronized (mDiscoveries) {
+            registration = mRegistrations.get(listener);
+            if (update) {
+                if (registration == null) throw new IllegalArgumentException("listener not registered");
+                registration.original = original;
+                registration.executor = executor;
+            } else {
+                if (registration != null || mDiscoveries.containsKey(listener)
+                        || mResolutions.containsKey(listener)) {
+                    throw new IllegalArgumentException("listener already in use");
+                }
+                registration = new Registration(original, executor);
+                mRegistrations.put(listener, registration);
+            }
+            // The service owns the registration/retained-update portion of the
+            // quota; it must not trust this caller to under-report those entries.
+            other = mDiscoveries.size() + mResolutions.size();
+            if (update) registration.commands.addLast(new RegistrationCommand(owned, other));
+        }
+        if (update) {
+            drainRegistration(registration);
+            return;
+        }
+        final Registration record = registration;
+        try {
+            NsdRegistrationClient.Session session = mRegistrationBackend.start(owned, other,
+                    new NsdRegistrationClient.Callback() {
+                        public void registered(NsdServiceInfo result) {
+                            registrationEvent(listener, record, false,
+                                    (value, sink) -> sink.onServiceRegistered(result));
+                        }
+                        public void failed(int error, boolean retained) {
+                            registrationEvent(listener, record, true,
+                                    (value, sink) -> sink.onRegistrationFailed(value, error));
+                        }
+                        public void unregistered() {
+                            registrationEvent(listener, record, true,
+                                    (value, sink) -> sink.onServiceUnregistered(value));
+                        }
+                        public void unregisterFailed(int error) {
+                            registrationEvent(listener, record, true,
+                                    (value, sink) -> sink.onUnregistrationFailed(value, error));
+                        }
+                    });
+            synchronized (mDiscoveries) { record.session = session; }
+            drainRegistration(record);
+        } catch (RuntimeException | Error failure) {
+            synchronized (mDiscoveries) {
+                if (mRegistrations.get(listener) == record) mRegistrations.remove(listener);
+                record.commands.clear();
+            }
+            throw failure;
+        }
+    }
+
+    private interface RegistrationEvent {
+        void deliver(NsdServiceInfo original, RegistrationListener listener);
+    }
+
+    private void registrationEvent(RegistrationListener listener, Registration registration,
+            boolean terminal, RegistrationEvent event) {
+        mServiceExecutor.execute(() -> {
+            NsdServiceInfo original;
+            Executor executor;
+            synchronized (mDiscoveries) {
+                if (mRegistrations.get(listener) != registration) return;
+                original = registration.original;
+                executor = registration.executor;
+                if (terminal) {
+                    mRegistrations.remove(listener);
+                    registration.commands.clear();
+                }
+            }
+            try {
+                executor.execute(() -> event.deliver(original, listener));
+            } catch (RejectedExecutionException rejected) {
+                if (!terminal) {
+                    synchronized (mDiscoveries) {
+                        if (mRegistrations.get(listener) == registration) mRegistrations.remove(listener);
+                        registration.commands.clear();
+                        if (!registration.stopPending) {
+                            registration.stopPending = true;
+                            registration.commands.add(new RegistrationCommand(null, 0));
+                        }
+                    }
+                    drainRegistration(registration);
+                }
+                throw rejected;
+            }
+        });
+    }
+
+    // A synchronous callback can enqueue an update/unregister before start()
+    // returns its session. One drain preserves submission order across that
+    // handoff without invoking the backend while holding a listener-map lock.
+    private void drainRegistration(Registration registration) {
+        synchronized (mDiscoveries) {
+            if (registration.session == null || registration.draining) return;
+            registration.draining = true;
+        }
+        try {
+            for (;;) {
+                RegistrationCommand command;
+                synchronized (mDiscoveries) {
+                    command = registration.commands.pollFirst();
+                    if (command == null) {
+                        registration.draining = false;
+                        return;
+                    }
+                }
+                if (command.update == null) registration.session.stop();
+                else registration.session.update(command.update, command.otherActiveRequests);
+            }
+        } catch (RuntimeException | Error failure) {
+            synchronized (mDiscoveries) { registration.draining = false; }
+            throw failure;
+        }
     }
 
     public void unregisterService(RegistrationListener listener) {
         Objects.requireNonNull(listener, "listener cannot be null");
+        Registration registration;
+        synchronized (mDiscoveries) {
+            registration = mRegistrations.get(listener);
+            if (registration == null) throw new IllegalArgumentException("listener not registered");
+            if (!registration.stopPending) {
+                registration.stopPending = true;
+                registration.commands.addLast(new RegistrationCommand(null, 0));
+            }
+        }
+        drainRegistration(registration);
     }
 
     // --- discovering ---------------------------------------------------------------
@@ -266,7 +440,8 @@ public final class NsdManager {
             // API36 rejects an already-used listener before the NetworkRequest
             // tracker reaches ConnectivityManager's permission check. Do not
             // reserve a new listener if that permission check then fails.
-            if (mDiscoveries.containsKey(listener) || mResolutions.containsKey(listener)) throw new IllegalArgumentException("listener already in use");
+            if (mDiscoveries.containsKey(listener) || mResolutions.containsKey(listener)
+                    || mRegistrations.containsKey(listener)) throw new IllegalArgumentException("listener already in use");
         }
         if (request != null && mContext != null) {
             mContext.enforcePermission("android.permission.ACCESS_NETWORK_STATE",
@@ -276,11 +451,13 @@ public final class NsdManager {
         boolean overLimit;
         synchronized (mDiscoveries) {
             // Another thread may have registered it during permission checking.
-            if (mDiscoveries.containsKey(listener) || mResolutions.containsKey(listener)) throw new IllegalArgumentException("listener already in use");
+            if (mDiscoveries.containsKey(listener) || mResolutions.containsKey(listener)
+                    || mRegistrations.containsKey(listener)) throw new IllegalArgumentException("listener already in use");
             // The service applies discovery's quota to the whole active client
             // request map. The Java one-shot resolve path has no such admission
             // check, but its active requests still count when discovery starts.
-            overLimit = mDiscoveries.size() + mResolutions.size() >= 200;
+            overLimit = mDiscoveries.size() + mResolutions.size() + mRegistrations.size()
+                    + mRegistrationBackend.retainedCount() >= 200;
             mDiscoveries.put(listener, discovery);
         }
         if (overLimit) {
@@ -410,7 +587,8 @@ public final class NsdManager {
         Objects.requireNonNull(listener, "listener cannot be null");
         Resolution resolution = new Resolution(serviceInfo, executor);
         synchronized (mDiscoveries) {
-            if (mDiscoveries.containsKey(listener) || mResolutions.containsKey(listener)) {
+            if (mDiscoveries.containsKey(listener) || mResolutions.containsKey(listener)
+                    || mRegistrations.containsKey(listener)) {
                 throw new IllegalArgumentException("listener already in use");
             }
             mResolutions.put(listener, resolution);

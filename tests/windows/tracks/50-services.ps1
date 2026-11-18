@@ -813,6 +813,10 @@ if ($state) { foreach ($n in DeviceAlive $state) { Stop-Process -Id ([int]($n -s
 if ($failed -ne $failedBefore) { DeviceLogs }
 Remove-Item Env:GESHER_APP_WINDOW -ErrorAction SilentlyContinue
 
+# Actual persistent owner, installed application identity, independent binary
+# wire peer, immediate reuse, process death/uninstall and native retirement.
+. (Join-Path $PSScriptRoot '../run-nsd-registration-contract.ps1')
+
 # Manager construction and software-service completion contracts need no running
 # device, installed app, UI, or hardware. Keep their state separate from the
 # lifecycle fixtures above and never inherit a Binder device name.

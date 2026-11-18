@@ -70,8 +70,18 @@ def main():
     assert len(selected) == 7, 'selected SDK denominator changed'
 
     native = ROOT / 'compat/net/windows_nsd_resolve.cc'
-    native_rows = re.findall(r'\{"(native\w+)", "([^"]+)", NATIVEHELPER_SYSV_JNI_ENTRY\((\w+)\)\}',
-                             native.read_text())
+    native_text = native.read_text()
+
+    def native_table(symbol):
+        table = re.search(r'const JNINativeMethod ' + re.escape(symbol)
+                          + r'\[\] = \{(.*?)\n\};', native_text, re.S)
+        assert table is not None, symbol + ' table missing'
+        return re.findall(r'\{"(native\w+)", "([^"]+)", NATIVEHELPER_SYSV_JNI_ENTRY\((\w+)\)\}',
+                          table.group(1))
+
+    # These are distinct providers even though they share one real native
+    # library/registry. Never count both tables as seventeen resolver methods.
+    native_rows = native_table('kMethods')
     declared = {item.name: item.descriptor for item in
                 application['com.gesher.net.WindowsNsdResolver'].members.values()
                 if item.flags & members.NATIVE and item.flags & members.STATIC}
@@ -79,6 +89,17 @@ def main():
     assert {name: descriptor for name, descriptor, _ in native_rows} == declared
     assert ('method', '<init>', '(JIII[B)V') in application['com.gesher.net.WindowsNsdResolver$Packet'].members
     assert '"(JIII[B)V"' in native.read_text(), 'native Packet constructor descriptor'
+    advertiser_rows = native_table('kAdvertiserMethods')
+    advertiser_declared = {item.name: item.descriptor for item in
+                          application['com.gesher.net.WindowsNsdAdvertiser'].members.values()
+                          if item.flags & members.NATIVE and item.flags & members.STATIC}
+    assert len(advertiser_rows) == len(advertiser_declared) == 9
+    assert {name: descriptor for name, descriptor, _ in advertiser_rows} == advertiser_declared
+    advertiser_constructors = {'Packet': '(JIII[BIZI[B)V', 'Address': '(JII[BIIIIII)V'}
+    for name, descriptor in advertiser_constructors.items():
+        assert ('method', '<init>', descriptor) in application[
+            'com.gesher.net.WindowsNsdAdvertiser$' + name].members
+        assert '"' + descriptor + '"' in native_text, 'native advertiser ' + name + ' constructor'
 
     framework, framework_manifest = members.archive_members(args.framework_dex, 'boot', 'selected-framework')
     # Genuine core classfiles close inherited declarations such as
@@ -122,6 +143,12 @@ def main():
         'codec_imports': verified, 'sdk_sha256': digest(args.android_jar),
         'sdk_selected_declarations': selected, 'native_source_sha256': digest(native),
         'native_signatures': [{'name': n, 'descriptor': d, 'function': f} for n, d, f in native_rows],
+        'advertiser_native_signatures': [{'name': n, 'descriptor': d, 'function': f}
+                                         for n, d, f in advertiser_rows],
+        'advertiser_constructor_descriptors': advertiser_constructors,
+        'advertiser_jni_class_hashes': {name: digest(application_paths[name]) for name in (
+            'com.gesher.net.WindowsNsdAdvertiser', 'com.gesher.net.WindowsNsdAdvertiser$Packet',
+            'com.gesher.net.WindowsNsdAdvertiser$Address')},
         'packet_constructor_descriptor': '(JIII[B)V', 'framework': framework_manifest,
         'application_closure_hashes': {name: digest(application_paths[name]) for name in closure},
         'called_android_gesher_members': resolved, 'unresolved_members': unresolved,
@@ -129,6 +156,7 @@ def main():
                 for row in resolved if row['provider'] == 'genuine-core-compile-class'},
         'javap_command': command, 'tool_sha256': digest(Path(__file__)),
         'limits': ['Selected 7 SDK36 declarations, not whole NSD/runtime coverage',
+                   'Advertiser extension checks 9 JNI methods and 2 constructors only; its full Java/core/SDK behavior has a separate registration audit',
                    'Actual selected framework DEX plus fresh application class inputs; not a complete boot DEX census',
                    'java.*, javax.* and other core-provider members are outside this selected member audit',
                    'Inherited core declarations resolved from genuine classfiles are compile evidence, not packaged core DEX provider proof',
@@ -138,7 +166,8 @@ def main():
     args.output.write_text(json.dumps(output, indent=2) + '\n')
     assert not unresolved, 'Selected member linkage unresolved; see output'
     print(json.dumps({'imports': len(verified), 'sdk_declarations': len(selected),
-                      'native_signatures': len(native_rows), 'closure_classes': len(closure),
+                      'native_signatures': len(native_rows), 'advertiser_native_signatures': len(advertiser_rows),
+                      'closure_classes': len(closure),
                       'called_members': len(resolved), 'windowsExecution': False}))
 
 
