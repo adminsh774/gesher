@@ -347,11 +347,25 @@ int BIONIC_SYSV PthreadSigmask(int how, const uint64_t* set, uint64_t* old) {
   ThreadState* self = Self();
   uint64_t current = self->mask;
   if (set != nullptr) {
+    if (how != kSigBlock && how != kSigUnblock && how != kSigSetmask) return kEINVAL;
+    // Match Android 16 Bionic's filter_reserved_signals on the REQUEST,
+    // before applying the operation. Filtering the resulting mask instead
+    // would change pre-existing reserved bits even for SIG_BLOCK/UNBLOCK.
+    // Signal 32 belongs to POSIX timers; runtime signals 33..41 must not be
+    // newly blocked through the public mask functions.
+    uint64_t requested = *set;
+    if (how == kSigUnblock) {
+      requested &= ~Bit(32);
+      for (int sig = 33; sig < kSigrtMin; ++sig) requested |= Bit(sig);
+    } else {
+      requested |= Bit(32);
+      for (int sig = 33; sig < kSigrtMin; ++sig) requested &= ~Bit(sig);
+    }
     uint64_t next;
     switch (how) {
-      case kSigBlock: next = current | *set; break;
-      case kSigUnblock: next = current & ~*set; break;
-      case kSigSetmask: next = *set; break;
+      case kSigBlock: next = current | requested; break;
+      case kSigUnblock: next = current & ~requested; break;
+      case kSigSetmask: next = requested; break;
       default: return kEINVAL;
     }
     // SIGKILL and SIGSTOP cannot be blocked.
