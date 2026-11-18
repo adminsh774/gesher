@@ -199,8 +199,9 @@ public final class NsdResolveContractTest {
     private static final class Operation implements WindowsNsdResolver.Session {
         final WindowsNsdResolver.Callback callback;
         boolean stopped;
+        int stopCalls;
         Operation(WindowsNsdResolver.Callback callback) { this.callback = callback; }
-        public void stop() { stopped = true; }
+        public void stop() { stopped = true; stopCalls++; }
     }
     private static final class Backend implements WindowsNsdResolver.Factory {
         final List<Operation> operations = new ArrayList<>();
@@ -251,8 +252,11 @@ public final class NsdResolveContractTest {
         expect(IllegalArgumentException.class, () -> manager.resolveService(original, app, listener));
         manager.stopServiceResolution(listener); check(first.stopped, "cancel reaches owned transport");
         check(listener.events.isEmpty(), "stop is not successful before backend retirement");
-        expect(IllegalArgumentException.class, () -> manager.stopServiceResolution(listener));
+        manager.stopServiceResolution(listener);
+        check(first.stopCalls == 1, "Pending repeated stop coalesces without restarting transport cleanup");
         first.callback.stopped(); check(listener.events.isEmpty(), "backend callback enters service dispatcher");
+        manager.stopServiceResolution(listener);
+        check(first.stopCalls == 1, "Stop coalesces while terminal dispatch is queued");
         service.drain(); check(listener.events.isEmpty(), "application executor owns terminal callback");
         manager.resolveService(original, app, listener); Operation second = backend.last();
         app.drain(); check(listener.value == original && listener.events.equals(List.of("stopped")), "original request and reuse before callback execution");
