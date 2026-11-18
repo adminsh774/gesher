@@ -16,6 +16,9 @@ add_library(gesher_bionic_binary128 STATIC
   ${_gesher_gdtoa}/sum.c)
 target_include_directories(gesher_bionic_binary128 PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}/gdtoa)
+# The pinned gdtoa sources use signed wraparound while accumulating mantissa
+# bits and large exponents. Preserve those arithmetic assumptions on Windows
+# without modifying the upstream parser or other Gesher targets.
 target_compile_options(gesher_bionic_binary128 PRIVATE
-  -fno-strict-aliasing -frounding-math -ffp-contract=off
+  -fwrapv -fno-strict-aliasing -frounding-math -ffp-contract=off
   -Wall -Wextra -Wno-sign-compare -Wno-unused-parameter)
