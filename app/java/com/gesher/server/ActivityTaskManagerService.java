@@ -625,7 +625,9 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                     || requestCode < 0 && (incoming.getFlags() & Intent.FLAG_ACTIVITY_NEW_DOCUMENT) != 0;
             int taskId = launchTaskId >= 0 && topOf(launchTaskId) != null ? launchTaskId
                     : !newTask ? origin.taskId : -1;
-            ActivityRecord covered = taskId >= 0 ? topOf(taskId) : topResumedCandidateLocked();
+            ActivityRecord covered = taskId >= 0 ? topOf(taskId) : focusedTaskTopLocked();
+            // Native UI can already cover the focused task without removing it.
+            if (taskId < 0 && covered != null && covered.app == null) covered = null;
             Object key = origin != null ? origin.token : process != null ? process.thread.asBinder() : new Object();
             if (mIntentChoosers.size() >= 16 || mIntentChoosers.containsKey(key)) return ActivityManager.START_CANCELED;
             choice = new IntentChoice(key, request, creator, creatorCode,
@@ -3397,12 +3399,18 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
      * back, if it is in a process. Guarded by this.
      */
     private ActivityRecord topResumedCandidateLocked() {
+        ActivityRecord top = focusedTaskTopLocked();
+        return top != null && top.app != null && top.chooserCoverCount == 0 ? top : null;
+    }
+
+    /** The focused task remains the target of detached native UI while covered. Guarded by this. */
+    private ActivityRecord focusedTaskTopLocked() {
         for (int i = mTaskOrder.size() - 1; i >= 0; i--) {
             int taskId = mTaskOrder.get(i);
             if (mHiddenTasks.contains(taskId)) continue;
             ActivityRecord top = topOf(taskId);
             if (top == null) continue;
-            return top.app != null && top.chooserCoverCount == 0 ? top : null;
+            return top;
         }
         return null;
     }

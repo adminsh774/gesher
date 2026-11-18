@@ -136,6 +136,7 @@ public final class ChooserContractTest {
     }
     private static final class Selection {
         final CountDownLatch shown = new CountDownLatch(1), release = new CountDownLatch(1);
+        volatile Thread worker;
         volatile String[] labels;
         volatile BooleanSupplier active;
         volatile int selected = -1;
@@ -145,6 +146,7 @@ public final class ChooserContractTest {
             Class<?> api = type("IntentChooser$Dialog");
             return Proxy.newProxyInstance(api.getClassLoader(), new Class<?>[]{api}, (p, m, args) -> {
                 if (m.getName().equals("available")) return available;
+                worker = Thread.currentThread();
                 labels = (String[])args[2]; active = (BooleanSupplier)args[4]; shown.countDown();
                 if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("Fixture input was not released");
                 if (failure != null) throw failure;
@@ -806,9 +808,41 @@ public final class ChooserContractTest {
         check(concurrent.records().isEmpty() && concurrent.idleSince() >= closedAfter,
                 "Last chooser did not start a fresh idle interval");
     }
+    private static void detachedOverlap() throws Exception {
+        Harness h = new Harness();
+        Selection secondUi = new Selection();
+        try {
+            check(h.start(chooser().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null, -1)
+                    == ActivityManager.START_SUCCESS, "First detached chooser admitted");
+            h.ui.displayed();
+            set(h.tasks, "mIntentChooserDialog", secondUi.dialog());
+            long oldIdentity = Binder.clearCallingIdentity();
+            try {
+                Binder.restoreCallingIdentity(((long)(UID + 1) << 32) | (PID + 1));
+                check(h.api.startActivity(h.first, FIRST, null,
+                        chooser().addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), null, null, null, -1,
+                        0, null, null) == ActivityManager.START_SUCCESS, "Second detached caller admitted");
+            } finally { Binder.restoreCallingIdentity(oldIdentity); }
+            secondUi.displayed();
+            check(h.pending() == 2 && h.idleSince() == 0, "Both detached coordinators own native sessions");
+            h.ui.choose(-1); h.ui.worker.join(3000);
+            check(!h.ui.worker.isAlive() && h.pending() == 1, "First native call and cleanup actually returned");
+            System.out.println("DETACHED78 source=" + get(h.root, "state") + " resumes="
+                    + h.owner.count(ResumeActivityItem.class) + " remaining=" + h.pending()
+                    + " secondActive=" + secondUi.active.getAsBoolean());
+            check(get(h.root, "state") == state("PAUSED") && h.owner.count(ResumeActivityItem.class) == 0,
+                    "First detached chooser completion must not resume beneath the second detached chooser");
+            check(secondUi.active.getAsBoolean() && h.idleSince() == 0 && h.owner.results.isEmpty(),
+                    "Remaining chooser retains its native lifetime and creates no result dependency");
+            secondUi.choose(-1); h.settled();
+            check(get(h.root, "state") == state("RESUMED") && h.owner.count(ResumeActivityItem.class) == 1,
+                    "Final detached chooser resumes the covered task once");
+        } finally { h.ui.choose(-1); secondUi.choose(-1); h.settled(); }
+    }
+
     public static int run(boolean binder) throws Exception {
         realBinder = binder; checks = 0;
-        idleOwnership();
+        idleOwnership(); detachedOverlap();
         validation(); selectionAndGrants(); cancellation(); initialsAndSingle(); sharedUid(); selectors(); providerTypes();
         retirement(); flagsAndSuspension(); callback();
         return checks;
