@@ -131,6 +131,9 @@ final class AppOpsPermissionChecker extends android.permission.IPermissionChecke
         List<AttributionSourceState> chain = AppOpsAttribution.chain(source);
         boolean appOpPermission = info != null && info.isAppOp();
         boolean runtime = info != null && info.isRuntime();
+        // An app-op permission has no usable authorization path without its mapped op.
+        // Runtime modifier permissions without an op still follow the permission check.
+        if (appOpPermission && op == OP_NONE) return PERMISSION_HARD_DENIED;
         for (AttributionSourceState node : chain) {
             if (node.packageName == null) {
                 String[] packages = mPm.getPackagesForUid(node.uid);
@@ -163,9 +166,11 @@ final class AppOpsPermissionChecker extends android.permission.IPermissionChecke
         int blamedOp = attributedOp == OP_NONE ? op : attributedOp;
         boolean start = forDelivery && startDelivery && !appOpPermission;
         if (start && source.token == null) return PERMISSION_HARD_DENIED;
+        int chainId = start && chain.size() > 1 ? mChainIds.updateAndGet(value -> value == Integer.MAX_VALUE ? 1 : value + 1) : ATTRIBUTION_CHAIN_ID_NONE;
+        boolean hasChain = chainId != ATTRIBUTION_CHAIN_ID_NONE;
+        boolean trustedStart = !hasChain || permission(Manifest.permission.UPDATE_APP_OPS_STATS, source);
         Delivery delivery = start ? new Delivery(blamedOp, source, fromDatasource) : null;
         if (delivery != null && !delivery.link()) return PERMISSION_HARD_DENIED;
-        int chainId = start && chain.size() > 1 ? mChainIds.updateAndGet(value -> value == Integer.MAX_VALUE ? 1 : value + 1) : ATTRIBUTION_CHAIN_ID_NONE;
         boolean success = false;
         try {
             for (int index = 0; index < chain.size(); index++) {
@@ -174,8 +179,18 @@ final class AppOpsPermissionChecker extends android.permission.IPermissionChecke
                 boolean self = singleReceiver || index == chain.size() - 1;
                 AttributionSourceState accessor = singleReceiver ? chain.get(1) : current;
                 boolean skip = fromDatasource || index > 0;
+                boolean trustedLink = hasChain && trustedStart
+                        && (index == 0 || mPm.permissions().isRegisteredAttributionSource(current))
+                        && (index + 1 == chain.size()
+                                || mPm.permissions().isRegisteredAttributionSource(chain.get(index + 1)));
+                int proxyFlags = hasChain && !skip
+                        ? attributionFlags(index, chain.size(), fromDatasource, self, true, trustedLink)
+                        : ATTRIBUTION_FLAGS_NONE;
+                int proxiedFlags = hasChain
+                        ? attributionFlags(index + 1, chain.size(), fromDatasource, self, false, trustedLink)
+                        : ATTRIBUTION_FLAGS_NONE;
                 int mode = transaction(op, blamedOp, source.token, current, accessor, self, singleReceiver,
-                        skip, message, forDelivery, start, chainId, delivery);
+                        skip, message, forDelivery, start, proxyFlags, proxiedFlags, chainId, delivery);
                 if (appOpPermission) {
                     if (mode == MODE_ERRORED || mode == MODE_IGNORED) return PERMISSION_HARD_DENIED;
                     if (mode == MODE_DEFAULT) {
@@ -205,9 +220,25 @@ final class AppOpsPermissionChecker extends android.permission.IPermissionChecke
         } finally { if (!success && delivery != null) delivery.finish(); }
     }
 
+    /** AOSP PermissionChecker assigns roles per link, excluding a datasource itself. */
+    private static int attributionFlags(int index, int size, boolean fromDatasource,
+            boolean self, boolean proxy, boolean trusted) {
+        if (index >= size) return ATTRIBUTION_FLAGS_NONE;
+        int flags = trusted ? ATTRIBUTION_FLAG_TRUSTED : ATTRIBUTION_FLAGS_NONE;
+        if (proxy) {
+            if (self || !fromDatasource && index == 0) return flags | ATTRIBUTION_FLAG_ACCESSOR;
+        } else {
+            if (self) return flags | ATTRIBUTION_FLAG_RECEIVER;
+            if (fromDatasource && index == 1) return flags | ATTRIBUTION_FLAG_ACCESSOR;
+            if (index + 1 == size) return flags | ATTRIBUTION_FLAG_RECEIVER;
+        }
+        if (fromDatasource && index == 0) return ATTRIBUTION_FLAGS_NONE;
+        return flags | ATTRIBUTION_FLAG_INTERMEDIARY;
+    }
+
     private int transaction(int permissionOp, int blamedOp, IBinder token, AttributionSourceState current,
             AttributionSourceState accessor, boolean self, boolean singleReceiver, boolean skip, String message,
-            boolean forDelivery, boolean start, int chainId, Delivery delivery) {
+            boolean forDelivery, boolean start, int proxyFlags, int proxiedFlags, int chainId, Delivery delivery) {
         if (!forDelivery) {
             int mode = skip && !singleReceiver ? MODE_ALLOWED : mOps.checkOperationRawForDevice(permissionOp,
                     accessor.uid, accessor.packageName, accessor.attributionTag, accessor.deviceId);
@@ -222,23 +253,22 @@ final class AppOpsPermissionChecker extends android.permission.IPermissionChecke
         if (checked == MODE_ERRORED) return checked;
         SyncNotedAppOp result;
         boolean proxy = !self;
-        int flags = chainId == ATTRIBUTION_CHAIN_ID_NONE ? ATTRIBUTION_FLAGS_NONE : ATTRIBUTION_FLAG_ACCESSOR;
         try {
             if (self) {
                 result = start ? mOps.startOperationForDevice(token, blamedOp, accessor.uid, accessor.packageName,
-                        accessor.attributionTag, accessor.deviceId, false, false, message, false, flags, chainId)
+                        accessor.attributionTag, accessor.deviceId, false, false, message, false, proxyFlags, chainId)
                         : mOps.noteOperationForDevice(blamedOp, accessor.uid, accessor.packageName,
                                 accessor.attributionTag, accessor.deviceId, false, message, false);
             } else {
                 result = start ? mOps.startProxyOperationWithState(token, blamedOp, accessor, false, false, message,
-                        false, skip, flags, ATTRIBUTION_FLAG_RECEIVER, chainId)
+                        false, skip, proxyFlags, proxiedFlags, chainId)
                         : mOps.noteProxyOperationWithState(blamedOp, accessor, false, message, false, skip);
             }
         } catch (SecurityException notTrustedDatasource) {
             if (!singleReceiver) throw notTrustedDatasource;
             proxy = true; accessor = current;
             result = start ? mOps.startProxyOperationWithState(token, blamedOp, current, false, false, message,
-                    false, skip, flags, ATTRIBUTION_FLAG_RECEIVER, chainId)
+                    false, skip, proxyFlags, proxiedFlags, chainId)
                     : mOps.noteProxyOperationWithState(blamedOp, current, false, message, false, skip);
         }
         if (start && result.getOpMode() == MODE_ALLOWED) {

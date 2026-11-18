@@ -255,13 +255,28 @@ and generation-reentry regressions remain required.
 
 The Windows `framework-fixes` track runs the fixture through generated AppOps and
 PermissionChecker Binder Parcel transports. Its required success marker includes
-`434 checks; binder=true`. `tools/test_appops.py` runs the same service contracts on a host JDK
+`482 checks; binder=true`. `tools/test_appops.py` runs the same service contracts on a host JDK
 with the existing declared JNI identity/clock boundary. Its host-only setup also
 supplies the pinned permission definitions, including their background and
 restriction metadata, when framework assets are
 unavailable, bypasses unrelated ICU initialization and disables the cross-process
 cache nonce. An isolated broadcast transport boundary keeps package lifecycle tests local.
 It does not replace permission decisions or operation methods.
+
+The current regressions also cover missing app-op permission mappings, actual
+accessor/intermediary/receiver observer roles, trusted and datasource chains,
+explicit foreground-service exit, and service-removal accounting while another
+activity retains the process. The service's earlier while-in-use eligibility is
+cleared on an actual foreground exit; sticky-restart handling is unchanged.
+Service removal schedules a UID-state refresh so the published ledger and
+observers transition after settling without requiring a later query.
+
+The 2026-11-18 repair composes the reviewed SAF/task/result changes and typechecks
+288 production Java sources. All 482 host AppOps checks and the original
+independent attribution and foreground-lifecycle assertions pass. The expanded
+fixture rejects the original PR72 implementation at its missing-app-op mapping
+assertion. These are host/source results; the new Windows Binder marker remains
+an execution requirement, not a claim that this repaired tree ran on Windows.
 
 Repair validation on 2026-11-17 compiled all 284 production Java sources, passed
 434 AppOps assertions, passed the 85 UID checks in each compatibility mode and

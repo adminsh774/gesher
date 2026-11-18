@@ -29,6 +29,11 @@ normal service/activity recovery and inexact alarms. The revocation path preserv
 valid requests waiting for a process that had not attached yet. A later grant sends
 the protected permission-state broadcast; revocation does not send a grant event.
 
+Positive repeating intervals use Android 16's default bounds: at least 60,000 ms
+and at most 31,536,000,000 ms (365 days). Zero and negative intervals retain
+one-shot behavior. Registration normalizes the stored interval before timer
+dispatch; these bounds do not claim Windows suspend/wake support.
+
 ## Native Settings integration
 
 When no installed `com.android.settings` package owns the namespace and the native
@@ -50,6 +55,17 @@ front. Such a recipient keeps its result pending until its normal resume. A
 `NEW_TASK` launch cancels the result dependency immediately, as ActivityStarter
 does. `NO_USER_ACTION` suppresses the user-leaving hint while retaining lifecycle
 transitions.
+
+`FORWARD_RESULT` transfers the source activity's original recipient, result-who
+and request code, including a finishing trampoline's queued result ownership.
+Only that source's pending result is consumed; another child's result remains
+even if its who and request code match. Combining forwarding with a nonnegative
+new request code returns `START_FORWARD_AND_REQUEST_CONFLICT` before reserving a
+window or changing lifecycle state. A forwarded `NEW_TASK` launch immediately
+cancels the original route once. A valid forwarded `NEW_DOCUMENT` request retains
+its result dependency, as Android's launch-flag normalization requires. A stopped
+recipient or one retained as saved history after process death receives its result
+through ordinary delivery/restoration; a retired activity receives no result.
 
 Each accepted native Settings request owns a bounded server reservation from
 admission through its coordinator's completion. This includes requests queued
@@ -75,14 +91,19 @@ all observe that coverage. A different task resuming cannot restart an activity
 still covered by Settings. Closing the last covering request restores the current
 task top and starts any lower activities that are visible again. Other desktop
 tasks retain normal multi-resume behavior.
+Coverage and restoration retain the actual registered task generation. Removing
+that task and reusing its numeric ID cannot let an old Settings window cover or
+resume the replacement. Restoration rechecks that generation after result
+delivery, which can itself remove the task.
 Native launches without a result token still capture the focused task beneath an
 existing native window. Selecting only a currently resumable activity would lose
 that coverage when another Settings screen or chooser already covers the top.
 
-The integrated intent chooser keeps its existing translucent coverage and caller
-validity rules. If Settings closes while a chooser remains, the underlying stopped
-activity becomes visible without resuming; the chooser's later completion resumes
-it. Either completion order retains the other native operation's busy lifetime.
+The integrated intent and document choosers keep their existing translucent
+coverage and caller-validity rules. If Settings closes while a chooser remains,
+the underlying stopped activity becomes visible without resuming; the chooser's
+later completion resumes it. Either completion order retains the other native
+operation's busy lifetime and result route.
 The existing account-chooser map also participates in the shared idle predicate.
 Its original source-validity checks remain in force through caller retirement;
 the native call must return before its reservation is released. Its coordinator
@@ -96,12 +117,14 @@ unchanged.
 `tools/test_exact_alarm_contracts.py` runs the production Java policy, AppOps,
 Settings coordinator, resolver, and activity lifecycle against actual framework
 classes. Only parsed package/process identities, host-window choices, native
-allocation/identity facilities, and timer dispatch are isolated fixtures. The
+allocation/identity facilities, host locale/service location, and timer dispatch
+are isolated fixtures. The
 scheduler suite separately checks pending/delivery listener lifetime regressions.
 Additional bounded controls exercise queued and headless requests, exhausted
 admission, failures, caller retirement, opaque coverage below a translucent top,
 stale visibility work, late pause acknowledgment, overlapping Settings requests,
-and Settings with intent/account choosers. The account controls use empty isolated
+forward-result transfer and conflict, result delivery after process death, task-ID
+reuse, and Settings with intent/document/account choosers. The account controls use empty isolated
 metadata and a controlled host-call boundary; they make no account-data, credential,
 authenticator or real Windows-window execution claim.
 
@@ -113,12 +136,9 @@ suspend/wake behavior; the latest commit's Windows CI remains a required gate.
 The grant broadcast's flags are implemented; this change does not claim to add the
 runtime's general background-FGS enforcement or its temporary allowlist policy.
 
-The inherited repeating-alarm interval normalization is also unchanged. A bounded
-registration-only independent probe retains a requested 1 ms positive interval,
-where pinned AOSP defaults to a 60,000 ms minimum. The same normalization exists
-before this PR's exact-alarm work. It is a separate scheduler contract gap; these
-permission and native-lifecycle corrections neither claim to repair nor validate
-rapid timer delivery, load, or suspend/wake behavior.
+Bounded registration-only tests verify repeating interval normalization around
+both Android defaults, plus zero, negative and long-integer extremes. They do not
+run a rapid repeating timer or claim delivery-load or suspend/wake validation.
 
 ## Android source evidence
 

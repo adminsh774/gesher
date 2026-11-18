@@ -138,3 +138,20 @@ These fixtures are separate from the application jar and contain no real account
 or user payloads. Cross-compilation of the DLL and native driver is required for
 both x86-64 and ARM64; execution of the Windows suites is a separate validation
 step.
+
+### Detached overlapping chooser coverage
+
+A no-result `NEW_TASK` chooser selects the focused task even while an earlier
+native chooser already covers that task. Focus and eligibility to resume are
+separate decisions: the second window acquires its own coverage before either
+worker can complete. Closing one chooser cannot resume the covered activity or
+release the other chooser's real native reservation. A task with no attached
+process retains the existing detached admission behavior. Caller authority,
+selection validity and normal cancellation remain unchanged.
+
+`ChooserContractTest` exercises two simultaneous detached choosers from different
+authenticated caller processes. The first worker must return without resuming
+the shared covered source; the last completion resumes it once. The same probe
+fails published `39a1cc15928048e49d18af320f1574f38f5669e7` before this change.
+The fixture controls host user input and process metadata and does not claim
+Windows UI, ART or remote Binder execution.

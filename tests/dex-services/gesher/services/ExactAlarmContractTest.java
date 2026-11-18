@@ -252,6 +252,8 @@ public final class ExactAlarmContractTest {
         final IAppOpsService appOps;
         final Object previousNotifications;
         final List<Object> previousWorkSources;
+        final boolean hostLocale;
+        final Object previousHour, previousLocales;
         final IActivityManager am;
         final IAlarmManager alarmService;
         final AlarmManager unprivAm, exactAm, useExactAm, legacyAm;
@@ -259,6 +261,16 @@ public final class ExactAlarmContractTest {
 
         @SuppressWarnings("unchecked")
         TestHarness(boolean wire) throws Exception {
+            // The host API archive has no ICU data. Isolate only the unrelated
+            // locale boundary; the actual providers, URI ownership and lifecycle run.
+            hostLocale = !wire;
+            Class<?> locales = Class.forName("com.gesher.app.locale.SystemLocale");
+            previousHour = field(locales, "sIs24Hour").get(null);
+            previousLocales = field(locales, "sLocales").get(null);
+            if (hostLocale) {
+                field(locales, "sIs24Hour").set(null, Boolean.TRUE);
+                field(locales, "sLocales").set(null, new android.os.LocaleList(java.util.Locale.ROOT));
+            }
             previousWorkSources = new ArrayList<>((List<Object>) field(type("DeviceWork"), "sSources").get(null));
             previousNotifications = field(type("NotificationManagerService"), "sLast").get(null);
             Object unprivOwner = createApkPackage(UNPRIV_PKG, UNPRIV_UID, 34, Collections.emptyList());
@@ -289,14 +301,8 @@ public final class ExactAlarmContractTest {
             set(am, "mAtm", atm);
             set(am, "mCallers", callers);
 
-            Object providers = UNSAFE.allocateInstance(type("ContentProviders"));
-            set(providers, "mClients", new HashMap<>());
-            set(providers, "mPublished", new HashMap<>());
-            set(providers, "mPublishedBy", new HashMap<>());
-            set(providers, "mPublishedCode", new HashMap<>());
-            set(providers, "mInstalling", new HashMap<>());
-            set(providers, "mConnections", new HashMap<>());
-            set(providers, "mRequests", new java.util.HashSet<>());
+            // Result/task retirement uses the actual URI ownership service too.
+            Object providers = make(type("ContentProviders"), new Class<?>[]{pmType, atmType}, pm, atm);
             set(am, "mProviders", providers);
 
             permissions = invoke(pm, "permissions", new Class<?>[0]);
@@ -402,6 +408,11 @@ public final class ExactAlarmContractTest {
                 List<Object> sources = (List<Object>) field(type("DeviceWork"), "sSources").get(null);
                 sources.clear(); sources.addAll(previousWorkSources);
                 field(type("NotificationManagerService"), "sLast").set(null, previousNotifications);
+                if (hostLocale) {
+                    Class<?> locales = Class.forName("com.gesher.app.locale.SystemLocale");
+                    field(locales, "sIs24Hour").set(null, previousHour);
+                    field(locales, "sLocales").set(null, previousLocales);
+                }
             } catch (Exception failure) { throw new AssertionError(failure); }
         }
     }
@@ -455,6 +466,26 @@ public final class ExactAlarmContractTest {
         });
         check(!h.alarmService.hasScheduleExactAlarm("com.gesher.test.missing", 0), "Unknown target never has SEA");
         check(!h.alarmService.hasScheduleExactAlarm(EXACT_PKG, 10), "Absent user never reports target access");
+    }
+
+    /** Registration-only bounds; the fixture never starts a rapid delivery loop. */
+    private static void repeatIntervals(TestHarness h) throws Exception {
+        long max = 365L * AlarmManager.INTERVAL_DAY;
+        long[] supplied = {Long.MIN_VALUE, -1, 0, 1, 59_999, 60_000, 60_001, max - 1, max, max + 1, Long.MAX_VALUE};
+        long[] expected = {0, 0, 0, 60_000, 60_000, 60_000, 60_001, max - 1, max, max, max};
+        runAs(LEGACY_UID, LEGACY_PID, () -> {
+            for (int i = 0; i < supplied.length; i++) {
+                PendingIntent operation = mockOperation(1700 + i);
+                try {
+                    h.alarmService.set(LEGACY_PKG, AlarmManager.ELAPSED_REALTIME,
+                            android.os.SystemClock.elapsedRealtime() + 3_600_000,
+                            AlarmManager.WINDOW_HEURISTIC, supplied[i], 0, operation, null, null, null, null);
+                    List<?> pending = h.getAlarms();
+                    check((long)get(pending.get(pending.size() - 1), "interval") == expected[i],
+                            "AOSP repeat registration bound: input=" + supplied[i] + ", expected=" + expected[i]);
+                } finally { h.alarmService.remove(operation, null); }
+            }
+        });
     }
 
     private static final class TrackedListener extends IAlarmListener.Stub {
@@ -610,6 +641,7 @@ public final class ExactAlarmContractTest {
         ((List<Object>)get(process, "activities")).add(source);
         ((List<Object>)get(h.atm, "mActivities")).add(source);
         ((List<Integer>)get(h.atm, "mTaskOrder")).add(1);
+        invoke(h.atm, "recordAppTaskLocked", new Class<?>[]{recordType, boolean.class}, source, false);
         List<String> order = new ArrayList<>();
         List<android.app.ResultInfo> delivered = new ArrayList<>();
         List<Boolean> userLeaving = new ArrayList<>();
@@ -740,6 +772,7 @@ public final class ExactAlarmContractTest {
             ((List<Object>)get(process, "activities")).remove(source);
             ((List<Object>)get(h.atm, "mActivities")).remove(source);
             ((List<Integer>)get(h.atm, "mTaskOrder")).remove(Integer.valueOf(1));
+            invoke(h.atm, "discardAppTaskLocked", new Class<?>[]{int.class}, 1);
             set(h.atm, "mTopResumed", null);
         }
     }
@@ -873,14 +906,18 @@ public final class ExactAlarmContractTest {
             set(h.atm, "mExactAlarmRequests", requests); set(h.pm, "mExactAlarmAccessRequests", requests);
         }
         int start(Object source, String target) throws Exception {
+            return start(source, target, source == null ? Intent.FLAG_ACTIVITY_NEW_TASK : 0,
+                    "lifetime", source == null ? -1 : 81);
+        }
+        int start(Object source, String target, int flags, String who, int requestCode) throws Exception {
             int[] result = {-1};
             runAs(EXACT_UID, EXACT_PID, () -> result[0] = ((android.app.IActivityTaskManager)h.atm)
                     .startActivity(h.thread, EXACT_PKG, null,
                         new Intent("android.settings.REQUEST_SCHEDULE_EXACT_ALARM",
                             android.net.Uri.fromParts("package", target, null))
-                            .addFlags(source == null ? Intent.FLAG_ACTIVITY_NEW_TASK : 0),
-                        null, source == null ? null : (IBinder)get(source, "token"), "lifetime",
-                        source == null ? -1 : 81, 0, null, null));
+                            .addFlags(flags),
+                        null, source == null ? null : (IBinder)get(source, "token"), who,
+                        requestCode, 0, null, null));
             return result[0];
         }
         int pending() throws Exception { return ((Set<?>)get(h.atm, "mExactAlarmSettingsSessions")).size(); }
@@ -900,6 +937,12 @@ public final class ExactAlarmContractTest {
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private static Object settingsRecord(TestHarness h, String name, int task, String initialState) throws Exception {
+        return settingsRecord(h, name, task, initialState, null, null, -1);
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Object settingsRecord(TestHarness h, String name, int task, String initialState,
+            Object recipient, String resultWho, int requestCode) throws Exception {
         Class<?> record = type("ActivityTaskManagerService$ActivityRecord");
         var info = ((android.content.pm.IPackageManager)h.pm).getActivityInfo(
                 new android.content.ComponentName(name, name + ".FixtureActivity"), 0, 0);
@@ -910,13 +953,14 @@ public final class ExactAlarmContractTest {
         Object result = make(record, new Class<?>[]{type("ActivityTaskManagerService"),
                 android.content.pm.ActivityInfo.class, Intent.class, int.class, int.class, String.class,
                 record, String.class, int.class}, h.atm, info, new Intent(), task,
-                name.equals(EXACT_PKG) ? EXACT_PID : UNPRIV_PID, name, null, null, -1);
+                name.equals(EXACT_PKG) ? EXACT_PID : UNPRIV_PID, name, recipient, resultWho, requestCode);
         set(result, "app", process);
         set(result, "state", Enum.valueOf((Class)type("ActivityTaskManagerService$State"), initialState));
         ((List<Object>)get(process, "activities")).add(result);
         ((List<Object>)get(h.atm, "mActivities")).add(result);
         List<Integer> tasks = (List<Integer>)get(h.atm, "mTaskOrder");
         if (!tasks.contains(task)) tasks.add(task);
+        invoke(h.atm, "recordAppTaskLocked", new Class<?>[]{record, boolean.class}, result, false);
         return result;
     }
 
@@ -1181,6 +1225,306 @@ public final class ExactAlarmContractTest {
         }
     }
 
+    private static void settingsWithDocuments(boolean wire) throws Exception {
+        for (boolean documentsFirst : new boolean[]{false, true}) {
+            for (boolean settingsFinishFirst : new boolean[]{false, true}) try (TestHarness h = new TestHarness(wire)) {
+                // Attach the actual provider transport with a service-locator
+                // boundary. These cancellations do not bypass any URI grant check.
+                AppOpsManager[] appOps = {null};
+                PackageManager packages = new android.app.ApplicationPackageManager(null,
+                        (android.content.pm.IPackageManager)h.pm) { };
+                Context context = new ContextWrapper(null) {
+                    @Override public String getPackageName() { return "android"; }
+                    @Override public String getOpPackageName() { return "android"; }
+                    @Override public String getAttributionTag() { return null; }
+                    @Override public android.content.AttributionSource getAttributionSource() {
+                        return new android.content.AttributionSource(Process.SYSTEM_UID, "android", null);
+                    }
+                    @Override public ApplicationInfo getApplicationInfo() { return new ApplicationInfo(); }
+                    @Override public PackageManager getPackageManager() { return packages; }
+                    @Override public int getUserId() { return 0; }
+                    @Override public String getSystemServiceName(Class<?> service) {
+                        return service == AppOpsManager.class ? Context.APP_OPS_SERVICE : null;
+                    }
+                    @Override public Object getSystemService(String name) {
+                        if (!Context.APP_OPS_SERVICE.equals(name)) throw new AssertionError("Unexpected service: " + name);
+                        return appOps[0];
+                    }
+                };
+                appOps[0] = (AppOpsManager)make(AppOpsManager.class,
+                        new Class<?>[]{Context.class, IAppOpsService.class}, context, h.appOps);
+                Object provider = get(get(h.am, "mProviders"), "mDocumentsStorage");
+                invoke(provider, "attachTo", new Class<?>[]{Context.class}, context);
+                Object source = settingsRecord(h, EXACT_PKG, 1, "RESUMED");
+                List<String> events = acknowledgeSettings(h);
+                List<DeliveredResult> delivered = recordResults(h);
+                var shown = new java.util.concurrent.CountDownLatch(1);
+                var close = new java.util.concurrent.CountDownLatch(1);
+                var worker = new java.util.concurrent.atomic.AtomicReference<Thread>();
+                Class<?> backendType = type("DocumentPicker$Backend");
+                Object previous = get(h.atm, "mDocumentDialog");
+                Object backend = java.lang.reflect.Proxy.newProxyInstance(backendType.getClassLoader(),
+                        new Class<?>[]{backendType}, (proxy, method, args) -> {
+                    if (method.getName().equals("available")) return true;
+                    if (!method.getName().equals("pick")) throw new AssertionError("Unexpected file selection in cancellation fixture");
+                    worker.set(Thread.currentThread()); shown.countDown();
+                    if (!close.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("Document window not released");
+                    return null;
+                });
+                set(h.atm, "mDocumentDialog", backend);
+                try (SettingsWindow window = new SettingsWindow(h, null, () -> -1)) {
+                    if (!documentsFirst) check(window.start(source, EXACT_PKG) == ActivityManager.START_SUCCESS,
+                            "Opaque Settings admitted before document window");
+                    runAs(EXACT_UID, EXACT_PID, () -> check(((android.app.IActivityTaskManager)h.atm).startActivity(
+                            h.thread, EXACT_PKG, null, new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("text/plain"),
+                            "text/plain", getToken(source), "documents", 74, 0, null, null)
+                            == ActivityManager.START_SUCCESS, "Actual document coordinator admitted its window"));
+                    check(shown.await(3, java.util.concurrent.TimeUnit.SECONDS), "Document worker reached its host window boundary");
+                    if (documentsFirst) {
+                        check(settingsState(source).equals("PAUSED"), "Document window alone leaves the activity visible and paused");
+                        check(window.start(source, EXACT_PKG) == ActivityManager.START_SUCCESS,
+                                "Opaque Settings admitted above the document window");
+                    }
+                    check(settingsState(source).equals("STOPPED") && (int)get(source, "documentPickers") == 1,
+                            "Opaque Settings retains document coverage while stopping its source");
+                    if (settingsFinishFirst) {
+                        window.finish();
+                        check(settingsState(source).equals("STARTED") && !events.contains("ResumeActivityItem")
+                                && (long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                                "Closing Settings restores visibility below the still-open document window without resume");
+                    }
+                    close.countDown(); worker.get().join(3000);
+                    check(!worker.get().isAlive() && ((Map<?, ?>)get(h.atm, "mDocumentPickers")).isEmpty(),
+                            "Actual document worker releases its own session after cancellation");
+                    if (!settingsFinishFirst) {
+                        check(settingsState(source).equals("STOPPED") && !events.contains("ResumeActivityItem")
+                                && window.pending() == 1 && (long)invoke(h.atm, "idleSince", new Class<?>[0]) == 0,
+                                "Document completion cannot resume below or retire the opaque Settings session");
+                        window.finish();
+                    }
+                    check(settingsState(source).equals("RESUMED") && Collections.frequency(events, "ResumeActivityItem") == 1
+                            && (int)get(source, "documentPickers") == 0 && window.pending() == 0,
+                            "Both opening and completion orders restore the underlying activity exactly once");
+                    check(delivered.stream().filter(value -> value.target == getToken(source)
+                                && value.result.mResultCode == android.app.Activity.RESULT_CANCELED
+                                && (value.result.mRequestCode == 74 || value.result.mRequestCode == 81)).count() == 2,
+                            "Independent document and Settings cancellations retain both original result routes");
+                } finally { close.countDown(); set(h.atm, "mDocumentDialog", previous); }
+            }
+        }
+    }
+
+    private record DeliveredResult(IBinder target, android.app.ResultInfo result) {}
+
+    @SuppressWarnings("unchecked")
+    private static List<DeliveredResult> recordResults(TestHarness h) {
+        List<DeliveredResult> results = new ArrayList<>();
+        var acknowledge = h.thread.onTransaction;
+        h.thread.onTransaction = transaction -> {
+            try {
+                for (var item : transaction.getTransactionItems()) {
+                    IBinder token;
+                    List<android.app.ResultInfo> pending;
+                    if (item instanceof android.app.servertransaction.ActivityResultItem result) {
+                        token = result.getActivityToken();
+                        pending = (List<android.app.ResultInfo>)get(item, "mResultInfoList");
+                    } else if (item instanceof android.app.servertransaction.LaunchActivityItem launch) {
+                        token = launch.getActivityToken();
+                        pending = (List<android.app.ResultInfo>)get(item, "mPendingResults");
+                    } else continue;
+                    if (pending != null) for (var result : pending) results.add(new DeliveredResult(token, result));
+                }
+            } catch (Exception failure) { throw new AssertionError("Could not inspect actual result delivery", failure); }
+            if (acknowledge != null) acknowledge.accept(transaction);
+        };
+        return results;
+    }
+
+    private static IBinder getToken(Object record) {
+        try { return (IBinder)get(record, "token"); }
+        catch (Exception failure) { throw new AssertionError(failure); }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void settingsForwarding(boolean wire) throws Exception {
+        Class<?> record = type("ActivityTaskManagerService$ActivityRecord");
+        for (String mode : List.of("conflict", "forward", "new-task", "new-document", "finishing",
+                "dead-recipient", "retired-recipient")) try (TestHarness h = new TestHarness(wire)) {
+            Object recipient = settingsRecord(h, UNPRIV_PKG, 1, "STOPPED");
+            Object sibling = settingsRecord(h, EXACT_PKG, 2, "STOPPED", recipient, "original-who", 73);
+            Object source = settingsRecord(h, EXACT_PKG, 1, "RESUMED", recipient, "original-who", 73);
+            Class<?> pendingType = type("ActivityTaskManagerService$PendingActivityResult");
+            Object sourceResult = make(pendingType, new Class<?>[]{record, int.class, Intent.class, IBinder.class},
+                    source, android.app.Activity.RESULT_CANCELED, new Intent("fixture.source"), null);
+            Object siblingResult = make(pendingType, new Class<?>[]{record, int.class, Intent.class, IBinder.class},
+                    sibling, android.app.Activity.RESULT_CANCELED, new Intent("fixture.sibling"), null);
+            List<android.app.ResultInfo> pending = (List<android.app.ResultInfo>)get(recipient, "pendingResults");
+            pending.add((android.app.ResultInfo)sourceResult); pending.add((android.app.ResultInfo)siblingResult);
+            List<String> events = acknowledgeSettings(h);
+            List<DeliveredResult> delivered = recordResults(h);
+            if (mode.equals("finishing")) set(source, "finishing", true);
+            try (SettingsWindow window = new SettingsWindow(h, null, () -> 1)) {
+                int flags = Intent.FLAG_ACTIVITY_FORWARD_RESULT;
+                if (mode.equals("new-task")) flags |= Intent.FLAG_ACTIVITY_NEW_TASK;
+                if (mode.equals("new-document")) flags |= Intent.FLAG_ACTIVITY_NEW_DOCUMENT;
+                int result = window.start(source, EXACT_PKG, flags, "ignored-incoming-who",
+                        mode.equals("conflict") ? 81 : -1);
+                if (mode.equals("conflict")) {
+                    check(result == ActivityManager.START_FORWARD_AND_REQUEST_CONFLICT
+                            && window.queued.isEmpty() && window.pending() == 0 && events.isEmpty(),
+                            "FORWARD_RESULT plus nonnegative request rejects before native reservation or lifecycle effects");
+                    check(get(source, "resultTo") == recipient && pending.size() == 2
+                            && settingsState(source).equals("RESUMED"),
+                            "Rejected forward-result request preserves source ownership and queued child results");
+                    continue;
+                }
+                check(result == ActivityManager.START_SUCCESS && window.pending() == 1,
+                        "Valid native Settings forward-result admitted: " + mode);
+                check(get(source, "resultTo") == null && !pending.contains(sourceResult)
+                        && pending.contains(siblingResult),
+                        "Forward consumes only its source's ownership and pending result: " + mode);
+                if (mode.equals("new-task")) check(pending.size() == 2
+                        && pending.get(1).mResultCode == android.app.Activity.RESULT_CANCELED
+                        && pending.get(1).mRequestCode == 73
+                        && "original-who".equals(pending.get(1).mResultWho),
+                        "NEW_TASK immediately cancels the original forwarded route once");
+                else check(pending.size() == 1,
+                        "A live native window retains the forward result until completion: " + mode);
+                if (mode.equals("dead-recipient") || mode.equals("retired-recipient")) {
+                    set(recipient, "savedState", mode.equals("dead-recipient") ? new Bundle() : null);
+                    invoke(h.atm, "processDied", new Class<?>[]{type("ActivityTaskManagerService$ProcessRecord")},
+                            get(recipient, "app"));
+                    check(((List<?>)get(h.atm, "mActivities")).contains(recipient) == mode.equals("dead-recipient"),
+                            "Actual process death preserves only saved history: " + mode);
+                }
+                window.finish();
+                check(window.pending() == 0 && ((List<?>)get(source, "pendingResults")).isEmpty()
+                        && delivered.stream().noneMatch(value -> value.target == getToken(source)),
+                        "Native completion never substitutes its forwarding trampoline as recipient: " + mode);
+                List<android.app.ResultInfo> owned = new ArrayList<>(pending);
+                for (DeliveredResult value : delivered) if (value.target == getToken(recipient)) owned.add(value.result);
+                List<android.app.ResultInfo> settingsResults = owned.stream().filter(value -> value.mData == null).toList();
+                if (mode.equals("retired-recipient")) {
+                    check(settingsResults.isEmpty(), "Retired recipient is not resurrected to accept a native result");
+                } else {
+                    check(settingsResults.size() == 1 && settingsResults.get(0).mRequestCode == 73
+                            && "original-who".equals(settingsResults.get(0).mResultWho)
+                            && settingsResults.get(0).mResultCode == (mode.equals("new-task")
+                                ? android.app.Activity.RESULT_CANCELED : android.app.Activity.RESULT_OK)
+                            && owned.contains(siblingResult),
+                            "Forward preserves original result metadata, outcome and sibling results: " + mode);
+                    if (mode.equals("dead-recipient")) {
+                        check(get(recipient, "app") == null && pending.contains(settingsResults.get(0)),
+                                "Saved recipient keeps its native result while its process is dead");
+                        h.reattach(UNPRIV_PKG, UNPRIV_UID, UNPRIV_PID);
+                        invoke(h.atm, "finishFromApp", new Class<?>[]{record, int.class, Intent.class},
+                                source, android.app.Activity.RESULT_CANCELED, null);
+                        check(delivered.stream().filter(value -> value.target == getToken(recipient)
+                                    && value.result.mData == null && value.result.mRequestCode == 73).count() == 1
+                                && pending.isEmpty(),
+                                "Ordinary task restoration delivers the saved native result once to the replacement process");
+                    } else if (!mode.equals("finishing")) check(settingsState(recipient).equals("STOPPED")
+                            && pending.contains(settingsResults.get(0)),
+                            "Stopped original recipient retains its result until its own foreground restoration: " + mode);
+                }
+            }
+        }
+    }
+
+    private static void settingsTaskGeneration(boolean wire) throws Exception {
+        Class<?> record = type("ActivityTaskManagerService$ActivityRecord");
+        for (boolean overlap : new boolean[]{false, true}) try (TestHarness h = new TestHarness(wire)) {
+            Object source = settingsRecord(h, EXACT_PKG, 1, "RESUMED");
+            settingsRecord(h, EXACT_PKG, 2, "STOPPED"); // Keep the process independently alive.
+            List<String> events = acknowledgeSettings(h);
+            android.app.IAppTask[] handle = {null};
+            runAs(EXACT_UID, EXACT_PID, () -> {
+                for (IBinder binder : ((android.app.IActivityTaskManager)h.atm).getAppTasks(EXACT_PKG)) {
+                    var task = android.app.IAppTask.Stub.asInterface(binder);
+                    if (task.getTaskInfo().taskId == 1) handle[0] = task;
+                }
+            });
+            check(handle[0] != null, "Actual AppTask owns the Settings-covered task generation");
+            try (SettingsWindow window = new SettingsWindow(h, null, () -> -1)) {
+                runAs(EXACT_UID, EXACT_PID, () -> check(handle[0].startActivity(h.thread.asBinder(),
+                        EXACT_PKG, null, new Intent("android.settings.REQUEST_SCHEDULE_EXACT_ALARM",
+                            android.net.Uri.fromParts("package", EXACT_PKG, null)), null, null)
+                        == ActivityManager.START_SUCCESS, "Owned AppTask starts native Settings without a result source"));
+                check(settingsState(source).equals("STOPPED") && window.pending() == 1,
+                        "Native Settings covers the captured AppTask before removal");
+                runAs(EXACT_UID, EXACT_PID, () -> handle[0].finishAndRemoveTask());
+                invoke(h.atm, "activityDestroyed", new Class<?>[]{record}, source);
+                check(!(boolean)get(exactProcess(h), "exiting"), "Independent task keeps the actual caller process alive");
+                Object replacement = settingsRecord(h, EXACT_PKG, 1, "PAUSED");
+                check((boolean)invoke(h.atm, "willBeVisible", new Class<?>[]{record}, replacement)
+                        && (int)get(replacement, "exactAlarmSettings") == 0,
+                        "Old native Settings cannot cover a newly registered task with the same numeric ID");
+                events.clear();
+                if (overlap) check(window.start(replacement, EXACT_PKG) == ActivityManager.START_SUCCESS,
+                        "Replacement task can own its own independent native Settings session");
+                window.finish();
+                check(settingsState(replacement).equals(overlap ? "STOPPED" : "PAUSED")
+                        && !events.contains("ResumeActivityItem"),
+                        "Retired task's completion cannot restore a replacement task generation");
+                if (overlap) {
+                    check(window.pending() == 1
+                            && !(boolean)invoke(h.atm, "willBeVisible", new Class<?>[]{record}, replacement),
+                            "Old completion retains the replacement session's opaque coverage");
+                    window.finish();
+                    check(settingsState(replacement).equals("RESUMED")
+                            && Collections.frequency(events, "ResumeActivityItem") == 1,
+                            "Only the replacement task's own completion restores its lifecycle once");
+                }
+                check(window.pending() == 0 && (int)get(source, "exactAlarmSettings") == 0,
+                        "Both retired and live native session reservations are released exactly once");
+            }
+        }
+    }
+
+    private static void settingsResultReentrancy(boolean wire) throws Exception {
+        Class<?> record = type("ActivityTaskManagerService$ActivityRecord");
+        try (TestHarness h = new TestHarness(wire)) {
+            Object recipient = settingsRecord(h, UNPRIV_PKG, 2, "RESUMED");
+            settingsRecord(h, EXACT_PKG, 3, "STOPPED");
+            Object source = settingsRecord(h, EXACT_PKG, 1, "RESUMED", recipient, "original-who", 73);
+            List<String> events = acknowledgeSettings(h);
+            List<DeliveredResult> delivered = recordResults(h);
+            android.app.IAppTask[] handle = {null};
+            runAs(EXACT_UID, EXACT_PID, () -> {
+                for (IBinder binder : ((android.app.IActivityTaskManager)h.atm).getAppTasks(EXACT_PKG)) {
+                    var task = android.app.IAppTask.Stub.asInterface(binder);
+                    if (task.getTaskInfo().taskId == 1) handle[0] = task;
+                }
+            });
+            Object[] replacement = {null};
+            var acknowledge = h.thread.onTransaction;
+            h.thread.onTransaction = transaction -> {
+                acknowledge.accept(transaction);
+                for (var item : transaction.getTransactionItems()) {
+                    if (replacement[0] == null && item instanceof android.app.servertransaction.ActivityResultItem result
+                            && result.getActivityToken() == getToken(recipient)) {
+                        try {
+                            runAs(EXACT_UID, EXACT_PID, () -> handle[0].finishAndRemoveTask());
+                            invoke(h.atm, "activityDestroyed", new Class<?>[]{record}, source);
+                            replacement[0] = settingsRecord(h, EXACT_PKG, 1, "PAUSED");
+                        } catch (Exception failure) { throw new AssertionError("Result-driven task retirement failed", failure); }
+                    }
+                }
+            };
+            try (SettingsWindow window = new SettingsWindow(h, null, () -> 1)) {
+                check(window.start(source, EXACT_PKG, Intent.FLAG_ACTIVITY_FORWARD_RESULT, null, -1)
+                        == ActivityManager.START_SUCCESS, "Forwarded Settings admitted before result-driven task replacement");
+                events.clear(); window.finish();
+                check(replacement[0] != null && settingsState(replacement[0]).equals("PAUSED")
+                        && !events.contains("ResumeActivityItem"),
+                        "Result callback can retire the captured task without letting restoration resume its numeric-ID replacement");
+                check(window.pending() == 0 && delivered.stream().filter(value -> value.target == getToken(recipient)
+                            && value.result.mRequestCode == 73 && value.result.mResultCode == android.app.Activity.RESULT_OK).count() == 1,
+                        "Reentrant retirement leaves one completed original result and no native reservation");
+            }
+        }
+    }
+
     private static void accountSettingsLifetime(boolean wire) throws Exception {
         for (String mode : List.of("cancel", "retire", "runtime", "linkage", "worker-error", "overlap")) {
             try (TestHarness h = new TestHarness(wire)) {
@@ -1253,9 +1597,10 @@ public final class ExactAlarmContractTest {
 
     public static void contracts(boolean wire) throws Exception {
         try (TestHarness h = new TestHarness(wire)) {
-            access(h); listeners(h); transitions(h); settingsLifecycle(h); settings(h); settingsInstalledResolution(h);
+            access(h); repeatIntervals(h); listeners(h); transitions(h); settingsLifecycle(h); settings(h); settingsInstalledResolution(h);
         }
-        settingsSessionLifetime(wire); settingsTaskCoverage(wire); settingsWithChooser(wire);
+        settingsSessionLifetime(wire); settingsTaskCoverage(wire); settingsWithChooser(wire); settingsWithDocuments(wire);
+        settingsForwarding(wire); settingsTaskGeneration(wire); settingsResultReentrancy(wire);
         accountSettingsLifetime(wire);
         System.out.println("ExactAlarmContractTest all passed: " + checks + " checks verified");
     }

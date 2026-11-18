@@ -635,6 +635,9 @@ final class ActiveServices {
             r.foregroundId = id;
             r.foregroundType = selectedType;
             r.foregroundCapabilities = eligible;
+            // stopForeground ends this admission. A later foreground entry must
+            // use its current eligibility, not the earlier startService visibility.
+            if (id == 0 && previous != 0) r.whileInUseAtStart = false;
             r.foregroundChannelId = id == 0 ? null : notification.getChannelId();
         }
         if (id != 0) {
@@ -942,6 +945,9 @@ final class ActiveServices {
                 }
             }
         }
+        // Removing the service also removes its foreground capabilities even if
+        // another service or an activity keeps the process alive.
+        mPm.appOps().requestUidStateRefresh();
         synchronized (this) { clearStartGrants(r, Integer.MAX_VALUE); }
         if (r.foregroundId != 0) mNotifications.cancel(r.info.packageName, null, r.foregroundId);
         if (r.app == null || !r.created) return;

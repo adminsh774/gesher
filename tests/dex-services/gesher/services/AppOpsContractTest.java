@@ -552,6 +552,198 @@ public final class AppOpsContractTest {
                 "Replacement releases delivery tokens even while the old token objects remain alive");
         call(h.pm, "add", new Class<?>[]{ApkPackage.class}, h.peer);
     }
+    /** Public PermissionChecker results and observer metadata, using owned fixture packages. */
+    private static void permissionCheckerEdges() throws Exception {
+        Harness h = new Harness();
+        String name = "fixture.appops.unmapped";
+        String permission = name + ".permission.OPERATION";
+        ApkPackage declared = pkg(name, UID + 19, (byte)19);
+        PackageImpl parsed = (PackageImpl)PackageImpl.forTesting(name, declared.apkPath);
+        parsed.setEnabled(true); parsed.setTargetSdkVersion(36);
+        var definition = new com.android.internal.pm.pkg.component.ParsedPermissionImpl();
+        definition.setName(permission); definition.setPackageName(name);
+        definition.setProtectionLevel(PermissionInfo.PROTECTION_NORMAL | PermissionInfo.PROTECTION_FLAG_APPOP);
+        parsed.addPermission(definition);
+        parsed.addUsesPermission(new com.android.internal.pm.pkg.component.ParsedUsesPermissionImpl(permission, 0, java.util.Set.of()));
+        parsed.hideAsFinal(); set(declared, "parsed", parsed);
+        call(h.pm, "add", new Class<?>[]{ApkPackage.class}, declared);
+        check(AppOpsManager.permissionToOpCode(permission) == OP_NONE,
+                "The declared app-op permission has no framework operation mapping");
+        check(h.pm.permissions().checkPermission(name, permission) == PackageManager.PERMISSION_GRANTED,
+                "The fixture has its normal permission independently of the missing app-op mapping");
+        AttributionSourceState own = h.source(declared, new Token());
+        for (boolean delivery : new boolean[]{false, true}) {
+            check(h.checker.checkPermission(permission, own, null, delivery, delivery, false, OP_NONE)
+                            == PERMISSION_HARD_DENIED,
+                    "An app-op permission without its operation is hard denied before accounting");
+        }
+
+        ApkPackage[] participants = {
+                pkg("fixture.appops.attribution.origin", UID + 20, (byte)20),
+                pkg("fixture.appops.attribution.middle", UID + 21, (byte)21),
+                pkg("fixture.appops.attribution.third", UID + 22, (byte)22),
+                pkg("fixture.appops.attribution.fourth", UID + 23, (byte)23)};
+        for (ApkPackage participant : participants) {
+            call(h.pm, "add", new Class<?>[]{ApkPackage.class}, participant);
+            h.ops.setUidMode(OP_VIBRATE, participant.uid(), MODE_ALLOWED);
+            h.ops.setMode(OP_VIBRATE, participant.uid(), participant.packageName, MODE_ALLOWED);
+            h.pm.permissions().grantRuntimePermission(participant.packageName,
+                    Manifest.permission.READ_CONTACTS, "default:0", 0);
+            check(h.ops.checkOperationRaw(OP_READ_CONTACTS, participant.uid(), participant.packageName, null) == MODE_ALLOWED,
+                    "Each attribution participant has its own granted operation before the observer test");
+        }
+        attachedProcess(h, participants[0], PID + 20, new IApplicationThread.Default() {
+            final IBinder token = new Binder();
+            @Override public IBinder asBinder() { return token; }
+        });
+        // Explicit AOSP observer expectations: chain origin, middle nodes, final receiver,
+        // privileged origin and datasource exclusion are distinct cases.
+        for (boolean trusted : new boolean[]{false, true}) for (boolean datasource : new boolean[]{false, true}) {
+            int count = trusted && datasource ? 4 : 3;
+            AttributionSourceState[] nodes = new AttributionSourceState[count];
+            for (int i = count - 1; i >= 0; i--) {
+                nodes[i] = h.source(participants[i], new Token());
+                if (trusted && i == 0) {
+                    nodes[i].uid = android.os.Process.SYSTEM_UID;
+                    nodes[i].packageName = "android"; nodes[i].attributionTag = null;
+                }
+                if (i + 1 < count) nodes[i].next = new AttributionSourceState[]{nodes[i + 1]};
+                nodes[i].token = h.pm.permissions().registerAttributionSource(nodes[i]);
+            }
+            java.util.Map<String, List<Integer>> observed = new java.util.concurrent.ConcurrentHashMap<>();
+            java.util.Set<Integer> chainIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            Token observerToken = new Token();
+            var observer = new com.android.internal.app.IAppOpsStartedCallback.Default() {
+                @Override public IBinder asBinder() { return observerToken; }
+                @Override public void opStarted(int op, int uid, String pkg, String tag, int device,
+                        int flags, int mode, int type, int attributionFlags, int chainId) {
+                    if (type == AppOpsManager.OnOpStartedListener.START_TYPE_STARTED) {
+                        observed.computeIfAbsent(pkg, ignored -> new java.util.concurrent.CopyOnWriteArrayList<>())
+                                .add(attributionFlags);
+                        chainIds.add(chainId);
+                    }
+                }
+            };
+            int op = datasource ? OP_READ_CONTACTS : OP_VIBRATE;
+            h.service.startWatchingStarted(new int[]{op}, observer);
+            try {
+                Checked start = () -> {
+                    int result = datasource
+                        ? h.checker.checkPermission(Manifest.permission.READ_CONTACTS, nodes[0], null,
+                                true, true, true, OP_NONE)
+                        : h.checker.checkOp(OP_VIBRATE, nodes[0], null, true, true);
+                    check(result == PERMISSION_GRANTED,
+                            "The owned attribution chain starts (trusted=" + trusted + ", datasource="
+                                    + datasource + "): result=" + result);
+                };
+                if (trusted) start.run(); else asCaller(participants[0].uid(), PID + 20, start);
+                drain(h); drain(h);
+                int trust = trusted ? ATTRIBUTION_FLAG_TRUSTED : ATTRIBUTION_FLAGS_NONE;
+                java.util.Map<String, List<Integer>> expected = new java.util.LinkedHashMap<>();
+                if (!datasource) expected.put(nodes[0].packageName, List.of(trust | ATTRIBUTION_FLAG_ACCESSOR));
+                else if (!trusted) expected.put(nodes[0].packageName, List.of(ATTRIBUTION_FLAGS_NONE));
+                for (int i = 1; i < count; i++) {
+                    int role = i == count - 1 ? ATTRIBUTION_FLAG_RECEIVER
+                            : datasource && i == 1 ? ATTRIBUTION_FLAG_ACCESSOR : ATTRIBUTION_FLAG_INTERMEDIARY;
+                    expected.put(nodes[i].packageName, List.of(trust | role));
+                }
+                check(expected.equals(observed), "Attribution roles match AOSP: expected " + expected + ", got " + observed);
+                check(chainIds.size() == 1 && !chainIds.contains(ATTRIBUTION_CHAIN_ID_NONE),
+                        "All observer records identify the same actual attribution chain");
+            } finally {
+                Checked finish = () -> h.checker.finishDataDelivery(op, nodes[0], datasource);
+                if (trusted) finish.run(); else asCaller(participants[0].uid(), PID + 20, finish);
+                h.service.stopWatchingStarted(observer);
+            }
+            for (AttributionSourceState node : nodes) {
+                check(!h.service.isOperationActive(op, node.uid, node.packageName),
+                        "Finishing the attributed delivery balances every participant");
+            }
+            check(observerToken.recipients.isEmpty(), "Attribution observer teardown releases its death registration");
+        }
+    }
+
+    private static void asCaller(int uid, int pid, Checked action) throws Exception {
+        long identity = Binder.clearCallingIdentity();
+        try { Binder.restoreCallingIdentity(((long)uid << 32) | pid); action.run(); }
+        finally { Binder.restoreCallingIdentity(identity); }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void foregroundServiceExit() throws Exception {
+        Harness h = new Harness();
+        Object services = get(h.am, "mServices");
+        set(services, "mNotifications", new com.gesher.server.NotificationManagerService());
+        String name = NAME + ".AccountingService";
+        var declared = new com.android.internal.pm.pkg.component.ParsedServiceImpl();
+        declared.setPackageName(NAME); declared.setName(name); declared.setEnabled(true);
+        declared.setExported(true); declared.setProcessName(NAME);
+        PackageImpl parsed = (PackageImpl)PackageImpl.forTesting(NAME, h.owner.apkPath);
+        parsed.setEnabled(true); parsed.setTargetSdkVersion(36); parsed.setUid(UID);
+        parsed.addUsesPermission(new com.android.internal.pm.pkg.component.ParsedUsesPermissionImpl(
+                Manifest.permission.VIBRATE, 0, java.util.Set.of()));
+        parsed.addService(declared); parsed.hideAsFinal(); set(h.owner, "parsed", parsed);
+        android.content.pm.ServiceInfo info = h.owner.serviceInfo(name, 0);
+        check(info != null, "The owned service fixture uses declared manifest metadata");
+        Class<?> recordType = type("ActiveServices$ServiceRecord");
+        Object service = make(recordType,
+                new Class<?>[]{android.content.pm.ServiceInfo.class, ApkPackage.class}, info, h.owner);
+        var component = new android.content.ComponentName(NAME, name);
+        ((java.util.Map<Object, Object>)get(services, "mServices")).put(component, service);
+        set(service, "app", h.process); set(service, "created", true); set(service, "startRequested", true);
+        set(service, "foregroundId", 41); set(service, "whileInUseAtStart", true);
+        call(services, "setServiceForeground", new Class<?>[]{android.content.ComponentName.class,
+                IBinder.class, int.class, android.app.Notification.class, int.class, int.class},
+                component, service, 0, null, 0, 0);
+        check(!(Boolean)get(service, "whileInUseAtStart"),
+                "Explicit foreground exit discards the preceding start's visibility eligibility");
+        check((Integer)get(service, "foregroundType") == 0 && (Integer)get(service, "foregroundCapabilities") == 0,
+                "Foreground exit clears selected types and their capabilities");
+
+        h.visible(true);
+        Object activity = ((List<?>)get(h.process, "activities")).get(0);
+        set(activity, "state", Enum.valueOf((Class)type("ActivityTaskManagerService$State"), "STOPPED"));
+        set(service, "foregroundId", 42);
+        h.ops.setUidMode(OP_VIBRATE, UID, MODE_FOREGROUND);
+        java.util.concurrent.CountDownLatch inactive = new java.util.concurrent.CountDownLatch(1);
+        AtomicInteger inactiveCount = new AtomicInteger();
+        Token watcherToken = new Token(), operation = new Token();
+        var watcher = new com.android.internal.app.IAppOpsActiveCallback.Default() {
+            @Override public IBinder asBinder() { return watcherToken; }
+            @Override public void opActiveChanged(int op, int uid, String pkg, String tag, int device,
+                    boolean active, int flags, int chain) {
+                if (!active) { inactiveCount.incrementAndGet(); inactive.countDown(); }
+            }
+        };
+        h.service.startWatchingActive(new int[]{OP_VIBRATE}, watcher);
+        try {
+            check(h.ops.startOperation(operation, OP_VIBRATE, UID, NAME, null,
+                            false, false, null, false, 0, -1).getOpMode() == MODE_ALLOWED,
+                    "The service contributes foreground state to ordinary operation accounting");
+            drain(h); drain(h);
+            check((Boolean)call(services, "stopServiceToken",
+                            new Class<?>[]{android.content.ComponentName.class, IBinder.class, int.class},
+                            component, service, -1), "The owned service stops through the public server path");
+            check(inactive.await(8, TimeUnit.SECONDS),
+                    "Service removal publishes the settled inactive transition without a later AppOps query");
+            drain(h);
+            int active = 0;
+            for (Object history : ((java.util.Map<?, ?>)get(h.service, "mHistory")).values()) {
+                active += (Integer)get(history, "active");
+            }
+            check(active == 0 && inactiveCount.get() == 1,
+                    "The published ledger and observer each reflect the service removal once");
+            check(((java.util.Map<?, ?>)get(services, "mServices")).isEmpty()
+                            && ((List<?>)get(h.atm, "mProcesses")).contains(h.process),
+                    "A stopped Activity retains the process after its foreground service is gone");
+        } finally {
+            h.ops.finishOperation(operation, OP_VIBRATE, UID, NAME, null);
+            h.service.stopWatchingActive(watcher);
+        }
+        check(watcherToken.recipients.isEmpty() && operation.recipients.isEmpty(),
+                "Teardown releases operation and observer death registrations");
+    }
+
     private static void persistence(Harness h) throws Exception {
         File directory = new File(System.getenv("ANDROID_DATA"), "appops-contract");
         if (!directory.isDirectory() && !directory.mkdirs()) throw new AssertionError("Cannot create isolated state directory");
@@ -1285,6 +1477,8 @@ public final class AppOpsContractTest {
     public static int run(boolean parcel) throws Exception {
         binder = parcel; checks = 0;
         Harness h = new Harness(); modes(h); lifetimes(h); watchers(h); foreground(h); restrictions(h); delivery(h); persistence(h);
+        permissionCheckerEdges();
+        foregroundServiceExit();
         return checks;
     }
     public static void main(String[] args) throws Exception {

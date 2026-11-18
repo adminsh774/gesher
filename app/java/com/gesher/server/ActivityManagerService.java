@@ -482,6 +482,7 @@ public final class ActivityManagerService extends IActivityManager.Default {
     }
 
     UriGrants uriGrants() { return mProviders.uriGrants(); }
+    DocumentsStorageProvider documents() { return mProviders.documents(); }
 
     @Override
     public void grantUriPermission(IApplicationThread caller, String targetPackage,

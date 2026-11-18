@@ -60,6 +60,9 @@ final class AlarmManagerService extends IAlarmManager.Default
     private static final long TIME_SET_SLACK_MS = 2_000;
     /** Maximum delivery hold from reservation, including an acknowledged broadcast chain. */
     private static final long DELIVERY_TIMEOUT_MS = 5 * 60_000;
+    /** Android 16 AlarmManagerService's default repeating-alarm bounds. */
+    private static final long MIN_INTERVAL_MS = 60_000;
+    private static final long MAX_INTERVAL_MS = 365L * AlarmManager.INTERVAL_DAY;
 
     private final ActivityManagerService mAm;
     private final PackageManagerService mPm;
@@ -243,8 +246,10 @@ final class AlarmManagerService extends IAlarmManager.Default
             throw new IllegalArgumentException("Invalid alarm type " + type);
         }
         start();
+        long repeatInterval = interval <= 0 ? 0
+                : Math.max(MIN_INTERVAL_MS, Math.min(interval, MAX_INTERVAL_MS));
         Alarm a = new Alarm(callingPackage, type, Math.max(0, triggerAtTime), windowLength,
-                Math.max(0, interval), flags, operation, listener, listenerTag, alarmClock, isExact);
+                repeatInterval, flags, operation, listener, listenerTag, alarmClock, isExact);
         if (!linkPendingListener(a)) return;
         List<Alarm> replaced = new ArrayList<>();
         boolean published = false;

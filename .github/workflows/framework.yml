@@ -494,6 +494,13 @@ jobs:
             --app-classes out/app/gesher-app-classes.jar \
             --apksig-jar "$RUNNER_TEMP/gesher-apksig.jar"
 
+      - name: SAF provider, picker lifecycle and grant restart contracts
+        run: |
+          python3 tools/test_saf_documents.py --java-home "$JAVA_HOME" \
+            --framework-classes out/framework/classes --core-classes out/coremod \
+            --app-classes out/app/gesher-app-classes.jar \
+            --apksig "$RUNNER_TEMP/gesher-apksig.jar"
+
       - name: Application storage public API and system-package policy contracts
         run: |
           python3 tools/test_app_storage_public.py --java-home "$JAVA_HOME" \
@@ -577,6 +584,7 @@ jobs:
           python3 tools/test_webmessage_ports.py --java-home "$JAVA_HOME" \
             --sdk-jar work/sdk-36/android.jar --framework-classes out/framework/classes \
             --core-classes out/coremod
+          python3 tools/test_webmessage_page_script.py
           "$JAVA_HOME/bin/javac" -cp work/sdk-36/android.jar \
             -d "$RUNNER_TEMP/codec-lifecycle-sdk" \
             tests/dex-services/gesher/services/CodecLifecycleContractTest.java
