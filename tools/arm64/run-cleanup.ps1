@@ -18,6 +18,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Cannot read checked-out tree' }
 if ($receipt.source.commit -cne $commit -or $receipt.source.tree -cne $tree) {
     throw 'Build and native runner source identities differ'
 }
+if ($receipt.source.files.PSObject.Properties.Name -cnotcontains 'compat/arm64/dll/host_call.h') {
+    throw 'Cleanup receipt omits the production HostCall definition'
+}
 foreach ($item in $receipt.source.files.PSObject.Properties) {
     if ((Sha256 (Join-Path $sourceDir $item.Name)) -cne $item.Value) {
         throw "Source hash mismatch: $($item.Name)"

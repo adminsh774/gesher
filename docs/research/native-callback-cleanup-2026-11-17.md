@@ -7,8 +7,10 @@ is a test function, not a translated ARM64 program. Passing this gate would
 qualify one pinned native cleanup mechanism and its explicit limits. It would
 not establish that Gesher supports `longjmp` across a native callback.
 
-The assembly unwind prerequisite must be present first. Neither the production
-thunks nor the translator is changed here. Existing full CI remains unchanged.
+The assembly unwind prerequisite must be present first. The qualification
+increment does not change production thunks or translator behavior. The reviewed
+branch also includes the separately approved call-record ABI prerequisite from
+PR131, as described below. Existing full CI remains unchanged by this increment.
 
 ## Why a native proof is necessary
 
@@ -177,3 +179,22 @@ is not a permanent pull-request correctness gate.
 Production translator cleanup, correct Jit owner selection, guest masks/FP
 state, allowed boundary discovery and an actual translated corpus pass remain
 future work even if every native qualification case passes.
+
+## Shared production call record
+
+Integration QA found that the original fixture copied the former 56-byte
+`HostCall` layout. PR131 extends the production record to 64 bytes and writes
+`out_xmm0_hi` at byte offset 56 on normal return. A text-clean merge would leave
+that copied test record too small for the actual assembly it links.
+
+The consolidated branch preserves the reviewed PR131 history and includes
+`compat/arm64/dll/host_call.h` directly in the fixture. Its shared static layout
+assertions therefore apply to the test as well as the translator. The fixture
+initializes the complete current record and no longer owns a parallel layout.
+The native cleanup control flow and `EntryFrame` contract are unchanged.
+
+The source receipt hashes the shared header, both workflow path filters include
+it, and the native receiver rejects a receipt that omits it. The receiver also
+checks its exact source hash through the existing source-verification loop.
+Historical Windows results qualify their original source; a fresh native run
+must qualify this integrated fixture and its current production thunks.

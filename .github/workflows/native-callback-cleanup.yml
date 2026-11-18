@@ -4,6 +4,7 @@ on:
     branches: ['test/56-native-callback-cleanup-*']
     paths:
       - 'compat/arm64/dll/thunks.S'
+      - 'compat/arm64/dll/host_call.h'
       - 'tests/native/host_callback_cleanup/**'
       - 'tests/native/callback_longjmp_contract.c'
       - 'tools/arm64/*cleanup*'
@@ -13,6 +14,7 @@ on:
   pull_request:
     paths:
       - 'compat/arm64/dll/thunks.S'
+      - 'compat/arm64/dll/host_call.h'
       - 'tests/native/host_callback_cleanup/**'
       - 'tests/native/callback_longjmp_contract.c'
       - 'tools/arm64/*cleanup*'

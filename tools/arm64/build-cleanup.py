@@ -31,7 +31,8 @@ RUNTIME_HASHES = {
 }
 FIXTURE = "tests/native/host_callback_cleanup"
 SOURCES = [
-    "compat/arm64/dll/thunks.S", "compat/arm64/dll/CMakeLists.txt",
+    "compat/arm64/dll/thunks.S", "compat/arm64/dll/host_call.h",
+    "compat/arm64/dll/CMakeLists.txt",
     *[f"{FIXTURE}/{name}" for name in (
         "cleanup_probe.h", "cleanup_main.cc", "cleanup_dll.cc",
         "cleanup_c_bridge.c", "cleanup_checkpoint.S")],

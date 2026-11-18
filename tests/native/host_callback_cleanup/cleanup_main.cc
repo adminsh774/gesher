@@ -13,6 +13,7 @@
 #include <exception>
 #include <initializer_list>
 #include "cleanup_probe.h"
+#include "../../../compat/arm64/dll/host_call.h"
 
 struct alignas(16) Checkpoint {
   uint64_t gpr[8], rsp, rip, xmm[20];
@@ -22,13 +23,6 @@ static_assert(offsetof(Checkpoint, xmm) == 80 && sizeof(Checkpoint) == 240);
 extern "C" __attribute__((returns_twice)) int CleanupSave(Checkpoint*);
 extern "C" [[noreturn]] void CleanupRestore(Checkpoint*);
 
-struct HostCall {
-  void* fn;
-  const uint64_t* gpr;
-  const uint64_t* xmm;
-  const uint64_t* stack;
-  uint64_t nstack, out_xmm0, out_rdx;
-};
 struct EntryFrame {
   uint64_t gpr[8], xmm[8];
   const uint64_t* stack;
@@ -270,7 +264,7 @@ __declspec(noinline) static uint64_t InvokeHost(CleanupLink* link) {
   const uint64_t gpr[6] = {reinterpret_cast<uint64_t>(link), 0, 0, 0, 0, 0};
   const uint64_t xmm[8] = {};
   const uint64_t stack[3] = {};
-  HostCall call{reinterpret_cast<void*>(&CleanupSysvTarget), gpr, xmm, stack, 3, 0, 0};
+  HostCall call{reinterpret_cast<void*>(&CleanupSysvTarget), gpr, xmm, stack, 3, 0, 0, 0};
   return gesher_call_host_sysv(&call);
 }
 
