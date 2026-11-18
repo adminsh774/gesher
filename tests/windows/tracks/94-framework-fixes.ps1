@@ -111,6 +111,14 @@ Check 'services: exact alarm scheduling contracts, permissions and revocation' {
   $exactAlarmOut
 } @('ExactAlarmContractTest all passed: 414 checks verified')
 
+$schedulerConstraintsOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'JobSchedulerConstraintContractTest') 90
+$schedulerConstraintsCode = $LASTEXITCODE
+Check 'services: observed job constraints, deadlines, callback ordering and bounded retirement' {
+  $global:LASTEXITCODE = $schedulerConstraintsCode
+  $schedulerConstraintsOut
+} @('JobSchedulerConstraintContractTest all passed:')
+
 $activityRestoreOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'ActivityRestoreContractTest') 90
 $activityRestoreCode = $LASTEXITCODE
