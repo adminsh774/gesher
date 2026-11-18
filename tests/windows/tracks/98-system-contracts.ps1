@@ -77,7 +77,14 @@ try {
     Check 'services: UserDictionary builtin metadata, SQLite and actual observer delivery' {
       $global:LASTEXITCODE = $dictionaryBootstrapCode
       $dictionaryBootstrapOut
-    } @('UserDictionaryBootstrapTest all passed:', 'actual provider transport, SQLite and ContentService')
+    } @('UserDictionaryBootstrapTest all passed:', 'actual provider transport, SQLite and ContentService', 'features=initialized')
+    $dictionaryRetainedFeaturesOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+      'UserDictionaryBootstrapTest' + 'preinitialized-features') 90
+    $dictionaryRetainedFeaturesCode = $LASTEXITCODE
+    Check 'services: UserDictionary retains existing real package-manager feature cache' {
+      $global:LASTEXITCODE = $dictionaryRetainedFeaturesCode
+      $dictionaryRetainedFeaturesOut
+    } @('UserDictionaryBootstrapTest all passed:', 'actual provider transport, SQLite and ContentService', 'features=retained')
   } finally {
     if ($null -eq $settingsBootstrapBinder) { Remove-Item -LiteralPath Env:GESHER_BINDER -ErrorAction SilentlyContinue }
     else { [Environment]::SetEnvironmentVariable('GESHER_BINDER', $settingsBootstrapBinder, 'Process') }

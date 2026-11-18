@@ -26,6 +26,13 @@ public final class ServiceFixtureRunner {
             Class<?> shared = Class.forName("com.android.internal.os.ApplicationSharedMemory");
             Object region = shared.getMethod("create").invoke(null);
             shared.getMethod("setInstance", shared).invoke(null, region);
+            if (args[0].equals("UserDictionaryContractTest")) {
+                // app_process already installs system assets on the Android oracle.
+                // This raw ART entry point needs the real Windows runtime resource
+                // APK before SQLite reads its framework database configuration.
+                android.content.res.AssetManager.createSystemAssetsInZygoteLocked(false,
+                        System.getenv("ANDROID_ROOT") + "/framework/framework-res.apk");
+            }
         }
         try {
             Class.forName("gesher.services." + args[0]).getMethod("main", String[].class)

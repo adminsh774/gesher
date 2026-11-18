@@ -31,6 +31,7 @@ import android.app.AppOpsManager;
 import android.view.textservice.SpellCheckerInfo;
 import android.view.textservice.TextServicesManager;
 import com.android.internal.pm.parsing.pkg.PackageImpl;
+import com.android.internal.pm.parsing.pkg.ParsedPackage;
 import com.android.internal.pm.pkg.component.ParsedProviderImpl;
 import com.android.internal.textservice.ITextServicesManager;
 import sun.misc.Unsafe;
@@ -52,8 +53,13 @@ public final class UserDictionaryPolicyHost {
     }
     private static ApkPackage record(File directory, String name, int uid,
             String authority, boolean enabled) throws Exception {
+        return record(directory, name, uid, authority, enabled, null);
+    }
+    private static ApkPackage record(File directory, String name, int uid,
+            String authority, boolean enabled, String requiredLibrary) throws Exception {
         PackageImpl parsed = (PackageImpl)PackageImpl.forTesting(name, new File(directory, name + ".apk").getPath());
         parsed.setTargetSdkVersion(36);
+        if (requiredLibrary != null) parsed.addUsesLibrary(requiredLibrary);
         if (authority != null) {
             ParsedProviderImpl provider = new ParsedProviderImpl();
             provider.setName(name + ".Dictionary"); provider.setPackageName(name);
@@ -292,6 +298,73 @@ public final class UserDictionaryPolicyHost {
         }
     }
 
+    private static ApkPackage constructed(ApkPackage fixture) throws Exception {
+        // Parsed manifests remain the explicit fixture boundary. Exercise the real
+        // constructor and library resolver used after parsing, not a null-success path.
+        var constructor = ApkPackage.class.getDeclaredConstructor(String.class, ParsedPackage.class);
+        constructor.setAccessible(true);
+        try { return constructor.newInstance(fixture.apkPath, fixture.parsed); }
+        catch (InvocationTargetException failure) {
+            if (failure.getCause() instanceof Exception cause) throw cause;
+            throw failure;
+        }
+    }
+
+    private static void admissionRejected(ApkPackage pkg, int code) throws Exception {
+        try {
+            UserDictionaryProvider.checkPackageAdmission(pkg);
+            throw new AssertionError("Reserved provider owner admitted: " + pkg.packageName);
+        } catch (android.content.pm.PackageParser.PackageParserException rejected) {
+            check(rejected.error == code, "Manifest admission lost the Android install error");
+        }
+    }
+
+    private static void manifestAdmission(File directory) throws Exception {
+        int ordinal = 0;
+        for (boolean enabled : new boolean[]{false, true}) {
+            for (boolean directBoot : new boolean[]{false, true}) {
+                for (String aliases : new String[]{"user_dictionary", "user_dictionary;fixture.other",
+                        "fixture.first;user_dictionary;fixture.last"}) {
+                    ApkPackage fixture = record(directory, "fixture.dictionary.admission" + ordinal++,
+                            10044, aliases, enabled);
+                    ((ParsedProviderImpl)fixture.parsed.getProviders().get(0)).setDirectBootAware(directBoot);
+                    ApkPackage real = constructed(fixture);
+                    check(real.sharedLibraries != null && real.sharedLibraries.isEmpty(),
+                            "Real package construction did not initialize the ordinary library graph");
+                    admissionRejected(real, PackageManager.INSTALL_FAILED_CONFLICTING_PROVIDER);
+                    rejects(IllegalArgumentException.class, () -> new PackageManagerService(List.of(real), false));
+                    // The visibility fixture has authoritative parsed declarations
+                    // without installed metadata. A missing graph must not waive ownership.
+                    set(fixture, "sharedLibraries", null);
+                    admissionRejected(fixture, PackageManager.INSTALL_FAILED_CONFLICTING_PROVIDER);
+                }
+            }
+        }
+        for (String authority : new String[]{null, "user_dictionary.extra", "prefix.user_dictionary",
+                "fixture.first;fixture.last"}) {
+            ApkPackage real = constructed(record(directory, "fixture.dictionary.allowed" + ordinal++,
+                    10044, authority, false));
+            UserDictionaryProvider.checkPackageAdmission(real);
+            PackageManagerService pm = new PackageManagerService(List.of(real), false);
+            check(pm.get(real.packageName) == real, "Distinct or absent authority was rejected");
+        }
+        ApkPackage reserved = constructed(record(directory, UserDictionaryProvider.PACKAGE,
+                10044, null, false));
+        admissionRejected(reserved, PackageManager.INSTALL_FAILED_UPDATE_INCOMPATIBLE);
+
+        ApkPackage missingLibrary = record(directory, "fixture.dictionary.missing_library",
+                10044, "fixture.other;user_dictionary", false, "fixture.dictionary.not_installed");
+        set(missingLibrary, "sharedLibraries", null);
+        admissionRejected(missingLibrary, PackageManager.INSTALL_FAILED_CONFLICTING_PROVIDER);
+        try {
+            constructed(missingLibrary);
+            throw new AssertionError("Real construction silently satisfied an absent required library");
+        } catch (java.io.IOException rejected) {
+            check(rejected.getMessage().contains("INSTALL_FAILED_MISSING_SHARED_LIBRARY"),
+                    "Real library admission failed for an unrelated reason");
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         System.load(args[0]);
         unsafe = (Unsafe)field(Unsafe.class, "theUnsafe").get(null);
@@ -319,6 +392,7 @@ public final class UserDictionaryPolicyHost {
             check((Boolean)allowed.invoke(provider), "Server-local provider call admitted");
             metadata(new PackageManagerService(Collections.emptyList(), false));
             authenticatedCallers(directory);
+            manifestAdmission(directory);
             System.out.println("UserDictionaryPolicyHost all passed: " + checks + " checks");
         } finally { directory.delete(); }
     }

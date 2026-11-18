@@ -141,8 +141,12 @@ final class ContentProviders {
     UriGrants uriGrants() { return mUriGrants; }
 
     static boolean hasAuthority(ProviderInfo info, String authority) {
-        if (info == null || info.authority == null || authority == null) return false;
-        for (String declared : info.authority.split(";")) if (authority.equals(declared)) return true;
+        return info != null && hasDeclaredAuthority(info.authority, authority);
+    }
+
+    static boolean hasDeclaredAuthority(String declarations, String authority) {
+        if (declarations == null || authority == null) return false;
+        for (String declared : declarations.split(";")) if (authority.equals(declared)) return true;
         return false;
     }
 

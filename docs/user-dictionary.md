@@ -66,9 +66,14 @@ ordinary ContentProviders/ContentProvider transport. Its database resides at
 `$ANDROID_DATA/system/user-dictionary/databases/user_dict.db`.
 This system-owned directory cannot collide with a previously installed APK's
 `data/<package>` directory or its ordinary uninstall cleanup.
-The holder uses the actual prepared framework context and resolver. Notification
-and enabled-service calls clear and restore the incoming Binder identity to
-preserve the service identity that separate AOSP provider-process calls have.
+The holder uses the actual prepared framework context and resolver.
+Before an application is bound, that context initializes the SDK feature cache
+from the available package manager's real feature catalog. Existing application
+feature caches are retained. Missing package service or failed Binder calls
+remain startup errors; no substitute feature list is installed.
+Notification and enabled-service calls clear and restore the incoming Binder
+identity to preserve the service identity that separate AOSP provider-process
+calls have.
 Mutations also invoke the framework BackupManager's `dataChanged` request; this
 change does not implement a new backup transport.
 
@@ -109,6 +114,12 @@ registry loading. Conflicting package/authority installation returns Android's
 errors. Registry removal cannot retire the built-in provider. Word rows belong
 to the user's dictionary; uninstalling an input method revokes its access and
 does not erase the user's dictionary.
+
+Authority admission reads the authoritative parsed provider declarations,
+including disabled and direct-boot declarations and each semicolon-separated
+alias. It does not synthesize installed `PackageInfo` merely to check ownership.
+Ordinary APK construction still resolves and validates the actual shared-library
+graph; a missing required library remains an installation error.
 
 ## Validation
 
@@ -184,9 +195,13 @@ download may be supplied with `--reference-source`. Each invocation creates and
 removes its own temporary database directory.
 
 Windows track 98 runs that data fixture and `UserDictionaryBootstrapTest` on
-Gesher ART. The bootstrap fixture acquires the actual provider holder from the
-actual service map, creates and queries a real SQLite row and receives its
-notification through the actual ContentService. It also checks repeated holder
-identity and installed metadata, and deletes only its own unique test row. This
-is an in-process transport gate; it does not claim a remote application or a
-complete keyboard/spell-checker user flow.
+Gesher ART. Its raw-ART fixture runner installs the actual runtime's
+`$ANDROID_ROOT/framework/framework-res.apk` before the data fixture opens SQLite,
+as Android's `app_process` does for the unchanged reference corpus. The bootstrap
+fixture checks both initialization and retention of the real package-manager
+feature cache, acquires the actual provider holder from the actual service map,
+creates and queries a real SQLite row and receives its notification through the
+actual ContentService. It also checks repeated holder identity and installed
+metadata, and deletes only its own unique test row. This is an in-process
+transport gate; it does not claim a remote application or a complete
+keyboard/spell-checker user flow.

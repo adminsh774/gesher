@@ -50,6 +50,7 @@ import android.view.inputmethod.InputMethodInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.view.textservice.SpellCheckerInfo;
 import android.view.textservice.TextServicesManager;
+import com.android.internal.pm.pkg.component.ParsedProvider;
 
 /**
  * Port of the pinned Android 16 r4 UserDictionaryProvider. SQLite/query semantics
@@ -139,10 +140,11 @@ final class UserDictionaryProvider extends ContentProvider {
                     PackageManager.INSTALL_FAILED_UPDATE_INCOMPATIBLE,
                     "The built-in user dictionary is updated with the runtime");
         }
-        long flags = PackageManager.GET_META_DATA | PackageManager.MATCH_DISABLED_COMPONENTS
-                | PackageManager.MATCH_DIRECT_BOOT_AWARE | PackageManager.MATCH_DIRECT_BOOT_UNAWARE;
-        for (ProviderInfo provider : pkg.providers(flags)) {
-            if (ContentProviders.hasAuthority(provider, AUTHORITY)) {
+        // Ownership is a manifest-admission rule, including disabled declarations.
+        // It must not require generating installed PackageInfo (and resolving its
+        // libraries) just to inspect the authoritative parsed provider names.
+        for (ParsedProvider provider : pkg.parsed.getProviders()) {
+            if (ContentProviders.hasDeclaredAuthority(provider.getAuthority(), AUTHORITY)) {
                 throw new android.content.pm.PackageParser.PackageParserException(
                         PackageManager.INSTALL_FAILED_CONFLICTING_PROVIDER,
                         "Provider authority already owned by " + PACKAGE + ": " + AUTHORITY);

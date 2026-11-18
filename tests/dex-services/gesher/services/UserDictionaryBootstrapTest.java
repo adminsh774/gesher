@@ -7,10 +7,12 @@ import android.app.IActivityManager;
 import android.content.AttributionSource;
 import android.content.ContentValues;
 import android.content.IContentService;
+import android.content.pm.FeatureInfo;
 import android.content.pm.IPackageManager;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ProviderInfo;
+import android.content.pm.SystemFeaturesCache;
 import android.database.Cursor;
 import android.database.IContentObserver;
 import android.net.Uri;
@@ -19,7 +21,9 @@ import android.os.Process;
 import android.provider.UserDictionary.Words;
 import com.gesher.app.Main;
 import com.gesher.server.Services;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -35,15 +39,27 @@ public final class UserDictionaryBootstrapTest {
     }
 
     public static void main(String[] args) throws Exception {
+        boolean preinitializedFeatures = args.length == 1 && "preinitialized-features".equals(args[0]);
+        if (args.length != 0 && !preinitializedFeatures) throw new IllegalArgumentException("Unknown bootstrap mode");
         if (System.getenv("GESHER_BINDER") != null) throw new AssertionError("Bootstrap fixture must have no Binder broker");
         String root = System.getenv("ANDROID_ROOT");
         Main.bootstrap("dictionary-bootstrap", root + "/build.prop", root + "/framework/framework-res.apk");
         check(ActivityThread.currentActivityThread() == null, "Bootstrap attached an application thread");
+        check(!SystemFeaturesCache.hasInstance(), "Bootstrap installed features before package services exist");
         Map<String, IBinder> services = Services.createInProcess(Collections.emptyList());
         Services.installInProcess(services);
         IActivityManager activity = IActivityManager.Stub.asInterface(services.get("activity"));
         IPackageManager packages = IPackageManager.Stub.asInterface(services.get("package"));
         IContentService content = IContentService.Stub.asInterface(services.get("content"));
+        // Also cover a process whose application startup already installed the
+        // actual catalog. The provider must retain that cache, not replace it.
+        final SystemFeaturesCache previousFeatures;
+        if (preinitializedFeatures) {
+            previousFeatures = new SystemFeaturesCache(packages.getSystemAvailableFeatures().getList());
+            SystemFeaturesCache.setInstance(previousFeatures);
+        } else {
+            previousFeatures = null;
+        }
         ProviderInfo info = packages.resolveContentProvider("user_dictionary", 0, 0);
         check(info != null && "com.android.providers.userdictionary".equals(info.packageName), "Builtin metadata is discoverable");
         PackageInfo owner = packages.getPackageInfo(info.packageName, PackageManager.GET_PROVIDERS, 0);
@@ -66,6 +82,25 @@ public final class UserDictionaryBootstrapTest {
             try {
                 holder = activity.getContentProviderExternal("user_dictionary", 0, null, "dictionary-bootstrap-contract");
                 check(holder != null && holder.provider != null && holder.noReleaseNeeded, "Builtin provider transport is available");
+                SystemFeaturesCache features = SystemFeaturesCache.getInstance();
+                check(previousFeatures == null || features == previousFeatures,
+                        "Provider acquisition replaced an already initialized feature cache");
+                @SuppressWarnings("unchecked")
+                List<FeatureInfo> availableFeatures = packages.getSystemAvailableFeatures().getList();
+                check(Arrays.equals(features.getSdkFeatureVersions(),
+                        new SystemFeaturesCache(availableFeatures).getSdkFeatureVersions()),
+                        "Provider bootstrap cache differs from the actual package-manager features");
+                PackageManager publicPackages = android.app.GesherSettingsContext.get().getPackageManager();
+                for (FeatureInfo feature : availableFeatures) {
+                    check(publicPackages.hasSystemFeature(feature.name, feature.version),
+                            "Public package manager lost feature " + feature.name);
+                    if (feature.version < Integer.MAX_VALUE) {
+                        check(!publicPackages.hasSystemFeature(feature.name, feature.version + 1),
+                                "Public package manager invented a newer feature " + feature.name);
+                    }
+                }
+                check(!publicPackages.hasSystemFeature("com.gesher.contract.absent_feature"),
+                        "Public package manager invented an unavailable feature");
                 check(Words.CONTENT_TYPE.equals(holder.provider.getType(caller, Words.CONTENT_URI)), "Transport MIME");
                 content.registerContentObserver(Words.CONTENT_URI, true, observer, 0, 36);
                 String word = "dictionary-contract-" + UUID.randomUUID();
@@ -81,6 +116,7 @@ public final class UserDictionaryBootstrapTest {
                 check(changed.await(5, TimeUnit.SECONDS) && inserted.equals(observed.get()), "Real ContentService delivers item notification");
                 ContentProviderHolder again = activity.getContentProviderExternal("user_dictionary", 0, null, "dictionary-repeat");
                 check(again.provider.asBinder() == holder.provider.asBinder(), "Repeated acquisition retains provider identity");
+                check(SystemFeaturesCache.getInstance() == features, "Repeated acquisition replaced the feature cache");
             } catch (Throwable error) { failure.set(error); }
             finally {
                 try {
@@ -95,6 +131,8 @@ public final class UserDictionaryBootstrapTest {
         check(!worker.isAlive(), "Worker did not complete without pumping the main Looper");
         if (failure.get() != null) throw new AssertionError("Dictionary bootstrap worker failed", failure.get());
         check(ActivityThread.currentActivityThread() == null, "Provider acquisition attached an application thread");
-        System.out.println("UserDictionaryBootstrapTest all passed: " + checks + " checks; actual provider transport, SQLite and ContentService");
+        System.out.println("UserDictionaryBootstrapTest all passed: " + checks
+                + " checks; actual provider transport, SQLite and ContentService; features="
+                + (preinitializedFeatures ? "retained" : "initialized"));
     }
 }
