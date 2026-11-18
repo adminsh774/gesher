@@ -14,6 +14,7 @@
 #include <gesher/inet.h>
 #include <jni.h>
 #include <nativehelper/jni_macros.h>
+#include "nsd_browse_records.h"
 
 #include <atomic>
 #include <chrono>
@@ -52,6 +53,11 @@ struct Event {
 std::atomic<size_t>& live_queries() { static auto* count = new std::atomic<size_t>(0); return *count; }
 std::atomic<uint64_t>& base_goodbyes() { static auto* count = new std::atomic<uint64_t>(0); return *count; }
 std::atomic<DWORD>& last_ptr_ttl() { static auto* ttl = new std::atomic<DWORD>(0); return *ttl; }
+struct Diagnostics {
+  std::atomic<uint64_t> callbacks{0}, records{0}, membership{0}, errors{0};
+  std::atomic<DWORD> last_status{0};
+};
+Diagnostics& diagnostics() { static auto* counters = new Diagnostics; return *counters; }
 struct WireQuery {
   MDNS_QUERY_REQUEST request{};
   MDNS_QUERY_HANDLE handle{};
@@ -87,19 +93,7 @@ Registry& state() { static Registry* value = new Registry; return *value; }
 constexpr size_t kMaxEvents = 1024;
 constexpr size_t kMaxQueries = 512;
 
-bool same_dns_name(const wchar_t* left, const wchar_t* right) {
-  size_t a = wcslen(left), b = wcslen(right);
-  if (a && left[a - 1] == L'.') --a;
-  if (b && right[b - 1] == L'.') --b;
-  if (a != b) return false;
-  for (size_t i = 0; i < a; ++i) {
-    wchar_t x = left[i], y = right[i];
-    if (x >= L'A' && x <= L'Z') x += L'a' - L'A';
-    if (y >= L'A' && y <= L'Z') y += L'a' - L'A';
-    if (x != y) return false;
-  }
-  return true;
-}
+using gesher::nsd::same_dns_name;
 
 bool instance_of_type(const wchar_t* name, const std::wstring& type) {
   size_t length = wcslen(name);
@@ -120,13 +114,16 @@ std::shared_ptr<Browse> find(uintptr_t id) {
 // never dereferences the handle supplied by Windows (intentionally unused below).
 // Stop success does not prove entered callbacks have returned: their shared
 // owners keep the request and handle storage alive until each invocation returns.
-void queue_records(PVOID context, PDNS_QUERY_RESULT result, bool loss_only) {
+void queue_records(PVOID context, PDNS_QUERY_RESULT result, bool companion) {
   auto op = find(reinterpret_cast<uintptr_t>(context));
   DWORD status = result ? result->QueryStatus : ERROR_INVALID_DATA;
   auto* records = result ? result->pQueryRecords : nullptr;
+  ++diagnostics().callbacks;
+  diagnostics().last_status = status;
+  if (status != ERROR_SUCCESS) ++diagnostics().errors;
   if (op) {
     std::lock_guard<std::mutex> guard(op->lock);
-    const auto& wire = loss_only ? op->base : op->primary;
+    const auto& wire = companion ? op->base : op->primary;
     if (!op->terminal && !wire.retired) {
       if (status == ERROR_CANCELLED && op->cancel_requested) {
         // Windows promises no final cancellation callback for this API.
@@ -138,9 +135,9 @@ void queue_records(PVOID context, PDNS_QUERY_RESULT result, bool loss_only) {
         else op->overflow = true;
       } else {
         for (auto* record = records; record; record = record->pNext) {
+          ++diagnostics().records;
           if ((record->wType != DNS_TYPE_PTR && record->wType != DNS_TYPE_SRV) || !record->pName) continue;
-          if (loss_only && (record->wType != DNS_TYPE_PTR ||
-                            (!record->Flags.S.Delete && record->dwTtl != 0))) continue;
+          if (companion && record->wType != DNS_TYPE_PTR) continue;
           // The request is Unicode. Reject unexpected encodings rather than
           // reinterpret char pointers as WCHAR records.
           if (record->Flags.S.CharSet != DnsCharSetUnicode) {
@@ -156,9 +153,10 @@ void queue_records(PVOID context, PDNS_QUERY_RESULT result, bool loss_only) {
             continue;
           }
           if (!record->Data.PTR.pNameHost) continue;
-          bool base_goodbye = (record->Flags.S.Delete || record->dwTtl == 0) &&
-              same_dns_name(record->pName, op->base_query.c_str());
-          if (loss_only ? !base_goodbye : !same_dns_name(record->pName, op->query.c_str())) continue;
+          const auto observation = gesher::nsd::classify_ptr(record->pName, op->query,
+              op->base_query, record->Flags.S.Delete || record->dwTtl == 0, companion);
+          if (observation == gesher::nsd::PtrObservation::Ignore) continue;
+          const bool base_goodbye = observation == gesher::nsd::PtrObservation::Goodbye;
           if (base_goodbye) ++base_goodbyes();
           if (!record->Flags.S.Delete && record->dwTtl > 0) last_ptr_ttl() = record->dwTtl;
           if (op->events.size() >= kMaxEvents) {
@@ -174,7 +172,7 @@ void queue_records(PVOID context, PDNS_QUERY_RESULT result, bool loss_only) {
                 same_dns_name(extra->pName, record->Data.PTR.pNameHost)) {
               service_ttl = extra->Flags.S.Delete ? 0 : extra->dwTtl;
               if (service_ttl == 0) goodbye = true;
-            } else if (!loss_only && op->slots == 2 &&
+            } else if (!base_goodbye && op->slots == 2 &&
                 extra->wType == DNS_TYPE_PTR && extra->pName &&
                 extra->Data.PTR.pNameHost && extra->Flags.S.CharSet == DnsCharSetUnicode &&
                 same_dns_name(extra->pName, op->base_query.c_str()) &&
@@ -186,6 +184,7 @@ void queue_records(PVOID context, PDNS_QUERY_RESULT result, bool loss_only) {
           // The companion owns base PTR loss. A subtype PTR paired with that
           // loss cannot start or refresh membership from the same packet.
           if (base_loss_in_batch) continue;
+          if (!base_goodbye) ++diagnostics().membership;
           op->events.push_back({ERROR_SUCCESS, record->Data.PTR.pNameHost,
                                record->Flags.S.Delete ? 0 : record->dwTtl, service_ttl, goodbye});
         }
@@ -409,6 +408,17 @@ jint active(JNIEnv*, jclass) {
 }
 jlong goodbyes(JNIEnv*, jclass) { return static_cast<jlong>(base_goodbyes().load()); }
 jlong ptr_ttl(JNIEnv*, jclass) { return static_cast<jlong>(last_ptr_ttl().load()); }
+jlongArray diagnostic_snapshot(JNIEnv* env, jclass) {
+  const jlong values[] = {static_cast<jlong>(diagnostics().callbacks.load()),
+      static_cast<jlong>(diagnostics().records.load()),
+      static_cast<jlong>(diagnostics().membership.load()),
+      static_cast<jlong>(base_goodbyes().load()),
+      static_cast<jlong>(diagnostics().errors.load()),
+      static_cast<jlong>(diagnostics().last_status.load())};
+  auto out = env->NewLongArray(6);
+  if (out) env->SetLongArrayRegion(out, 0, 6, values);
+  return out;
+}
 const JNINativeMethod kMethods[] = {
   {"nativeSupported", "()Z", NATIVEHELPER_SYSV_JNI_ENTRY(supported)},
   {"nativeInterfaces", "()[I", NATIVEHELPER_SYSV_JNI_ENTRY(interfaces)},
@@ -420,6 +430,7 @@ const JNINativeMethod kMethods[] = {
   {"nativeActive", "()I", NATIVEHELPER_SYSV_JNI_ENTRY(active)},
   {"nativeBaseGoodbyes", "()J", NATIVEHELPER_SYSV_JNI_ENTRY(goodbyes)},
   {"nativeLastPtrTtl", "()J", NATIVEHELPER_SYSV_JNI_ENTRY(ptr_ttl)},
+  {"nativeDiagnostics", "()[J", NATIVEHELPER_SYSV_JNI_ENTRY(diagnostic_snapshot)},
 };
 jint on_load(JavaVM* vm, void*) {
   JNIEnv* env = nullptr;

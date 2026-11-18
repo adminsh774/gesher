@@ -229,3 +229,27 @@ remains required; Android reference coverage must extend to the future responder
 [rfc6335]: https://www.rfc-editor.org/rfc/rfc6335.html#section-5.1
 [rfc6763]: https://www.rfc-editor.org/rfc/rfc6763.html#section-7.2
 [jmdns]: https://github.com/jmdns/jmdns/releases
+
+
+## Companion follow-up validation
+
+The shared native FIFO and grouped cancellation in the current repair are
+preserved. A companion base query now also accepts an actual requested-subtype
+PTR when Windows includes that record in its callback. A positive base PTR still
+cannot establish or refresh subtype membership, and unrelated subtype records
+are ignored. A base goodbye in the same batch suppresses subtype membership
+from that batch; base withdrawal remains owned by the companion and shares the
+same ordered queue as the primary query.
+
+The production PTR classifier has host regressions for base positives, actual
+subtype positives, base withdrawals, subtype-only withdrawals, unrelated owners,
+case and trailing-dot spelling. The Java fixture additionally tests failed
+companion start combined with failed cancellation, callback detachment, backoff
+and eventual release. The real Windows gate now first publishes base-only
+positive records and requires zero discovery, then retains the existing subtype
+positive and three-second base-goodbye checks. Timeout diagnostics include native
+callback/record/membership/goodbye/error/status counters and listener counts.
+
+These source and fixture improvements do not establish that Windows 2022 delivers
+the requested subtype. The actual IPv4/IPv6 gate still needs to run on both Windows
+versions; no successful Windows outcome is claimed for this candidate.

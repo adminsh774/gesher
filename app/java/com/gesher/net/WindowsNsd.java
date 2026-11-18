@@ -100,6 +100,7 @@ public final class WindowsNsd {
     private static native int nativeActive();
     private static native long nativeBaseGoodbyes();
     private static native long nativeLastPtrTtl();
+    private static native long[] nativeDiagnostics();
 
     private interface DriverSupplier { Driver get(); }
     // AOSP android-16.0.0_r4 NsdManager label grammar, restricted to one queried

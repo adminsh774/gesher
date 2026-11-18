@@ -26,11 +26,12 @@ def name(labels):
     return bytes(out)
 
 
-def packet(service_type, instance, ttl, port, address, family, base_goodbye=False):
+def packet(service_type, instance, ttl, port, address, family, base_goodbye=False,
+           base_only=False):
     labels = service_type.split('.') + ['local']
     target = name([instance] + labels)
     records = []
-    for owner in (labels, ['_printer', '_sub'] + labels):
+    for owner in ((labels,) if base_only else (labels, ['_printer', '_sub'] + labels)):
         records.append(name(owner) + struct.pack('!HHIH', 12, 1, ttl, len(target)) + target)
     if base_goodbye:
         return struct.pack('!6H', 0, 0x8400, 0, 1, 0, 0) + records[0]
@@ -101,19 +102,20 @@ def main():
             if command and command != current:
                 current = command
                 serial, mode = command.split(' ', 1)
-                if mode not in ('announce', 'announce-long', 'announce-subtype-long',
+                if mode not in ('announce', 'announce-long', 'announce-subtype-long', 'announce-base-only-long',
                                 'silent', 'goodbye', 'base-goodbye', 'quit'):
                     raise ValueError('unknown fixture command')
                 if mode == 'announce':
                     current_type, current_instance, positive_ttl = args.type, args.instance, 2
                 elif mode == 'announce-long':
                     current_type, current_instance, positive_ttl = args.type.replace('_gs', '_gl', 1), args.instance + '-long', 120
-                elif mode == 'announce-subtype-long':
+                elif mode in ('announce-subtype-long', 'announce-base-only-long'):
                     current_type, current_instance, positive_ttl = args.type.replace('_gs', '_gu', 1), args.instance + '-sub-long', 120
                 query_name = name(current_type.split('.') + ['local'])
                 if mode.startswith('announce') or mode in ('goodbye', 'base-goodbye'):
                     sock.sendto(packet(current_type, current_instance, positive_ttl if mode.startswith('announce') else 0,
-                                       port, args.address, args.family, mode == 'base-goodbye'), destination)
+                                       port, args.address, args.family, mode == 'base-goodbye',
+                                       mode == 'announce-base-only-long'), destination)
                     next_send = time.monotonic() + 0.5
                 (args.control / 'ack').write_text(serial, encoding='utf-8')
                 if mode == 'quit':
@@ -126,7 +128,8 @@ def main():
                 # Respond only to this fixture type; never enumerate another peer.
                 asked = len(data) >= 12 and not (data[2] & 0x80) and query_name in data
             if mode.startswith('announce') and (now >= next_send or asked):
-                sock.sendto(packet(current_type, current_instance, positive_ttl, port, args.address, args.family), destination)
+                sock.sendto(packet(current_type, current_instance, positive_ttl, port, args.address,
+                                   args.family, base_only=mode == 'announce-base-only-long'), destination)
                 next_send = now + 0.5
     finally:
         sock.close()

@@ -32,11 +32,11 @@ public final class NsdBrowseTransportTest {
         final java.util.Set<Long> unsettled = new java.util.HashSet<>();
         long next = 1;
         boolean supported = true;
-        boolean acknowledge = true;
+        volatile boolean acknowledge = true;
         volatile int cancelFailures;
         volatile int cancelCalls;
-        int releases;
-        int starts;
+        volatile int releases;
+        volatile int starts;
         long startError;
         int baseStartError;
         private RuntimeException pollError;
@@ -214,6 +214,21 @@ public final class NsdBrowseTransportTest {
                 partialCallbacks, clock::get).run();
         check(partialCallbacks.copy().equals(List.of("failed 0")), "A failed base attach never publishes discovery");
         check(partial.active() == 0 && partial.releases == 1, "Partial start releases the accepted query");
+        Driver blockedAttach = new Driver(); blockedAttach.baseStartError = 56; blockedAttach.cancelFailures = 100;
+        Callbacks bac = new Callbacks();
+        WindowsNsd.Browser bab = new WindowsNsd.Browser(blockedAttach, "_gesher._tcp", "_printer",
+                blockedAttach::interfaces, bac, clock::get);
+        Thread bat = thread(bab);
+        until(() -> bac.count("failed 4") == 1 && blockedAttach.cancelCalls == 1,
+                "companion start failure with failed rollback");
+        check(bac.count("started") == 0 && blockedAttach.active() == 1 && blockedAttach.releases == 0,
+                "Failed companion start preserves ownership of the accepted primary without success");
+        Thread.sleep(100);
+        check(blockedAttach.cancelCalls == 1 && bac.count("failed") == 1 && bat.isAlive(),
+                "Partial-start rollback backs off without duplicate callbacks or premature release");
+        blockedAttach.cancelFailures = 0; finish(bat);
+        check(blockedAttach.active() == 0 && blockedAttach.releases == 1 && bac.count("stopped") == 0,
+                "Later rollback success releases the accepted operation once");
         Driver retry = new Driver(); retry.cancelFailures = 2; Callbacks rc = new Callbacks();
         WindowsNsd.Browser rb = new WindowsNsd.Browser(retry, "_gesher._udp", null, retry::interfaces, rc, clock::get);
         Thread rt = thread(rb); until(() -> rc.count("started") == 1, "retry start"); rb.stop(); finish(rt);

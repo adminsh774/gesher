@@ -839,7 +839,7 @@ try {
   CheckTimed 'services: actual storage volumes, capacity, credential state and file allocation' "$Dir/dalvikvm.exe" `
     ($dvmContracts + 'gesher.services.StorageQueryContractTest') @('StorageQueryContractTest all passed:') 45
   CheckTimed 'services: DNS-SD state, cache expiry and cancellation ownership' "$Dir/dalvikvm.exe" `
-    ($dvmContracts + 'gesher.services.NsdBrowseTransportTest') @('NsdBrowseTransportTest all passed: 184') 30
+    ($dvmContracts + 'gesher.services.NsdBrowseTransportTest') @('NsdBrowseTransportTest all passed: 189') 30
   . (Join-Path $PSScriptRoot '../run-nsd-browse-contract.ps1')
   $canonicalChecks = @(
     @{ Class = 'UserManagerProfilesTest'; Count = 49; Name = 'single-user profile, serial, identity and restriction contracts' },
