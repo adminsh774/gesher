@@ -23,6 +23,11 @@ def main():
                         (args.app_classes, args.framework_classes, args.core_classes))
     with tempfile.TemporaryDirectory(prefix='gesher-nsd-browse-') as tmp:
         work = Path(tmp)
+        records = work / 'nsd_browse_records_test'
+        subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                        '-I' + str(ROOT / 'compat/net'),
+                        str(ROOT / 'tests/native/nsd_browse_records_test.cc'), '-o', str(records)], check=True)
+        subprocess.run([str(records)], check=True, timeout=30)
         library = work / 'libnsd_host.so'
         subprocess.run(['cc', '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-shared', '-fPIC',
                         '-I' + str(args.java_home / 'include'), '-I' + str(args.java_home / 'include/linux'),

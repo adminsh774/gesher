@@ -14,6 +14,7 @@
 #include <gesher/inet.h>
 #include <jni.h>
 #include <nativehelper/jni_macros.h>
+#include "nsd_browse_records.h"
 
 #include <atomic>
 #include <chrono>
@@ -49,20 +50,33 @@ struct Event {
   WORD type = DNS_TYPE_PTR;
   ULONGLONG received = GetTickCount64();
 };
-std::atomic<size_t>& live_browses() { static auto* count = new std::atomic<size_t>(0); return *count; }
+std::atomic<size_t>& live_queries() { static auto* count = new std::atomic<size_t>(0); return *count; }
 std::atomic<uint64_t>& base_goodbyes() { static auto* count = new std::atomic<uint64_t>(0); return *count; }
 std::atomic<DWORD>& last_ptr_ttl() { static auto* ttl = new std::atomic<DWORD>(0); return *ttl; }
+struct Diagnostics {
+  std::atomic<uint64_t> callbacks{0}, records{0}, membership{0}, errors{0};
+  std::atomic<DWORD> last_status{0};
+};
+Diagnostics& diagnostics() { static auto* counters = new Diagnostics; return *counters; }
+struct WireQuery {
+  MDNS_QUERY_REQUEST request{};
+  MDNS_QUERY_HANDLE handle{};
+  bool active = false;
+  bool retired = false;
+};
 struct Browse {
-  Browse() { ++live_browses(); }
-  ~Browse() { --live_browses(); }
+  explicit Browse(size_t slots) : slots(slots) { live_queries() += slots; }
+  ~Browse() { live_queries() -= slots; }
+  const size_t slots;
   std::mutex lock;
   std::condition_variable changed;
   std::wstring query;
   std::wstring base_query;
-  MDNS_QUERY_REQUEST request{};
-  MDNS_QUERY_HANDLE handle{};
+  WireQuery primary;
+  WireQuery base;
   std::deque<Event> events;
   bool cancel_requested = false;
+  bool base_starting = false;
   bool terminal = false;
   bool overflow = false;
 };
@@ -77,21 +91,9 @@ struct Registry {
 // their shared owners. The Java listener is never stored here.
 Registry& state() { static Registry* value = new Registry; return *value; }
 constexpr size_t kMaxEvents = 1024;
-constexpr size_t kMaxBrowses = 512;
+constexpr size_t kMaxQueries = 512;
 
-bool same_dns_name(const wchar_t* left, const wchar_t* right) {
-  size_t a = wcslen(left), b = wcslen(right);
-  if (a && left[a - 1] == L'.') --a;
-  if (b && right[b - 1] == L'.') --b;
-  if (a != b) return false;
-  for (size_t i = 0; i < a; ++i) {
-    wchar_t x = left[i], y = right[i];
-    if (x >= L'A' && x <= L'Z') x += L'a' - L'A';
-    if (y >= L'A' && y <= L'Z') y += L'a' - L'A';
-    if (x != y) return false;
-  }
-  return true;
-}
+using gesher::nsd::same_dns_name;
 
 bool instance_of_type(const wchar_t* name, const std::wstring& type) {
   size_t length = wcslen(name);
@@ -112,13 +114,17 @@ std::shared_ptr<Browse> find(uintptr_t id) {
 // never dereferences the handle supplied by Windows (intentionally unused below).
 // Stop success does not prove entered callbacks have returned: their shared
 // owners keep the request and handle storage alive until each invocation returns.
-void WINAPI on_browse(PVOID context, PMDNS_QUERY_HANDLE, PDNS_QUERY_RESULT result) {
+void queue_records(PVOID context, PDNS_QUERY_RESULT result, bool companion) {
   auto op = find(reinterpret_cast<uintptr_t>(context));
   DWORD status = result ? result->QueryStatus : ERROR_INVALID_DATA;
   auto* records = result ? result->pQueryRecords : nullptr;
+  ++diagnostics().callbacks;
+  diagnostics().last_status = status;
+  if (status != ERROR_SUCCESS) ++diagnostics().errors;
   if (op) {
     std::lock_guard<std::mutex> guard(op->lock);
-    if (!op->terminal) {
+    const auto& wire = companion ? op->base : op->primary;
+    if (!op->terminal && !wire.retired) {
       if (status == ERROR_CANCELLED && op->cancel_requested) {
         // Windows promises no final cancellation callback for this API.
       } else if (status != ERROR_SUCCESS) {
@@ -129,7 +135,9 @@ void WINAPI on_browse(PVOID context, PMDNS_QUERY_HANDLE, PDNS_QUERY_RESULT resul
         else op->overflow = true;
       } else {
         for (auto* record = records; record; record = record->pNext) {
+          ++diagnostics().records;
           if ((record->wType != DNS_TYPE_PTR && record->wType != DNS_TYPE_SRV) || !record->pName) continue;
+          if (companion && record->wType != DNS_TYPE_PTR) continue;
           // The request is Unicode. Reject unexpected encodings rather than
           // reinterpret char pointers as WCHAR records.
           if (record->Flags.S.CharSet != DnsCharSetUnicode) {
@@ -145,9 +153,10 @@ void WINAPI on_browse(PVOID context, PMDNS_QUERY_HANDLE, PDNS_QUERY_RESULT resul
             continue;
           }
           if (!record->Data.PTR.pNameHost) continue;
-          bool base_goodbye = (record->Flags.S.Delete || record->dwTtl == 0) &&
-              same_dns_name(record->pName, op->base_query.c_str());
-          if (!same_dns_name(record->pName, op->query.c_str()) && !base_goodbye) continue;
+          const auto observation = gesher::nsd::classify_ptr(record->pName, op->query,
+              op->base_query, record->Flags.S.Delete || record->dwTtl == 0, companion);
+          if (observation == gesher::nsd::PtrObservation::Ignore) continue;
+          const bool base_goodbye = observation == gesher::nsd::PtrObservation::Goodbye;
           if (base_goodbye) ++base_goodbyes();
           if (!record->Flags.S.Delete && record->dwTtl > 0) last_ptr_ttl() = record->dwTtl;
           if (op->events.size() >= kMaxEvents) {
@@ -156,20 +165,26 @@ void WINAPI on_browse(PVOID context, PMDNS_QUERY_HANDLE, PDNS_QUERY_RESULT resul
           }
           int64_t service_ttl = -1;
           bool goodbye = base_goodbye;
+          bool base_loss_in_batch = false;
           for (auto* extra = records; extra; extra = extra->pNext) {
             if (extra->wType == DNS_TYPE_SRV && extra->pName &&
                 extra->Flags.S.CharSet == DnsCharSetUnicode &&
                 same_dns_name(extra->pName, record->Data.PTR.pNameHost)) {
               service_ttl = extra->Flags.S.Delete ? 0 : extra->dwTtl;
               if (service_ttl == 0) goodbye = true;
-            } else if (extra->wType == DNS_TYPE_PTR && extra->pName &&
+            } else if (!base_goodbye && op->slots == 2 &&
+                extra->wType == DNS_TYPE_PTR && extra->pName &&
                 extra->Data.PTR.pNameHost && extra->Flags.S.CharSet == DnsCharSetUnicode &&
                 same_dns_name(extra->pName, op->base_query.c_str()) &&
                 same_dns_name(extra->Data.PTR.pNameHost, record->Data.PTR.pNameHost) &&
                 (extra->Flags.S.Delete || extra->dwTtl == 0)) {
-              goodbye = true;
+              base_loss_in_batch = true;
             }
           }
+          // The companion owns base PTR loss. A subtype PTR paired with that
+          // loss cannot start or refresh membership from the same packet.
+          if (base_loss_in_batch) continue;
+          if (!base_goodbye) ++diagnostics().membership;
           op->events.push_back({ERROR_SUCCESS, record->Data.PTR.pNameHost,
                                record->Flags.S.Delete ? 0 : record->dwTtl, service_ttl, goodbye});
         }
@@ -178,6 +193,26 @@ void WINAPI on_browse(PVOID context, PMDNS_QUERY_HANDLE, PDNS_QUERY_RESULT resul
     }
   }
   if (records) api().free(records, DnsFreeRecordList);
+}
+
+void WINAPI on_browse(PVOID context, PMDNS_QUERY_HANDLE, PDNS_QUERY_RESULT result) {
+  queue_records(context, result, false);
+}
+void WINAPI on_base_loss(PVOID context, PMDNS_QUERY_HANDLE, PDNS_QUERY_RESULT result) {
+  // Both callbacks append under the same Browse mutex. A base deletion and
+  // subtype PTR therefore reach Java in the native FIFO's observation order.
+  queue_records(context, result, true);
+}
+
+void prepare(WireQuery& wire, const std::wstring& query, ULONG index, uintptr_t id,
+             PMDNS_QUERY_CALLBACK callback) {
+  wire.request.Version = DNS_QUERY_REQUEST_VERSION1;
+  wire.request.InterfaceIndex = index;
+  wire.request.Query = query.c_str();
+  wire.request.QueryType = DNS_TYPE_PTR;
+  wire.request.QueryOptions = DNS_QUERY_STANDARD;
+  wire.request.pQueryCallback = callback;
+  wire.request.pQueryContext = reinterpret_cast<void*>(id);
 }
 
 void throw_error(JNIEnv* env, const char* type, const char* message) {
@@ -231,36 +266,56 @@ jlong start(JNIEnv* env, jclass, jstring query, jint index) {
   std::wstring name(reinterpret_cast<const wchar_t*>(chars), env->GetStringLength(query));
   env->ReleaseStringChars(query, chars);
   if (name.find(L'\0') != std::wstring::npos) return -ERROR_INVALID_PARAMETER;
+  const auto subtype = name.find(L"._sub.");
+  size_t slots = subtype == std::wstring::npos ? 1 : 2;
   std::shared_ptr<Browse> op;
   uintptr_t id;
   {
     std::lock_guard<std::mutex> guard(state().lock);
     // Count stopped requests still leased by entered callbacks and operations
     // retained after native Stop failures. Listener reuse cannot evade this cap.
-    if (live_browses() >= kMaxBrowses || state().next_id == 0 ||
+    if (live_queries() > kMaxQueries - slots || state().next_id == 0 ||
         state().next_id > static_cast<uintptr_t>(INT64_MAX)) return -ERROR_TOO_MANY_CMDS;
-    op = std::make_shared<Browse>();
+    op = std::make_shared<Browse>(slots);
     id = state().next_id++;
     state().entries.emplace(id, op);
   }
   op->query = std::move(name);
-  const auto subtype = op->query.find(L"._sub.");
   op->base_query = subtype == std::wstring::npos ? op->query : op->query.substr(subtype + 6);
-  op->request.Version = DNS_QUERY_REQUEST_VERSION1;
-  op->request.InterfaceIndex = static_cast<ULONG>(index);
-  op->request.Query = op->query.c_str();
-  op->request.QueryType = DNS_TYPE_PTR;
-  op->request.QueryOptions = DNS_QUERY_STANDARD;
-  op->request.pQueryCallback = on_browse;
-  op->request.pQueryContext = reinterpret_cast<void*>(id);
+  prepare(op->primary, op->query, static_cast<ULONG>(index), id, on_browse);
   last_ptr_ttl() = 0;
-  DWORD status = api().browse(&op->request, &op->handle);
+  DWORD status = api().browse(&op->primary.request, &op->primary.handle);
   if (status != ERROR_SUCCESS) {
     std::lock_guard<std::mutex> guard(state().lock);
     state().entries.erase(id);
     return -static_cast<jlong>(status);
   }
+  {
+    std::lock_guard<std::mutex> guard(op->lock);
+    op->primary.active = true;
+  }
   return static_cast<jlong>(id);
+}
+
+jint attach_base_loss(JNIEnv* env, jclass, jlong id) {
+  if (!internet(env)) return ERROR_ACCESS_DENIED;
+  auto op = find(static_cast<uintptr_t>(id));
+  if (!op) return ERROR_INVALID_HANDLE;
+  {
+    std::lock_guard<std::mutex> guard(op->lock);
+    if (op->slots != 2 || op->terminal || !op->primary.active) return ERROR_INVALID_PARAMETER;
+    if (op->cancel_requested || op->base_starting || op->base.active) return ERROR_BUSY;
+    op->base_starting = true;
+    prepare(op->base, op->base_query, op->primary.request.InterfaceIndex,
+            static_cast<uintptr_t>(id), on_base_loss);
+  }
+  DWORD status = api().browse(&op->base.request, &op->base.handle);
+  {
+    std::lock_guard<std::mutex> guard(op->lock);
+    op->base.active = status == ERROR_SUCCESS;
+    op->base_starting = false;
+  }
+  return static_cast<jint>(status);
 }
 
 jobjectArray poll(JNIEnv* env, jclass, jlong id, jint timeout) {
@@ -303,17 +358,31 @@ jobjectArray poll(JNIEnv* env, jclass, jlong id, jint timeout) {
 jint cancel(JNIEnv*, jclass, jlong id) {
   auto op = find(static_cast<uintptr_t>(id));
   if (!op) return ERROR_INVALID_HANDLE;
+  bool primary, base;
   {
     std::lock_guard<std::mutex> guard(op->lock);
-    if (op->terminal || op->cancel_requested) return ERROR_SUCCESS;
+    if (op->terminal) return ERROR_SUCCESS;
+    if (op->cancel_requested || op->base_starting) return ERROR_BUSY;
     op->cancel_requested = true;
+    primary = op->primary.active;
+    base = op->base.active;
   }
   // A synchronous callback is allowed; never hold op->lock across the API.
-  DWORD status = api().cancel(&op->handle);
+  DWORD primary_status = primary ? api().cancel(&op->primary.handle) : ERROR_SUCCESS;
+  DWORD base_status = base ? api().cancel(&op->base.handle) : ERROR_SUCCESS;
   {
     std::lock_guard<std::mutex> guard(op->lock);
-    if (status != ERROR_SUCCESS) op->cancel_requested = false;
-    else if (!op->terminal) {
+    if (primary && primary_status == ERROR_SUCCESS) {
+      op->primary.active = false;
+      op->primary.retired = true;
+    }
+    if (base && base_status == ERROR_SUCCESS) {
+      op->base.active = false;
+      op->base.retired = true;
+    }
+    if (op->primary.active || op->base.active) {
+      op->cancel_requested = false;
+    } else {
       op->terminal = true;
       op->events.clear();
       op->overflow = false;
@@ -321,7 +390,7 @@ jint cancel(JNIEnv*, jclass, jlong id) {
       op->changed.notify_all();
     }
   }
-  return static_cast<jint>(status);
+  return static_cast<jint>(primary_status != ERROR_SUCCESS ? primary_status : base_status);
 }
 jboolean release(JNIEnv*, jclass, jlong id) {
   std::lock_guard<std::mutex> registry_guard(state().lock);
@@ -335,20 +404,33 @@ jboolean release(JNIEnv*, jclass, jlong id) {
   return true;
 }
 jint active(JNIEnv*, jclass) {
-  return static_cast<jint>(live_browses().load());
+  return static_cast<jint>(live_queries().load());
 }
 jlong goodbyes(JNIEnv*, jclass) { return static_cast<jlong>(base_goodbyes().load()); }
 jlong ptr_ttl(JNIEnv*, jclass) { return static_cast<jlong>(last_ptr_ttl().load()); }
+jlongArray diagnostic_snapshot(JNIEnv* env, jclass) {
+  const jlong values[] = {static_cast<jlong>(diagnostics().callbacks.load()),
+      static_cast<jlong>(diagnostics().records.load()),
+      static_cast<jlong>(diagnostics().membership.load()),
+      static_cast<jlong>(base_goodbyes().load()),
+      static_cast<jlong>(diagnostics().errors.load()),
+      static_cast<jlong>(diagnostics().last_status.load())};
+  auto out = env->NewLongArray(6);
+  if (out) env->SetLongArrayRegion(out, 0, 6, values);
+  return out;
+}
 const JNINativeMethod kMethods[] = {
   {"nativeSupported", "()Z", NATIVEHELPER_SYSV_JNI_ENTRY(supported)},
   {"nativeInterfaces", "()[I", NATIVEHELPER_SYSV_JNI_ENTRY(interfaces)},
   {"nativeStart", "(Ljava/lang/String;I)J", NATIVEHELPER_SYSV_JNI_ENTRY(start)},
+  {"nativeAttachBaseLoss", "(J)I", NATIVEHELPER_SYSV_JNI_ENTRY(attach_base_loss)},
   {"nativePoll", "(JI)[Ljava/lang/String;", NATIVEHELPER_SYSV_JNI_ENTRY(poll)},
   {"nativeCancel", "(J)I", NATIVEHELPER_SYSV_JNI_ENTRY(cancel)},
   {"nativeRelease", "(J)Z", NATIVEHELPER_SYSV_JNI_ENTRY(release)},
   {"nativeActive", "()I", NATIVEHELPER_SYSV_JNI_ENTRY(active)},
   {"nativeBaseGoodbyes", "()J", NATIVEHELPER_SYSV_JNI_ENTRY(goodbyes)},
   {"nativeLastPtrTtl", "()J", NATIVEHELPER_SYSV_JNI_ENTRY(ptr_ttl)},
+  {"nativeDiagnostics", "()[J", NATIVEHELPER_SYSV_JNI_ENTRY(diagnostic_snapshot)},
 };
 jint on_load(JavaVM* vm, void*) {
   JNIEnv* env = nullptr;
