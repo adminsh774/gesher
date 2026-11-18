@@ -13,6 +13,7 @@
 
 inline std::recursive_mutex g_mutex;
 
+enum class LookupStatus { kNotFound, kResolved, kUnavailable };
 struct SymbolVersion { uint32_t hash; const char* name; const char* provider; };
 struct Namespace {};
 struct LoaderContext {};

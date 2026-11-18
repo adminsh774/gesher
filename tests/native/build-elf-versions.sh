@@ -4,7 +4,7 @@ set -euo pipefail
 compiler=$1
 output=$2
 here=$(cd "$(dirname "$0")" && pwd)
-for directory in lookup-gnu lookup-sysv required/good required/bad weak/good weak/bad unversioned global virtual tls tls-weak/good tls-weak/bad; do
+for directory in lookup-gnu lookup-sysv null-global required/good required/bad weak/good weak/bad unversioned global virtual tls tls-weak/good tls-weak/bad; do
   mkdir -p "$output/$directory"
 done
 common=(-shared -fPIC -O2 -fno-stack-protector -nostdlib -Wall -Wextra -Werror)
@@ -18,7 +18,7 @@ done
 common+=("-L$output/link-only" -Wl,--no-as-needed -l:libgv_test_host.so)
 provider() {
   local directory=$1 role=$2 hash=$3 script=$4
-  local flags=()
+  local flags=("${@:5}")
   if [[ -n "$script" ]]; then flags+=("-Wl,--version-script=$here/elf_versions/$script.map"); fi
   "$compiler" "${common[@]}" -DGV_ROLE="$role" "-Wl,--hash-style=$hash" \
     -Wl,-soname,libgv_provider.so "${flags[@]}" \
@@ -26,6 +26,9 @@ provider() {
 }
 provider lookup-gnu 1 gnu full
 provider lookup-sysv 1 sysv full
+# Bionic's relocation global group requires DF_1_GLOBAL. RTLD_GLOBAL alone
+# provides DEFAULT visibility but does not make an unrelated relocation group.
+provider null-global 1 gnu full -Wl,-z,global
 provider required/bad 2 gnu old
 provider unversioned 5 gnu ''
 provider global 6 gnu global
@@ -96,3 +99,6 @@ scope libgv_scope_static_ie.so -DGV_SCOPE_IE_ONLY -DGV_SCOPE_STATIC
 scope libgv_scope_symbolic_ie.so -DGV_SCOPE_IE_ONLY -Wl,-Bsymbolic
 scope libgv_scope_requester_versioned_ie.so -DGV_SCOPE_IE_ONLY \
   "-Wl,--version-script=$here/elf_versions/tls-scope.map"
+
+"$compiler" "${common[@]}" -Wl,--hash-style=both -Wl,-soname,libgv_null_import.so \
+  "$here/elf_null_reloc_fixture.c" -o "$output/libgv_null_import.so"

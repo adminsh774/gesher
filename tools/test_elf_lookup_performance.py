@@ -27,7 +27,7 @@ def section(text: str, begin: str, end: str) -> str:
 
 
 def lookup_section(source: str, scope: str | None = None) -> str:
-    begin = ("void* LookupVersion(Library* library, const char* name, const char* version) {"
+    begin = ("void* LookupVersion(Library* library, const char* name, const char* version"
              if "void* LookupVersion(" in source else "void* Lookup(Library* library, const char* name) {")
     public = section(source, begin, "void* LookupGlobal(")
     if '#include "lookup_scope_internal.h"' not in source:
@@ -40,12 +40,16 @@ def lookup_section(source: str, scope: str | None = None) -> str:
     # boundary. Production BFS, candidates and public wrappers are unchanged.
     adapter = '''
 void* LookupScoped(Library* library, const char* name, const char* version,
-                    LookupKind, const LoaderContext&, std::string*) {
+                    LookupKind, const LoaderContext&, std::string*, LookupStatus* status = nullptr) {
   std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  if (status) *status = LookupStatus::kNotFound;
   if (library == nullptr || name == nullptr) return nullptr;
   const SymbolVersion requested{version ? SysvHash(version) : 0, version, nullptr};
-  return LookupGraph(library, library->name_space, name, version ? &requested : nullptr,
-                     Architecture::kAuto).address;
+  const auto result = LookupGraph(library, library->name_space, name, version ? &requested : nullptr,
+                                 Architecture::kAuto);
+  if (status && result.found) *status = !result.address && result.sym &&
+      ELF64_ST_TYPE(result.sym->st_info) == STT_TLS ? LookupStatus::kUnavailable : LookupStatus::kResolved;
+  return result.address;
 }
 '''
     return result + graph + adapter + public

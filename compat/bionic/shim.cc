@@ -978,8 +978,9 @@ void* DlSymImpl(void* handle, const char* symbol, const char* version, const voi
     library = nullptr;
   }
   std::string error;
-  void* p = gesher::elf::LookupScoped(library, symbol, version, kind, context, &error);
-  if (!error.empty()) {
+  gesher::elf::LookupStatus status = gesher::elf::LookupStatus::kNotFound;
+  void* p = gesher::elf::LookupScoped(library, symbol, version, kind, context, &error, &status);
+  if (status != gesher::elf::LookupStatus::kResolved) {
     // A found IFUNC may legitimately return a null address. The common loader
     // reports lookup failure independently of that successful null result.
     t_dlerror = error;

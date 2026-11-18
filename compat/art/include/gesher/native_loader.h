@@ -7,6 +7,9 @@
 namespace gesher::nativeloader {
 
 void Initialize();
+// ART invokes this after JavaVM destruction. It clears native registry state
+// without invoking JNI; namespace identities and live ELF objects are retained.
+// Calls using the retired VM must have stopped before this lifecycle boundary.
 void Reset();
 // Called only by the actual VM application-target initializer, independently
 // of an individual classloader namespace's compatibility target.

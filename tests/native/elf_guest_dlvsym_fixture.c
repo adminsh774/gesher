@@ -43,5 +43,11 @@ int gv_guest_dlvsym(void* provider, void* self) {
   if (!dlerror() || dlerror()) return 9;
   if (dlvsym(provider, (const char*)0, "GV_1")) return 10;
   if (!dlerror() || dlerror()) return 11;
+  if (dlvsym(provider, "gv_null", "GV_2") || dlerror()) return 12;
+  if (dlvsym(provider, "getpid", "GV_2") || dlerror()) return 13;
+  if (dlvsym((void*)0, "gv_null", "GV_2") || dlerror()) return 14;
+  if (dlvsym(provider, "gv_value", "GV_missing")) return 15;
+  if (dlvsym(provider, "gv_null", "GV_2")) return 16;
+  if (!dlerror() || dlerror()) return 17;
   return 0;
 }

@@ -12,7 +12,6 @@
 #include <dlfcn.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,7 +33,6 @@ std::mutex g_mutex;
 std::vector<Entry> g_entries;
 std::map<std::string, elf::Namespace*> g_file_namespaces;
 elf::Namespace* g_main_namespace = nullptr;
-std::atomic<JavaVM*> g_vm{nullptr};
 size_t g_sequence = 0;
 
 bool Utf(JNIEnv* env, jstring value, std::string* output) {
@@ -57,11 +55,6 @@ std::vector<std::string> Split(const std::string& input) {
     start = end + 1;
   }
   return result;
-}
-
-void RememberVm(JNIEnv* env) {
-  JavaVM* vm = nullptr;
-  if (env->GetJavaVM(&vm) == JNI_OK) g_vm.store(vm, std::memory_order_release);
 }
 
 // getParent is a Java invocation. Do it, and all string conversion/config I/O,
@@ -129,7 +122,6 @@ elf::Namespace* Create(JNIEnv* env, int32_t target_sdk, jobject class_loader,
     *error = "The boot classloader has no app namespace";
     return nullptr;
   }
-  RememberVm(env);
   Initialize();
   std::string dex_path, library_path, permitted_path, uses;
   if (!Utf(env, dex_path_j, &dex_path) || !Utf(env, library_path_j, &library_path) ||
@@ -303,18 +295,17 @@ void SetApplicationTargetSdkVersion(uint32_t version) {
 }
 
 void Reset() {
-  JavaVM* vm = g_vm.load(std::memory_order_acquire);
-  if (vm == nullptr) return;
-  JNIEnv* env = nullptr;
-  if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) return;
+  // ART calls ResetNativeLoader after destroying Runtime and its JavaVM. Like
+  // LibraryNamespaces::Reset, discard native metadata without consulting JNI:
+  // the weak-reference table already belonged to the retired VM.
   elf::ScopedLoaderOperation operation;
   std::lock_guard<std::mutex> guard(g_mutex);
-  for (const auto& entry : g_entries) env->DeleteWeakGlobalRef(entry.class_loader);
   g_entries.clear();
   g_main_namespace = nullptr;
-  std::string ignored;
-  elf::SetAnonymousNamespace(elf::DefaultNamespace(), &ignored);
-  // The common loader retains namespace identities and their live objects.
+  // Bionic's anonymous namespace and live ELF identities are process-lifetime.
+  // ART's registry reset does not reassign that namespace or provide a general
+  // JavaVM-recreation contract. Only the pinned linker's test-only initializer
+  // clears its anonymous-assignment flag.
 }
 
 jstring CreateClassLoaderNamespace(JNIEnv* env, int32_t target_sdk_version,

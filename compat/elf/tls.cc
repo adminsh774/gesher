@@ -37,7 +37,14 @@ struct Arena {
   uint8_t* reservation = nullptr;
   uintptr_t tp = 0;
   size_t committed = 0;              // bytes committed below tp
-  std::unordered_map<size_t, uint8_t*> module_base;  // tp + tp_offset, or a dynamic copy
+  // Provisional entries are guarded by g_mutex because rollback visits every
+  // arena. A published entry moves to the thread-owned cache on its next use.
+  std::unordered_map<size_t, uint8_t*> module_base;
+  // Only the owning thread reads or writes this cache. Published modules cannot
+  // be rolled back and their IDs are never reused, so no registry lock is
+  // needed on an already cached access. Future successful-unload support must
+  // establish its own invalidation contract before retiring these addresses.
+  std::unordered_map<size_t, uint8_t*> published_base;
   std::vector<void*> dynamic;         // dynamic copies to free
 };
 
@@ -390,16 +397,20 @@ void* TlsGetAddr(size_t module_id, size_t offset) {
     if (!TlsSetupThread()) return nullptr;
     a = CurrentArena();
   }
+  const auto published = a->published_base.find(module_id);
+  if (published != a->published_base.end()) return published->second + offset;
   std::lock_guard<std::mutex> lock(g_mutex);
   auto entry = g_modules.find(module_id);
   if (entry == g_modules.end()) return nullptr;
   const TlsModule* m = entry->second.module;
-  // This check precedes even cached lookups: an IFUNC can resolve pending TLS
-  // on its loader thread, but no other thread may observe that transaction.
+  // Provisional cached addresses still require the owner check: an IFUNC can
+  // resolve pending TLS, but another thread cannot observe that transaction.
   if (!m->ready && entry->second.owner_thread != GetCurrentThreadId()) return nullptr;
   auto cached = a->module_base.find(module_id);
   if (cached != a->module_base.end()) {
-    return cached->second + offset;
+    uint8_t* base = cached->second;
+    if (m->ready) a->published_base.insert(a->module_base.extract(cached));
+    return base + offset;
   }
   uint8_t* base;
   if (m->is_static) {
@@ -416,7 +427,8 @@ void* TlsGetAddr(size_t module_id, size_t offset) {
     CopyImage(base, m);
     a->dynamic.push_back(base);
   }
-  a->module_base.emplace(module_id, base);
+  if (m->ready) a->published_base.emplace(module_id, base);
+  else a->module_base.emplace(module_id, base);
   return base + offset;
 }
 

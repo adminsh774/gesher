@@ -5,7 +5,10 @@ The complete production ELF tree is compiled unchanged, using the existing
 explicit Linux Win32-primitive fixture. Fixture-owned providers and contextual
 POSIX dispatch connect the real JVM to that loader; ART, Windows, NativeActivity
 and JNI_OnLoad ownership are separate runtime gates. All DSOs are original valid
-compiler outputs. The runner snapshots every input and reports its digest.
+compiler outputs. The JVM fixture includes the whole loader translation unit to
+inspect actual retained link state, without a production observer API. It calls
+native-loader Reset after the real JVM is destroyed. The runner snapshots every
+input and reports its digest.
 """
 from __future__ import annotations
 
@@ -120,7 +123,9 @@ def main() -> int:
                     "-I", str(jdk / "include"), "-I", str(jdk / "include/linux")]
         compile_flags = ["-std=c++20", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-fno-exceptions", "-pthread"]
         print("COMPILE_FLAGS", json.dumps(compile_flags + includes), flush=True)
-        sources = [elf / name for name in host.PRODUCTION_UNITS]
+        # native_namespace_jvm_host.cc includes the complete unchanged loader
+        # body so it can inspect real stored links and reset state directly.
+        sources = [elf / name for name in host.PRODUCTION_UNITS if name != "elf_loader.cc"]
         sources += [fixture / "elf_loader_host_platform.cc", fixture / "elf_loader_host_arm64.cc",
                     source / "compat/art/native_loader.cc", source / "compat/art/native_library_catalog.cc",
                     fixture / "native_namespace_jvm_host.cc"]

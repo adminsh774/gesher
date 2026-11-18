@@ -44,11 +44,34 @@ ordinary symbol/close dispatch. Boot host builtins and deliberate PE loads use
 the separate host route; an app's path cannot acquire an unrelated builtin
 through a basename fallback.
 
+Scoped symbol lookup and the direct/global version wrappers expose the same
+three-state result: absent, resolved (including a null IFUNC), or selected TLS
+with unavailable current-thread storage. The shim uses that result without
+repeating resolution or searching another provider after a selected definition.
+Namespace, caller and architecture selection remain part of the same search.
+
 Namespace configuration acquires `ScopedLoaderOperation` before the JNI
 registry mutex. Parent Java calls and catalog I/O precede both locks. Ordinary
 registry lookups release their mutex before loading. No registry mutex crosses
 constructors/JNI callbacks. This keeps N01 publication atomic and avoids the
 inverse registry-to-loader lock order during concurrent constructor reentry.
+
+ART destroys its Runtime and owned JavaVM before calling `ResetNativeLoader`.
+The adapter follows [ART's metadata-only reset][art-reset]: it drops native weak
+identity records without calling JNI through a retired VM. The VM owns disposal
+of its reference table. The native registry is cleared under the existing
+loader/registry lock order. Bionic's process anonymous namespace, other namespace
+identities and live ELF resources remain retained. The pinned linker's
+`set_anonymous_namespace` and `create_namespace` reject a second anonymous
+assignment; only its explicitly test-only `init_anonymous_namespace` resets that
+flag. ART's registry Reset does not provide general VM recreation, replacement
+of the process anonymous namespace or successful ELF unloading.
+
+Persistent public-file domains reuse identical ordered namespace links. Repeated
+classloader creation therefore does not append another copy of the same link
+and SONAME vector or extend every unsuccessful search. Deduplication preserves
+the first edge's position; a different destination or ordered list retains the
+existing append behavior. It does not change a library's visibility policy.
 
 ## Identity is distinct from a name
 
@@ -169,6 +192,14 @@ not Windows runtime success. An Android-targeted DSO or API36 android.jar is not
 an Android reference execution. Record exact source/fixture hashes, commands,
 timing and resource measurements for each acceptance run.
 
+The real-JVM host fixture inspects the actual production namespace link vectors:
+1,000 identical registrations retain one entry and unchanged capacity, distinct
+grants retain their order, and 300 transient classloaders retain the same shared
+file-domain link count. After `DestroyJavaVM` succeeds, it calls the production
+Reset without further JNI access, verifies retained process anonymous selection
+and refusal of a second assignment, and checks repeated reset. These are HotSpot/native metadata checks,
+not execution of the shipped ART teardown path on Windows.
+
 This change does not absorb N04 fd/offset/reserved-address/RELRO, N06 complete
 unloading, N07 direct APK ZIP loading or N08 dynamic ARM TLS. Namespace/provider
 identities remain stable for the process lifetime. Retiring a weak JNI reference
@@ -180,6 +211,7 @@ thread-pointer limit in [N05](native-symbol-versions.md) remains explicit.
 [libdl]: https://android.googlesource.com/platform/bionic/+/f22516cbc67e81c13cf943ce02f01b8929a98726/libdl/libdl.cpp
 [art-namespaces]: https://android.googlesource.com/platform/art/+/1690c6912a7972c9e62c39b48c706de9b8b18b4a/libnativeloader/library_namespaces.cpp
 [art-jni]: https://android.googlesource.com/platform/art/+/1690c6912a7972c9e62c39b48c706de9b8b18b4a/runtime/jni/java_vm_ext.cc
+[art-reset]: https://android.googlesource.com/platform/art/+/1690c6912a7972c9e62c39b48c706de9b8b18b4a/libnativeloader/library_namespaces.h
 [nativehelper-map]: https://android.googlesource.com/platform/libnativehelper/+/2d584ec2da2c5271ed1576593c6590d652806f0d/libnativehelper.map.txt
 [package-policy]: https://android.googlesource.com/platform/frameworks/base/+/45034f0663f960d9ee5fb0a101a4732b71f6e2f4/services/core/java/com/android/server/pm/SharedLibrariesImpl.java
 [manifest]: https://developer.android.com/guide/topics/manifest/uses-native-library-element

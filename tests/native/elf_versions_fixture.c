@@ -47,6 +47,15 @@ int gv_ifunc_old(void) __attribute__((ifunc("ifunc_old_resolver")));
 int gv_ifunc_new(void) __attribute__((ifunc("ifunc_new_resolver")));
 __asm__(".symver gv_ifunc_old,gv_ifunc@GV_1");
 __asm__(".symver gv_ifunc_new,gv_ifunc@@GV_2");
+static int null_resolutions;
+static __attribute__((used)) int (*null_resolver(void))(void) {
+  ++null_resolutions;
+  return 0;
+}
+int gv_null(void) __attribute__((ifunc("null_resolver")));
+/* A real shim name detects accidental fallback after successful selection. */
+int getpid(void) __attribute__((ifunc("null_resolver")));
+int gv_null_resolutions(void) { return null_resolutions; }
 #elif GV_ROLE == 2
 int gv_value_old(void) { return 11; }
 __asm__(".symver gv_value_old,gv_value@@GV_1");

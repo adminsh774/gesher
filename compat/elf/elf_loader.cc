@@ -2070,6 +2070,13 @@ bool LinkNamespaces(Namespace* from, Namespace* to, const std::vector<std::strin
   for (const auto& name : sonames) {
     if (name.empty() || HasPath(name)) { Fail(error, "namespace link accepts SONAMEs, not paths"); return false; }
   }
+  // Persistent public-file domains are configured for each new classloader.
+  // Repeating an identical edge must not retain another vector/string copy or
+  // extend every unsuccessful search. Keep the first edge's position; distinct
+  // ordered grants retain the existing append semantics.
+  for (const auto& link : from->links) {
+    if (link.target == to && link.sonames == sonames) return true;
+  }
   from->links.push_back({to, sonames});
   return true;
 }
@@ -2266,8 +2273,10 @@ Library* LoadFromMemory(const char* name, const void* data, size_t size, std::st
 }
 
 void* LookupScoped(Library* library, const char* name, const char* version,
-                   LookupKind kind, const LoaderContext& context, std::string* error) {
+                   LookupKind kind, const LoaderContext& context, std::string* error,
+                   LookupStatus* status) {
   std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  if (status) *status = LookupStatus::kNotFound;
   if (error) error->clear();
   if (name == nullptr) { Fail(error, "null symbol name"); return nullptr; }
   const SymbolVersion requested{version ? SysvHash(version) : 0, version, nullptr};
@@ -2295,26 +2304,35 @@ void* LookupScoped(Library* library, const char* name, const char* version,
     result = LookupLinear(ns, caller, kind == LookupKind::kNext, name, requirement,
                           ContextArchitecture(context, caller));
   }
-  if (!result.found) Fail(error, "undefined symbol: " + VersionedSymbolName(name, requirement));
-  else if (!result.address && result.sym && ELF64_ST_TYPE(result.sym->st_info) == STT_TLS)
+  if (!result.found) {
+    Fail(error, "undefined symbol: " + VersionedSymbolName(name, requirement));
+    return nullptr;
+  }
+  // The scoped search has already selected and resolved this definition once.
+  // A null IFUNC is success; unavailable TLS storage is a distinct failure.
+  // Neither permits a second provider search or another IFUNC invocation.
+  const bool unavailable = !result.address && result.sym &&
+      ELF64_ST_TYPE(result.sym->st_info) == STT_TLS;
+  if (status) *status = unavailable ? LookupStatus::kUnavailable : LookupStatus::kResolved;
+  if (unavailable)
     Fail(error, "current-thread TLS address unavailable: " + VersionedSymbolName(name, requirement));
   return result.address;
 }
 
-void* LookupVersion(Library* library, const char* name, const char* version) {
-  return LookupScoped(library, name, version, LookupKind::kHandle, {}, nullptr);
+void* LookupVersion(Library* library, const char* name, const char* version, LookupStatus* status) {
+  return LookupScoped(library, name, version, LookupKind::kHandle, {}, nullptr, status);
 }
 
 void* Lookup(Library* library, const char* name) {
-  return LookupVersion(library, name, nullptr);
+  return LookupVersion(library, name, nullptr, nullptr);
 }
 
 void* LookupGlobal(const char* name) {
-  return LookupGlobalVersion(name, nullptr);
+  return LookupGlobalVersion(name, nullptr, nullptr);
 }
 
-void* LookupGlobalVersion(const char* name, const char* version) {
-  return LookupScoped(nullptr, name, version, LookupKind::kDefault, {}, nullptr);
+void* LookupGlobalVersion(const char* name, const char* version, LookupStatus* status) {
+  return LookupScoped(nullptr, name, version, LookupKind::kDefault, {}, nullptr, status);
 }
 
 bool IsAarch64(Library* library) { return library != nullptr && library->is_aarch64; }

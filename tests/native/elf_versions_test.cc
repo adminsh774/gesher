@@ -148,6 +148,25 @@ void Lookup(const char* directory) {
   Check(Call(elf::Lookup(lib, "gv_weak")) == 52, "weak default definition participates in ordinary lookup");
   Check(Call(elf::LookupVersion(lib, "gv_ifunc", "GV_1")) == 71, "old IFUNC version executes its real resolver");
   Check(Call(elf::Lookup(lib, "gv_ifunc")) == 72, "default IFUNC version executes its real resolver");
+  void* resolutions = elf::Lookup(lib, "gv_null_resolutions");
+  Check(resolutions != nullptr, "real null IFUNC exposes an independent invocation counter");
+  for (const char* name : {"gv_null", "getpid"}) {
+    elf::LookupStatus status = elf::LookupStatus::kNotFound;
+    int before = Call(resolutions);
+    Check(elf::LookupVersion(lib, name, "GV_2", &status) == nullptr && status == elf::LookupStatus::kResolved,
+          "handle selection distinguishes a null IFUNC result from absence");
+    Check(Call(resolutions) == before + 1, "handle lookup invokes a null IFUNC exactly once");
+    status = elf::LookupStatus::kNotFound;
+    before = Call(resolutions);
+    Check(elf::LookupGlobalVersion(name, "GV_2", &status) == nullptr && status == elf::LookupStatus::kResolved,
+          "global selection distinguishes a null IFUNC result from absence");
+    Check(Call(resolutions) == before + 1, "global lookup invokes a null IFUNC exactly once");
+    Check(elf::LookupVersion(lib, name, "GV_missing", &status) == nullptr && status == elf::LookupStatus::kNotFound,
+          "handle missing version reports absence independently");
+    status = elf::LookupStatus::kResolved;
+    Check(elf::LookupGlobalVersion(name, "GV_missing", &status) == nullptr && status == elf::LookupStatus::kNotFound,
+          "global missing version reports absence independently");
+  }
   Check(Call(elf::LookupVersion(lib, "gv_bA", "GV_2")) == 301, "first colliding symbol name remains distinct");
   Check(Call(elf::LookupVersion(lib, "gv_ab", "GV_2")) == 302, "GNU hash collision still compares the full symbol name");
   Check(Call(elf::LookupVersion(lib, "gv_aQ", "GV_2")) == 303, "SysV hash collision still compares the full symbol name");

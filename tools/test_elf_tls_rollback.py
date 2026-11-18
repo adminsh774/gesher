@@ -2,7 +2,8 @@
 """Compile complete production x86 TLS with isolated host Win32 primitives.
 
 Checks pending ownership, allocation/commit rollback, stale ids, thread image
-initialization, and nested committed-module preservation. This host fixture does
+initialization, nested committed-module preservation, and published cache
+independence during concurrent registry work and thread teardown. This host fixture does
 not execute Windows FLS or guest code; it does execute the actual TLS allocator,
 registry, caches, publication and rollback from compat/elf/tls.cc unchanged.
 """

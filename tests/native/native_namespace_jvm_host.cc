@@ -2,7 +2,9 @@
 // Only the host POSIX callback transport, Bionic fixture registrations and
 // Win32 primitives are adapted. All registry/catalog/ELF policy is production.
 #include <gesher/native_loader.h>
-#include <gesher/elf_loader.h>
+// Compile the unchanged full loader here so this host fixture can inspect the
+// actual retained namespace links without adding a production observation API.
+#include "elf_loader.cc"
 #include <gesher/elf_dlopen.h>
 
 #include <jni.h>
@@ -30,6 +32,46 @@ std::mutex schedule_mutex;
 std::condition_variable schedule_changed;
 bool creation_attempted = false;
 bool snapshot_ready = false, resume_creation = false;
+
+bool Control(bool condition, const char* message) {
+  if (!condition) std::fprintf(stderr, "FAIL native namespace control: %s\n", message);
+  return condition;
+}
+
+bool LinkStorageContracts() {
+  auto create = [](const char* name) {
+    elf::NamespaceOptions options;
+    options.name = name;
+    std::string error;
+    return elf::CreateNamespace(options, &error);
+  };
+  elf::Namespace* from = create("link-control-from");
+  elf::Namespace* first = create("link-control-first");
+  elf::Namespace* second = create("link-control-second");
+  if (!Control(from && first && second, "create real link-control namespaces")) return false;
+  const std::vector<std::string> names{"libfirst.so", "libsecond.so"};
+  const std::vector<std::string> changed{"libsecond.so", "libthird.so"};
+  std::string error;
+  if (!Control(elf::LinkNamespaces(from, first, names, &error), "create first ordered grant")) return false;
+  const size_t capacity = from->links.capacity();
+  for (int i = 0; i < 1000; ++i) {
+    if (!Control(elf::LinkNamespaces(from, first, names, &error), "repeat equivalent grant")) return false;
+  }
+  if (!Control(from->links.size() == 1 && from->links.capacity() == capacity,
+               "1000 identical links retain one vector entry and unchanged capacity")) return false;
+  if (!Control(elf::LinkNamespaces(from, second, names, &error) &&
+               elf::LinkNamespaces(from, first, changed, &error) &&
+               elf::LinkNamespaces(from, first, names, &error), "distinct grants remain admissible")) return false;
+  if (!Control(from->links.size() == 3 && from->links[0].target == first &&
+               from->links[0].sonames == names && from->links[1].target == second &&
+               from->links[1].sonames == names && from->links[2].target == first &&
+               from->links[2].sonames == changed,
+               "deduplication preserves first-edge position and distinct ordered grants")) return false;
+  if (!Control(!elf::LinkNamespaces(from, nullptr, names, &error) && from->links.size() == 3,
+               "validation still rejects an unknown link destination")) return false;
+  std::puts("Native namespace retained-link controls passed: 1000 duplicate requests, 3 distinct grants");
+  return true;
+}
 
 void ConstructorCallback() {
   if (current_env == nullptr) std::abort();
@@ -109,6 +151,14 @@ jobjectArray PublicFiles(JNIEnv* env, jclass) { return loader::PublicFileCatalog
 jlong LoadedCount(JNIEnv*, jclass) {
   jlong count = 0;
   elf::ForEachLoaded([&](const elf::PhdrInfo&) { ++count; return 0; });
+  return count;
+}
+jlong PublicLinkCount(JNIEnv*, jclass) {
+  elf::ScopedLoaderOperation operation;
+  jlong count = 0;
+  for (const elf::Namespace* ns : elf::Namespaces()) {
+    if (ns->options.name.starts_with("public-files-")) count += ns->links.size();
+  }
   return count;
 }
 jlong ProcessRssKiB(JNIEnv*, jclass) {
@@ -193,6 +243,7 @@ extern "C" char* gesher_registry_host_dlerror() noexcept {
 
 int main(int argc, char** argv) {
   if (argc != 3 && argc != 4) return 2;
+  if (!LinkStorageContracts()) return 1;
   if (!Provider("libregistry_events.so", elf::ProviderVisibility::kNdkPublic,
                   "registry_ctor_event", reinterpret_cast<void*>(&ConstructorCallback)) ||
       !Provider("libregistry_ndk.so", elf::ProviderVisibility::kNdkPublic,
@@ -221,6 +272,7 @@ int main(int argc, char** argv) {
       METHOD("value", "(J)I", Value), METHOD("builtins", "()[[Ljava/lang/String;", Builtins),
       METHOD("publicFiles", "()[[Ljava/lang/String;", PublicFiles), METHOD("loadedCount", "()J", LoadedCount),
       METHOD("processRssKiB", "()J", ProcessRssKiB),
+      METHOD("publicLinkCount", "()J", PublicLinkCount),
       METHOD("setApplicationTargetSdk", "(I)V", SetApplicationTargetSdk),
       METHOD("applicationTargetSdk", "()I", ApplicationTargetSdk),
       METHOD("raceCreate", "(Ljava/lang/ClassLoader;)Ljava/lang/String;", RaceCreate),
@@ -269,7 +321,28 @@ int main(int argc, char** argv) {
   env->DeleteLocalRef(arguments);
   env->DeleteLocalRef(strings);
   env->DeleteGlobalRef(test_class);
+  elf::Namespace* retired_main = elf::g_anonymous_namespace;
+  const size_t retained_namespaces = elf::Namespaces().size();
+  // This is the real ART order: JavaVM destruction first, native-loader reset
+  // afterward. No JNI pointer is used after the successful destruction call.
+  if (!Control(vm->DestroyJavaVM() == JNI_OK, "destroy the real JavaVM before native reset")) return 7;
+  vm = nullptr;
+  env = nullptr;
   loader::Reset();
-  vm->DestroyJavaVM();
+  if (!Control(retired_main && elf::g_anonymous_namespace == retired_main && elf::KnownNamespace(retired_main) &&
+               elf::Namespaces().size() == retained_namespaces,
+               "post-VM reset retains Bionic's process anonymous namespace and live identities")) return 1;
+  elf::NamespaceOptions next_options;
+  next_options.name = "after-vm-reset";
+  std::string reset_error;
+  elf::Namespace* next_main = elf::CreateNamespace(next_options, &reset_error);
+  if (!Control(next_main && !elf::SetAnonymousNamespace(next_main, &reset_error) &&
+               elf::g_anonymous_namespace == retired_main,
+               "native reset does not invent a second anonymous assignment absent in AOSP")) return 1;
+  loader::Reset();
+  loader::Reset();
+  if (!Control(elf::g_anonymous_namespace == retired_main && elf::KnownNamespace(next_main),
+               "post-VM reset is idempotent without retiring live namespace identities")) return 1;
+  std::puts("Native namespace post-VM reset controls passed: 4 checks; no JNI after DestroyJavaVM");
   return failed ? 1 : 0;
 }

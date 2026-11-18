@@ -16,6 +16,7 @@ public final class NativeNamespaceRegistryTest {
     private static native String[][] builtins();
     private static native String[][] publicFiles();
     private static native long loadedCount();
+    private static native long publicLinkCount();
     private static native long processRssKiB();
     private static native void setApplicationTargetSdk(int version);
     private static native int applicationTargetSdk();
@@ -140,6 +141,8 @@ public final class NativeNamespaceRegistryTest {
                 "file catalog immediately stops advertising a removed provider");
 
         long before = loadedCount();
+        long publicLinksBefore = publicLinkCount();
+        check(publicLinksBefore > 0, "real public file-domain links exist before loader churn");
         long rssBefore = processRssKiB();
         List<WeakReference<ClassLoader>> weak = new ArrayList<>();
         for (int i = 0; i < 300; ++i) {
@@ -157,11 +160,14 @@ public final class NativeNamespaceRegistryTest {
         create(loader(null), 31, false, "", "");
         check(loadedCount() == before,
                 "creating and collecting empty classloaders adds no ELF mappings");
+        check(publicLinkCount() == publicLinksBefore,
+                "300 transient classloaders do not grow retained public file-domain links");
         long rssAfter = processRssKiB();
         check(rssBefore > 0 && rssAfter > 0, "host process RSS measurements are available");
         System.out.println("RESOURCE namespace_only_loaders=300 weak_refs_collected=300 elf_mappings_before="
                 + before + " elf_mappings_after=" + loadedCount() + " process_rss_before_kib=" + rssBefore
-                + " process_rss_after_kib=" + rssAfter + " (JVM and process allocations included)");
+                + " process_rss_after_kib=" + rssAfter + " retained_public_links_before=" + publicLinksBefore
+                + " retained_public_links_after=" + publicLinkCount() + " (JVM and process allocations included)");
         ClassLoader racing = loader(null);
         create(racing, 31, false, root + "/race", "");
         creator = new Thread(() -> creationError = raceCreate(loader(null)), "namespace-creator");

@@ -153,17 +153,23 @@ void* Lookup(Library* library, const char* name);
 
 // Explicit version lookup (dlvsym). nullptr version is ordinary lookup;
 // non-default/hidden definitions can be selected by their exact version name.
-void* LookupVersion(Library* library, const char* name, const char* version);
+// Selection and address availability are separate: an IFUNC may successfully
+// resolve to nullptr, while missing current-thread TLS storage is unavailable.
+// A selected-but-unavailable symbol must not fall back to another provider.
+enum class LookupStatus { kNotFound, kResolved, kUnavailable };
+void* LookupVersion(Library* library, const char* name, const char* version,
+                    LookupStatus* status = nullptr);
 
 // Caller-aware libdl lookup. An explicit handle uses its own namespace; NEXT
 // needs an identified ELF caller. Errors own their text for the caller to copy.
 void* LookupScoped(Library* handle, const char* name, const char* version,
-                   LookupKind kind, const LoaderContext& context, std::string* error);
+                   LookupKind kind, const LoaderContext& context, std::string* error,
+                   LookupStatus* status = nullptr);
 
 // RTLD_DEFAULT lookup for an unidentified host caller in the configured
 // anonymous/default namespace. Use LookupScoped for actual guest caller scope.
 void* LookupGlobal(const char* name);
-void* LookupGlobalVersion(const char* name, const char* version);
+void* LookupGlobalVersion(const char* name, const char* version, LookupStatus* status = nullptr);
 
 // Resolves `name` through the bionic resolver (SetBionicResolver) alone: the
 // host (shim) definition, or nullptr. The arm64 translator wraps some of them.

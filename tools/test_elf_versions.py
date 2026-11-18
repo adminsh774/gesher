@@ -14,6 +14,7 @@ not an unavailable new API or a compile error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,11 +25,15 @@ import sys
 import tempfile
 
 import test_elf_atomic_load as host
+import test_elf_dlvsym_shim as shim
+
+ROOT = Path(__file__).resolve().parents[1]
 
 FIXTURES = (
     "elf_versions_test.cc", "elf_versions_legacy_control.cc",
     "elf_versions_fixture.c", "elf_versions_link_only.c", "elf_versions_tls_scope.c", "build-elf-versions.sh",
     "elf_guest_dlvsym_fixture.c", "elf_guest_dlvsym.map",
+    "elf_null_reloc_fixture.c", "elf_dlvsym_null_host.cc.in",
     "elf_loader_host_platform.cc", "elf_loader_host_arm64.cc",
 )
 CASES = ("lookup-gnu", "lookup-sysv", "required", "weak", "weak-present",
@@ -90,6 +95,24 @@ def main() -> int:
         else:
             for case in CASES:
                 host.run([str(executable), str(graph), case], "RUN version contract " + case, env=environment)
+            # Reuse the same complete production objects, replacing only the
+            # driver with the actual shim dispatch/error/export section. This
+            # covers successful null IFUNCs across the loader/shim boundary.
+            body = (ROOT / "compat/bionic/shim.cc").read_text(encoding="utf-8")
+            state, implementation, entries = shim.extract(body)
+            template = (fixtures / "elf_dlvsym_null_host.cc.in").read_text(encoding="utf-8")
+            dispatch = template.replace("@ERROR_STATE@", state).replace(
+                "@LIBDL_IMPLEMENTATION@", implementation).replace("@LIBDL_ENTRIES@", entries)
+            driver, driver_object = folder / "null-dispatch.cc", folder / "null-dispatch.o"
+            driver.write_text(dispatch, encoding="utf-8")
+            print("NULL_DISPATCH_SHA256 " + hashlib.sha256(dispatch.encode()).hexdigest(), flush=True)
+            print("COMPLETE_SHIM_SHA256 " + hashlib.sha256(body.encode()).hexdigest(), flush=True)
+            host.run(cxx + flags + includes + ["-c", str(driver), "-o", str(driver_object)],
+                     "COMPILE actual shim null dispatch")
+            null_runner = folder / "elf-null-dispatch"
+            host.run(cxx + objects[:-1] + [str(driver_object)] + link_flags + ["-o", str(null_runner)],
+                     "LINK actual shim with complete production ELF")
+            host.run([str(null_runner), str(graph)], "RUN actual null IFUNC dispatch", env=environment)
     return 0
 
 
