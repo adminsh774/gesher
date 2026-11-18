@@ -34,6 +34,8 @@ struct StreamLock {
 };
 enum class PathKind { kFile, kNull, kMissing };
 namespace gesher {
+// Device/OFD identity is exercised by test_stream_device_lifetime.py and the complete OFD corpus.
+void ForgetStreamDevice(int, bool) {}
 int HandleFromFd(int fd) { return fcntl(fd, F_GETFD) >= 0 ? fd : INVALID_HANDLE_VALUE; }
 void ForgetOfd(int) {
   check("stdio retires OFD under its descriptor transaction",

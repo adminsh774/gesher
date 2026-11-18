@@ -104,6 +104,8 @@ static int SetHandleInformation(HANDLE handle, unsigned, unsigned bits) {
 }
 static int gesher_errno_from_crt(int error) { return error; }
 namespace gesher {
+// Device/OFD identity is exercised by test_stream_device_lifetime.py and the complete OFD corpus.
+void ForgetStreamDevice(int, bool) {}
 int GetFileStatusFlags(int fd) { return fcntl(fd, F_GETFL); }
 int SetFileStatusFlags(int fd, int flags) { return fcntl(fd, F_SETFL, flags); }
 int FailWithLastError() { return errno = last_error == ERROR_NOT_ENOUGH_MEMORY ? ENOMEM : EIO, -1; }

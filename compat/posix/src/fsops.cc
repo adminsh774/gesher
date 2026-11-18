@@ -685,6 +685,7 @@ int fclose(FILE* stream) {
     // The native entry avoids recursion through this public fclose symbol.
     result = _fclose_nolock(stream);
     saved = result == EOF ? gesher_errno_from_crt(errno) : flushed < 0 ? flush_error : errno;
+    gesher::ForgetStreamDevice(fd, result == 0);
     // A flush error can coexist with a completed close. Retire the fd entry
     // while its descriptor transaction still excludes participating reuse.
     if (result == 0 || gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) {
@@ -718,6 +719,7 @@ FILE* freopen(const char* path, const char* mode, FILE* stream) {
       // exactly once, including when flushing/closing itself reports an error.
       gesher::stdio::Forget(stream);
       int closed = _fclose_nolock(stream);
+      gesher::ForgetStreamDevice(old_fd, closed == 0);
       if (closed == 0 || gesher::HandleFromFd(old_fd) == INVALID_HANDLE_VALUE) {
         retired.Retire(old_fd);
       }
@@ -751,6 +753,7 @@ FILE* freopen(const char* path, const char* mode, FILE* stream) {
     if ((flags & O_CLOEXEC) != 0) wmode += L'N';
     FILE* result = _wfreopen(windows.c_str(), wmode.c_str(), stream);
     int saved = result == nullptr ? gesher_errno_from_crt(errno) : errno;
+    gesher::ForgetStreamDevice(old_fd, result != nullptr);
     if (result == nullptr && saved == ENOENT && HasNonDirectoryParent(windows)) saved = ENOTDIR;
     // The CRT closes the original file on both success and failure. A successful
     // reopen creates a new description; dup aliases must retain the old one.

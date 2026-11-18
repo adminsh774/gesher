@@ -13,6 +13,7 @@
 #include "stdio_stream_buffer.h"
 #include "internal.h"
 #include "record_lock_descriptors.h"
+#include <gesher/file_description.h>
 
 #include <windows.h>
 #include <fcntl.h>
@@ -146,7 +147,11 @@ StatePtr Find(FILE* stream, bool create) {
   // takes its transaction guard after a stream lock; the registry never waits
   // on a stream or descriptor while holding its mutex.
   int fd = _fileno(stream);
-  int flags = GetFileStatusFlags(fd);
+  // Buffer direction needs the actual access mode, not an observable wait
+  // policy. An inherited native pipe can perform I/O even when F_GETFL cannot
+  // truthfully report its externally controlled blocking mode.
+  auto snapshot = CaptureDescriptor(fd);
+  int flags = FileDescriptionIoFlags(snapshot);
   if (flags < 0) return {};
   try {
     auto candidate = std::make_shared<State>();

@@ -33,6 +33,8 @@ static bool WaitChild(PROCESS_INFORMATION* child) {
   bool done = WaitForSingleObject(child->hProcess, 5000) == WAIT_OBJECT_0;
   if (done) GetExitCodeProcess(child->hProcess, &status);
   else { TerminateProcess(child->hProcess, 127); WaitForSingleObject(child->hProcess, 1000); }
+  if (!done || status != 0)
+    std::printf("PIPE_CHILD_RESULT pid=%lu completed=%d status=%lu\n", child->dwProcessId, done, status);
   CloseHandle(child->hProcess);
   *child = {};
   return done && status == 0;
@@ -85,12 +87,21 @@ static void AwarePeer(const std::wstring& self) {
   auto snapshot = gesher::CaptureDescriptor(ends[0]);
   if (!snapshot) { Check("aware descriptor captured", false); close(ends[0]); close(ends[1]); return; }
   std::vector<gesher::exec::ChildFd> files{{37, snapshot->handle, snapshot}, {7100, snapshot->handle, snapshot}};
+  // Preserve real diagnostic handles so early importer failures in the child
+  // cannot disappear into intentionally closed standard descriptors.
+  for (int fd : {1, 2}) {
+    auto output = gesher::CaptureDescriptor(fd);
+    if (output) files.push_back({fd, output->handle, output});
+  }
   PROCESS_INFORMATION child{};
   DWORD error = gesher::exec::SpawnWithFds(Target(self, L"--aware-flags"), nullptr, L"", files, &child);
+  std::printf("PIPE_AWARE_LAUNCH mode=flags error=%lu\n", error);
   Check("aware child imports high alias and shared pipe policy", !error && WaitChild(&child));
-  Check("aware mode update reaches parent", (fcntl(ends[0], F_GETFL) & O_NONBLOCK) != 0);
+  const int shared_flags = fcntl(ends[0], F_GETFL);
+  Check("aware mode update reaches parent", shared_flags >= 0 && (shared_flags & O_NONBLOCK) != 0);
   Check("parent restores actual blocking mode", fcntl(ends[0], F_SETFL, 0) == 0);
   error = gesher::exec::SpawnWithFds(Target(self, L"--aware-read"), nullptr, L"", files, &child);
+  std::printf("PIPE_AWARE_LAUNCH mode=read error=%lu\n", error);
   Check("aware blocked reader starts", error == 0);
   if (!error) {
     bool busy = false;
@@ -161,10 +172,19 @@ static void ExternalPipe(bool asynchronous) {
   close(fd);
 }
 int main(int argc, char** argv) {
-  if (argc == 2 && std::strcmp(argv[1], "--aware-flags") == 0)
-    return fcntl(37, F_SETFL, O_NONBLOCK) == 0 && (fcntl(7100, F_GETFL) & O_NONBLOCK) != 0 ? 0 : 20;
+  if (argc == 2 && std::strcmp(argv[1], "--aware-flags") == 0) {
+    const int changed = fcntl(37, F_SETFL, O_NONBLOCK);
+    const int changed_error = errno;
+    const int flags = fcntl(7100, F_GETFL);
+    std::printf("PIPE_AWARE_FLAGS changed=%d error=%d alias_flags=%d alias_errno=%d\n",
+                changed, changed_error, flags, errno);
+    return changed == 0 && flags >= 0 && (flags & O_NONBLOCK) != 0 ? 0 : 20;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--aware-read") == 0) {
-    char byte; return read(37, &byte, 1) == 1 && byte == 'S' ? 0 : 21;
+    char byte = 0;
+    const int result = read(37, &byte, 1);
+    std::printf("PIPE_AWARE_READ result=%d byte=%d errno=%d\n", result, byte, errno);
+    return result == 1 && byte == 'S' ? 0 : 21;
   }
   wchar_t path[32768];
   DWORD length = GetModuleFileNameW(nullptr, path, 32768);
