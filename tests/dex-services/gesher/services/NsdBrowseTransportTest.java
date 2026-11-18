@@ -37,7 +37,7 @@ public final class NsdBrowseTransportTest {
         int releases;
         int starts;
         long startError;
-        volatile RuntimeException pollError;
+        private RuntimeException pollError;
         String query;
         public boolean supported() { return supported; }
         public int[] interfaces() { return new int[] {7}; }
@@ -56,6 +56,10 @@ public final class NsdBrowseTransportTest {
             if (event == null) unsettled.remove(id);
             if (event == null) try { wait(2); } catch (InterruptedException e) { throw new AssertionError(e); }
             return event;
+        }
+        synchronized void failNextPoll(RuntimeException failure) {
+            pollError = failure;
+            notifyAll();
         }
         public synchronized int cancel(long id) {
             cancelCalls++;
@@ -208,7 +212,7 @@ public final class NsdBrowseTransportTest {
                 broken::interfaces, brokenCallback, clock::get);
         Thread brokenThread = thread(brokenBrowser);
         until(() -> brokenCallback.count("started") == 1, "backend exception start");
-        broken.pollError = new IllegalStateException("native transport boundary");
+        broken.failNextPoll(new IllegalStateException("native transport boundary"));
         finish(brokenThread);
         check(broken.active() == 0 && brokenCallback.count("failed 0") == 1,
                 "Backend exception retires listener and native resources");
