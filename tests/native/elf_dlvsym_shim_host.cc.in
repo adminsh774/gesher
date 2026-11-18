@@ -33,7 +33,8 @@ char platform_handle;
 void* Answer(Route route, const char* name, const char* version = nullptr) {
   calls.push_back({route, name, version ? version : ""});
   if (route == Route::shim)
-    return std::strcmp(name, "unversioned") == 0 ? reinterpret_cast<void*>(&Unversioned) : nullptr;
+    return std::strcmp(name, "unversioned") == 0 || std::strcmp(name, "selected_unavailable") == 0
+        ? reinterpret_cast<void*>(&Unversioned) : nullptr;
   if (std::strcmp(name, "versioned") != 0) return nullptr;
   if (version == nullptr || std::strcmp(version, "V2") == 0) return reinterpret_cast<void*>(&V2);
   if (std::strcmp(version, "V1") == 0) return reinterpret_cast<void*>(&V1);
@@ -46,13 +47,33 @@ int Invoke(void* value) {
 
 namespace gesher::elf {
 struct Library {};
+enum class LookupStatus { kNotFound, kResolved, kUnavailable };
+LookupStatus Status(void* address, const char* name) {
+  if (std::strcmp(name, "selected_unavailable") == 0) return LookupStatus::kUnavailable;
+  return address != nullptr || std::strcmp(name, "selected_null") == 0
+      ? LookupStatus::kResolved : LookupStatus::kNotFound;
+}
 void* Lookup(Library*, const char* name) { return Answer(Route::handle, name); }
 void* LookupGlobal(const char* name) { return Answer(Route::global, name); }
-void* LookupVersion(Library*, const char* name, const char* version) {
-  return Answer(Route::handle_version, name, version);
+void* LookupVersion(Library*, const char* name, const char* version, bool* found = nullptr) {
+  void* address = Answer(version ? Route::handle_version : Route::handle, name, version);
+  if (found) *found = Status(address, name) != LookupStatus::kNotFound;
+  return address;
 }
-void* LookupGlobalVersion(const char* name, const char* version) {
-  return Answer(Route::global_version, name, version);
+void* LookupGlobalVersion(const char* name, const char* version, bool* found = nullptr) {
+  void* address = Answer(version ? Route::global_version : Route::global, name, version);
+  if (found) *found = Status(address, name) != LookupStatus::kNotFound;
+  return address;
+}
+void* LookupVersion(Library*, const char* name, const char* version, LookupStatus* status) {
+  void* address = Answer(version ? Route::handle_version : Route::handle, name, version);
+  *status = Status(address, name);
+  return address;
+}
+void* LookupGlobalVersion(const char* name, const char* version, LookupStatus* status) {
+  void* address = Answer(version ? Route::global_version : Route::global, name, version);
+  *status = Status(address, name);
+  return address;
 }
 }  // namespace gesher::elf
 
@@ -151,5 +172,34 @@ int main() {
   Check(std::string(error()) == "undefined symbol: main_missing, version MAIN_ABI",
         "worker failure does not replace the main thread's pending error");
   Check(error() == nullptr, "main error is consumed once");
+  for (void* handle : {static_cast<void*>(&library), static_cast<void*>(nullptr)}) {
+    calls.clear();
+    Check(vsym(handle, "selected_null", "V_NULL") == nullptr && error() == nullptr,
+          "selected null address succeeds without introducing an error");
+    Check(calls.size() == 1 && calls[0].route != Route::shim,
+          "selected null address never asks the shim for a replacement");
+    Check(vsym(handle, "missing_before_null", "V_MISSING") == nullptr,
+          "create a pending error before selected null success");
+    Check(vsym(handle, "selected_null", "V_NULL") == nullptr,
+          "null success preserves its actual result after a failure");
+    const char* pending = error();
+    Check(pending && std::string(pending) == "undefined symbol: missing_before_null, version V_MISSING",
+          "null success leaves previous unconsumed error storage intact");
+    Check(error() == nullptr, "pending error after null success is consumed once");
+  }
+  for (void* handle : {static_cast<void*>(&library), static_cast<void*>(nullptr)}) {
+    for (const char* version : {static_cast<const char*>(nullptr), "V_TLS"}) {
+      calls.clear();
+      Check(vsym(handle, "selected_unavailable", version) == nullptr,
+            "unavailable selected address does not become a builtin");
+      Check(calls.size() == 1 && calls[0].route != Route::shim,
+            "unavailable selection never asks another provider for the same name");
+      const char* unavailable = error();
+      Check(unavailable && std::string(unavailable).find("unavailable") != std::string::npos &&
+            std::string(unavailable).find("selected_unavailable") != std::string::npos,
+            "unavailable selected address reports its own failure");
+      Check(error() == nullptr, "unavailable-address failure is consumed once");
+    }
+  }
   std::printf("dlvsym shim dispatch/error contracts: %d checks passed (explicit lookup seam)\n", checks);
 }

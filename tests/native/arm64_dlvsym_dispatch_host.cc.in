@@ -26,6 +26,7 @@ void RegisterDispatch() {
 @REGISTRATION@
 }
 int checks, host_calls, null_names;
+const char* pending_error;
 void* seen_handle;
 const char* seen_name;
 const char* seen_version;
@@ -38,6 +39,11 @@ void Check(bool ok, const char* description) {
   }
 }
 void* GESHER_SYSV HostDlsym(void*, const char*) { return selected; }
+const char* GESHER_SYSV HostDlerror() {
+  const char* error = pending_error;
+  pending_error = nullptr;
+  return error;
+}
 void* GESHER_SYSV HostDlvsym(void* handle, const char* name, const char* version) {
   ++host_calls;
   seen_handle = handle; seen_name = name; seen_version = version;
@@ -55,6 +61,7 @@ int main() {
   api.resolve = HostLookup; g_host = &api;
   host_symbols["dlsym"] = reinterpret_cast<void*>(&HostDlsym);
   host_symbols["dlvsym"] = reinterpret_cast<void*>(&HostDlvsym);
+  host_symbols["dlerror"] = reinterpret_cast<void*>(&HostDlerror);
   RegisterDispatch();
   auto lookup = reinterpret_cast<VersionedLookup>(Entry("dlvsym"));
   Check(lookup != nullptr, "a three-argument entry is available");
@@ -87,6 +94,12 @@ int main() {
   Check(lookup(&ordinary, "plain", "GV_1") == &ordinary, "ordinary definition passes through");
   selected = nullptr;
   Check(lookup(&ordinary, "open", "GV_missing") == nullptr, "host failure cannot become override success");
+  pending_error = "earlier unconsumed error";
+  const int before_null = host_calls;
+  Check(lookup(&ordinary, "open", "GV_NULL") == nullptr,
+        "successful host null selection does not become the same-name ARM override");
+  Check(host_calls == before_null + 1 && pending_error != nullptr,
+        "null forwarding neither repeats host selection nor consumes error state");
   Check(lookup(&ordinary, nullptr, "GV_1") == nullptr && null_names == 1 && seen_name == nullptr,
         "null names reach host error path");
   selected = reinterpret_cast<void*>(&HostDlvsym);

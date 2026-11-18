@@ -31,7 +31,7 @@ def main():
                            check=True, timeout=15)
             return
         source = args.source.read_text()
-        begin = ("void* LookupVersion(Library* library, const char* name, const char* version) {"
+        begin = ("void* LookupVersion(Library* library, const char* name, const char* version"
                  if "void* LookupVersion(" in source else "void* Lookup(Library* library, const char* name) {")
         end = "void* LookupGlobal("
         if source.count(begin) != 1 or source.count(end) != 1:

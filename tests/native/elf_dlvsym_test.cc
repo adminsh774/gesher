@@ -97,6 +97,36 @@ int main(int argc, char** argv) {
   Check(Call(vsym(handle, "gv_ifunc", "GV_1"), arm64) == 71 &&
         Call(vsym(handle, "gv_ifunc", "GV_2"), arm64) == 72,
         "versioned IFUNC exports execute their real resolvers");
+  void* resolutions = sym(handle, "gv_null_resolutions");
+  Check(resolutions != nullptr, "null IFUNC exposes a real resolver counter");
+  for (void* scope : {handle, static_cast<void*>(nullptr)}) {
+    for (const char* name : {"gv_null", "getpid"}) {
+      const int before = Call(resolutions, arm64);
+      Check(vsym(scope, name, "GV_2") == nullptr && error() == nullptr,
+            "successful null IFUNC neither reports an error nor becomes a builtin");
+      Check(Call(resolutions, arm64) == before + 1,
+            "actual versioned null resolution executes the resolver once");
+      Check(sym(scope, name) == nullptr && error() == nullptr,
+            "ordinary lookup also preserves a selected null result");
+      Check(vsym(scope, "gv_value", "GV_pending_null") == nullptr,
+            "create a pending error before null IFUNC success");
+      Check(vsym(scope, name, "GV_2") == nullptr && Contains(error(), "GV_pending_null"),
+            "successful null IFUNC preserves an earlier unconsumed error");
+      Check(error() == nullptr, "preserved error is consumed once");
+    }
+  }
+  const int before_import = Call(resolutions, arm64);
+  const std::string null_import_path = std::string(argv[1]) + "/libgv_null_import.so";
+  void* null_import = open(null_import_path.c_str(), 2);
+  Check(null_import != nullptr, "global null IFUNC relocation is a successful binding");
+  void* import_entry = sym(null_import, "gv_null_import");
+  Check(import_entry != nullptr, "global null import fixture exposes its actual result");
+  gesher::bionic::EnterLoadedCode();
+  if (arm64) import_entry = gesher::arm64::HostEntry(import_entry);
+  Check(import_entry && reinterpret_cast<void*(SYSV*)()>(import_entry)() == nullptr,
+        "global relocation retains null instead of the same-name builtin");
+  Check(Call(resolutions, arm64) == before_import + 1,
+        "global null relocation invokes its IFUNC once");
   Check(sym(handle, "gv_hidden") == nullptr, "ordinary lookup excludes a hidden-only definition");
   Check(Contains(error(), "gv_hidden") && error() == nullptr, "hidden-only failure is consumed once");
   Check(Call(vsym(handle, "gv_hidden", "GV_1"), arm64) == 31,

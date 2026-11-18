@@ -64,6 +64,23 @@ Diagnostics distinguish a missing provider from an unresolved symbol/version.
 Shim error text is owned by the calling thread and consumed once by `dlerror`;
 successful lookups preserve an unconsumed prior error.
 
+Symbol selection is independent of the resolved address. In the pinned
+`do_dlsym`, a defined IFUNC whose resolver returns zero is still a successful
+lookup. The loader's optional `LookupStatus` output distinguishes absence,
+resolved addresses and selected symbols whose storage is unavailable, without
+executing the resolver again. Both ordinary and versioned shim lookup consult
+builtin providers only after genuine absence; a successful null result neither
+becomes a different same-name builtin nor introduces or overwrites `dlerror`.
+Global relocation lookup also retains the selected symbol when its IFUNC result
+is null. Guest `dlvsym` forwards the selected null unchanged and does not consume
+the host's error state to guess whether it succeeded.
+
+A selected TLS symbol needs actual current-thread storage. If the TLS backend
+cannot provide it, lookup reports address unavailability and sets `dlerror`;
+it cannot fabricate success or retry a same-name builtin. This applies to the
+native ARM backend's explicitly unavailable attachment path as well as a failed
+TLS allocation. A null IFUNC remains a successful result with different status.
+
 Metadata belongs to the mapped library. Parsing, provider-validation, and
 relocation failures use the same private graph rollback as
 [atomic native loading](native-load-transactions.md). No incomplete handle or
@@ -122,6 +139,7 @@ On Linux x86-64:
 ```sh
 python3 tools/test_elf_versions.py
 python3 tools/test_elf_versions.py --sanitize
+python3 tools/test_elf_unavailable_tls.py --sanitize
 python3 tools/test_elf_dlvsym_shim.py --sanitize
 python3 tools/test_arm64_dlvsym_dispatch.py --sanitize
 python3 tools/test_arm64_tls_address.py --sanitize
@@ -133,6 +151,20 @@ unchanged with the explicit Win32 primitive boundary from
 compilation. ASan/UBSan findings are fatal; LeakSanitizer is explicitly disabled
 for the ptrace environment. The shim unit uses actual extracted dispatch/error
 functions and declared lookup seams; it does not establish ELF parsing itself.
+The version runner additionally links those complete ELF units to the actual
+shim dispatch/error/export section. Original version-script DSOs provide a
+null-returning IFUNC, a same-name `getpid` collision, a resolver invocation
+counter and a separate global-import client. This joint check covers actual
+selection, once-only IFUNC execution, absence of fallback, pending-error lifetime
+and a successful null relocation; only Windows primitives and the builtin
+catalogue are host boundaries.
+The unavailable-TLS gate requires Clang and LLD (or `--arm-cc` naming a suitable
+Clang command). It builds a valid data-only AArch64 DSO and runs complete
+production ELF lookup, actual shim dispatch and the actual native TLS registry
+and address methods. Guest instruction entry points abort if reached. Real
+publication followed by the backend's unavailable address must produce a failure,
+including when the selected symbol has the same name as a builtin. This proves
+the host-executed error route, not native ARM instruction or Windows execution.
 The ARM dispatch unit similarly tests actual guest libdl dispatch with an
 observing host boundary, including genuine ELF selection versus builtin data.
 The ARM frontend test compiles that complete production translation unit with
@@ -150,6 +182,10 @@ Windows tracks 40 and 47 execute the graph driver on Android x86/ARM fixtures.
 libdl exports, including TLS and thread-local errors. The ARM variant also runs
 guest code calling guest `dlsym`/`dlvsym`, checking architecture-specific exports
 and genuine versioned definitions whose names coincide with builtins.
+Both native variants include the null IFUNC/error/relocation checks, and the
+guest caller includes successful null results with and without an earlier
+unconsumed error. Compiling these new cases does not establish Windows or
+translated ARM execution; an exact-source native run is still required.
 
 Host execution and Windows cross-linking do not establish Windows execution or
 an Android guest oracle. Native glibc characterizes ordinary fixtures, but its

@@ -61,3 +61,5 @@ test ! -e "$output/virtual/libgv_provider.so"
 "$compiler" "${common[@]}" -Wl,--hash-style=both -Wl,-soname,libgv_guest_dlvsym.so \
   "-Wl,--version-script=$here/elf_guest_dlvsym.map" \
   "$here/elf_guest_dlvsym_fixture.c" -o "$output/libgv_guest_dlvsym.so"
+"$compiler" "${common[@]}" -Wl,--hash-style=both -Wl,-soname,libgv_null_import.so \
+  "$here/elf_null_reloc_fixture.c" -o "$output/libgv_null_import.so"

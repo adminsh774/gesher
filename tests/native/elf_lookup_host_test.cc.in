@@ -10,7 +10,10 @@
 #include <vector>
 
 std::recursive_mutex g_mutex;
-struct Elf64_Sym { int value; };
+struct Elf64_Sym { int value; uint8_t st_info = 0; };
+constexpr unsigned STT_TLS = 6;
+constexpr unsigned ELF64_ST_TYPE(unsigned info) { return info & 0xf; }
+enum class LookupStatus { kNotFound, kResolved, kUnavailable };
 struct SymbolVersion { uint32_t hash; const char* name; const char* provider; };
 struct Library {
   std::vector<Library*> dependencies;

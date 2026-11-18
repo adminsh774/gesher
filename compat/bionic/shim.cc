@@ -953,6 +953,8 @@ void* DlOpenImpl(const char* filename) {
 // bionic's search reaches libc.so & co. through a library's dependencies.
 void* DlSymImpl(void* handle, const char* symbol, const char* version) {
   void* p = nullptr;
+  using gesher::elf::LookupStatus;
+  LookupStatus status = LookupStatus::kNotFound;
   if (symbol == nullptr) {
     t_dlerror = "dlsym: null symbol name";
     t_has_dlerror = true;
@@ -963,20 +965,30 @@ void* DlSymImpl(void* handle, const char* symbol, const char* version) {
     // check_symbol_version allows their actual unversioned exports to match
     // a version request; this does not declare any named version supported.
     p = LookupBionicSymbol(symbol);
+    if (p) status = LookupStatus::kResolved;
   } else if (handle == nullptr || handle == reinterpret_cast<void*>(-1) ||
              handle == reinterpret_cast<void*>(-2)) {
     // RTLD_DEFAULT is 0 and RTLD_NEXT -1 on bionic LP64; -2 is dlopen(NULL).
-    p = version == nullptr ? gesher::elf::LookupGlobal(symbol)
-                           : gesher::elf::LookupGlobalVersion(symbol, version);
-    if (p == nullptr) p = LookupBionicSymbol(symbol);
+    p = gesher::elf::LookupGlobalVersion(symbol, version, &status);
+    if (status == LookupStatus::kNotFound) {
+      p = LookupBionicSymbol(symbol);
+      if (p) status = LookupStatus::kResolved;
+    }
   } else {
     auto* library = static_cast<gesher::elf::Library*>(handle);
-    p = version == nullptr ? gesher::elf::Lookup(library, symbol)
-                           : gesher::elf::LookupVersion(library, symbol, version);
-    if (p == nullptr) p = LookupBionicSymbol(symbol);
+    p = gesher::elf::LookupVersion(library, symbol, version, &status);
+    if (status == LookupStatus::kNotFound) {
+      p = LookupBionicSymbol(symbol);
+      if (p) status = LookupStatus::kResolved;
+    }
   }
-  if (p == nullptr) {
-    t_dlerror = std::string("undefined symbol: ") + symbol;
+  // A selected IFUNC can return zero successfully. Do not replace its result
+  // with an unrelated builtin or overwrite the caller's pending dlerror.
+  // A selected TLS definition still fails if its current-thread storage is
+  // unavailable. Keep that failure separate from absence and null IFUNC success.
+  if (status != LookupStatus::kResolved) {
+    t_dlerror = std::string(status == LookupStatus::kUnavailable
+        ? "symbol address unavailable: " : "undefined symbol: ") + symbol;
     if (version != nullptr) t_dlerror += std::string(", version ") + version;
     t_has_dlerror = true;
     if (TraceDl()) {

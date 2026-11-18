@@ -26,7 +26,7 @@ def section(text: str, begin: str, end: str) -> str:
 
 
 def lookup_section(source: str) -> str:
-    begin = ("void* LookupVersion(Library* library, const char* name, const char* version) {"
+    begin = ("void* LookupVersion(Library* library, const char* name, const char* version"
              if "void* LookupVersion(" in source else "void* Lookup(Library* library, const char* name) {")
     return section(source, begin, "void* LookupGlobal(")
 

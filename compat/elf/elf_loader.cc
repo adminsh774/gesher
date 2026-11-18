@@ -527,7 +527,8 @@ ResolvedSymbol ResolveForReloc(Library* lib, const char* name, const SymbolVersi
   // Any other loaded object (global scope).
   const Library* gl = nullptr;
   const Elf64_Sym* gs = nullptr;
-  if (void* a = LookupGlobalLocked(name, &gl, &gs, lib->is_aarch64 ? 1 : 0, version)) {
+  void* a = LookupGlobalLocked(name, &gl, &gs, lib->is_aarch64 ? 1 : 0, version);
+  if (gs != nullptr) {
     return {a, gl, gs, true};
   }
   // Siblings and transitive dependencies are prepared together but are not
@@ -1922,14 +1923,20 @@ Library* LoadFromMemory(const char* name, const void* data, size_t size, std::st
   return LoadCommon(name, static_cast<const uint8_t*>(data), size, -1, error, options);
 }
 
-void* LookupVersion(Library* library, const char* name, const char* version) {
+void* LookupVersion(Library* library, const char* name, const char* version, LookupStatus* status) {
   std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  if (status) *status = LookupStatus::kNotFound;
   if (library == nullptr || name == nullptr) return nullptr;
   const SymbolVersion requested{version ? SysvHash(version) : 0, version, nullptr};
   const SymbolVersion* requirement = version ? &requested : nullptr;
   uint32_t gh = GnuHash(name), sh = SysvHash(name);
   const Elf64_Sym* sym = FindDefinedSymbol(library, name, gh, sh, requirement);
-  if (sym != nullptr) return LookupSymbolAddress(library, sym);
+  if (sym != nullptr) {
+    void* address = LookupSymbolAddress(library, sym);
+    if (status) *status = !address && ELF64_ST_TYPE(sym->st_info) == STT_TLS
+        ? LookupStatus::kUnavailable : LookupStatus::kResolved;
+    return address;
+  }
   // Bionic searches the complete DT_NEEDED graph breadth first: a direct
   // dependency wins over a grandchild even when that child's parent was
   // loaded first. A shared descendant or dependency cycle is visited once.
@@ -1961,29 +1968,38 @@ void* LookupVersion(Library* library, const char* name, const char* version) {
   for (size_t i = 0; i < (seen.empty() ? inline_count : pending.size()); ++i) {
     Library* dep = seen.empty() ? inline_pending[i] : pending[i];
     const Elf64_Sym* s = FindDefinedSymbol(dep, name, gh, sh, requirement);
-    if (s != nullptr) return LookupSymbolAddress(dep, s);
+    if (s != nullptr) {
+      void* address = LookupSymbolAddress(dep, s);
+      if (status) *status = !address && ELF64_ST_TYPE(s->st_info) == STT_TLS
+          ? LookupStatus::kUnavailable : LookupStatus::kResolved;
+      return address;
+    }
     enqueue(dep);
   }
   return nullptr;
 }
 
 void* Lookup(Library* library, const char* name) {
-  return LookupVersion(library, name, nullptr);
+  return LookupVersion(library, name, nullptr, nullptr);
 }
 
 void* LookupGlobal(const char* name) {
-  return LookupGlobalVersion(name, nullptr);
+  return LookupGlobalVersion(name, nullptr, nullptr);
 }
 
-void* LookupGlobalVersion(const char* name, const char* version) {
+void* LookupGlobalVersion(const char* name, const char* version, LookupStatus* status) {
   std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  if (status) *status = LookupStatus::kNotFound;
   if (name == nullptr) return nullptr;
   const SymbolVersion requested{version ? SysvHash(version) : 0, version, nullptr};
   const Library* owner = nullptr;
   const Elf64_Sym* symbol = nullptr;
   void* address = LookupGlobalLocked(name, &owner, &symbol, -1, version ? &requested : nullptr);
-  return symbol && ELF64_ST_TYPE(symbol->st_info) == STT_TLS
-      ? LookupSymbolAddress(owner, symbol) : address;
+  if (symbol == nullptr) return address;
+  const bool tls = ELF64_ST_TYPE(symbol->st_info) == STT_TLS;
+  if (tls) address = LookupSymbolAddress(owner, symbol);
+  if (status) *status = tls && !address ? LookupStatus::kUnavailable : LookupStatus::kResolved;
+  return address;
 }
 
 bool IsAarch64(Library* library) { return library != nullptr && library->is_aarch64; }

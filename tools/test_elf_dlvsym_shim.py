@@ -20,6 +20,21 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def extract(body: str) -> tuple[str, str, str]:
+    state = re.search(r"thread_local std::string t_dlerror;\s*thread_local bool t_has_dlerror = false;", body)
+    if state is None:
+        raise ValueError("production libdl error state marker changed")
+    begin = body.index("// dlsym: the shim's own symbols")
+    implementation = body[begin:body.index("struct BionicDlInfo", begin)]
+    entries = []
+    for name in ("dlsym", "dlvsym", "dlerror", "dlclose"):
+        found = re.findall(r'^[ \t]*ENTRY\("' + name + r'",[^\n]+;', body, flags=re.MULTILINE)
+        if len(found) != 1:
+            raise ValueError("expected one production export for " + name)
+        entries.append(found[0])
+    return state.group(), implementation, "\n".join(entries)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
@@ -35,23 +50,13 @@ def main() -> int:
                                        cwd=ROOT, text=True)
     else:
         body = (ROOT / "compat/bionic/shim.cc").read_text(encoding="utf-8")
-    state = re.search(r"thread_local std::string t_dlerror;\s*thread_local bool t_has_dlerror = false;", body)
-    if state is None:
-        raise ValueError("production libdl error state marker changed")
-    begin = body.index("// dlsym: the shim's own symbols")
-    implementation = body[begin:body.index("struct BionicDlInfo", begin)]
-    entries = []
-    for name in ("dlsym", "dlvsym", "dlerror", "dlclose"):
-        found = re.findall(r'^[ \t]*ENTRY\("' + name + r'",[^\n]+;', body, flags=re.MULTILINE)
-        if len(found) != 1:
-            raise ValueError("expected one production export for " + name)
-        entries.append(found[0])
+    state, implementation, entries = extract(body)
     template = (ROOT / "tests/native/elf_dlvsym_shim_host.cc.in").read_text(encoding="utf-8")
-    generated = template.replace("@ERROR_STATE@", state.group()).replace(
-        "@LIBDL_IMPLEMENTATION@", implementation).replace("@LIBDL_ENTRIES@", "\n".join(entries))
+    generated = template.replace("@ERROR_STATE@", state).replace(
+        "@LIBDL_IMPLEMENTATION@", implementation).replace("@LIBDL_ENTRIES@", entries)
     print("BOUNDARY production libdl dispatch/exports; explicit lookup seams; no ELF/Windows execution", flush=True)
     print("SOURCE_REF " + reference, flush=True)
-    for name, text in (("complete_shim", body), ("production_libdl", state.group() + implementation + "\n".join(entries)),
+    for name, text in (("complete_shim", body), ("production_libdl", state + implementation + entries),
                        ("fixture", template), ("generated_unit", generated)):
         print("SHA256 " + name + " " + hashlib.sha256(text.encode()).hexdigest(), flush=True)
     with tempfile.TemporaryDirectory(prefix="gesher-dlvsym-shim-") as temporary:
