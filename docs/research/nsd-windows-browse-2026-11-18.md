@@ -184,13 +184,17 @@ The gate requires real found/lost, silent expiry, goodbye, subtype discovery, Un
 identity, explicit-network isolation, permissions, 50 immediate-stop races, no callbacks
 after successful stop, and zero retained native containers. IPv4 is required. IPv6 runs
 when the selected adapter has a preferred IPv6 address; otherwise it is explicitly
-reported as unexercised. Missing APIs or callbacks fail. This gate has not run, and no
-canceled workflow was restarted to obtain its evidence.
+reported as unexercised. Missing APIs or callbacks fail. Earlier Windows Server
+CI reached the subtype PTR on Server 2022 and timed out waiting for the base-only
+goodbye. Server 2025 timed out at the subtype response.
 
-The gate also sends a base-only goodbye while browsing a subtype. The native parser
-handles such a record if supplied, but delivery to that subscription must be established
-on Windows. If the API filters it out, an additional base subscription or a different
-transport is required before claiming the corresponding lifecycle behavior.
+The gate also sends a base-only goodbye while browsing a subtype. A direct
+`DnsStartMulticastQuery` check on Windows desktop delivered the zero-TTL base PTR
+to the exact base query. The subtype query received the earlier positive subtype
+PTR and did not receive that goodbye. Each subtype browse now owns a separate base
+query on the same interface. Its callback enqueues only base PTR deletions into
+the same native FIFO, and both queries must retire before successful stop. This
+direct API check does not establish end-to-end ART or Windows Server behavior.
 
 ## Remaining N46 work
 

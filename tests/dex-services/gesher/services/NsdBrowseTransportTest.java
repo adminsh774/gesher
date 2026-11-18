@@ -28,6 +28,7 @@ public final class NsdBrowseTransportTest {
     private static final class Driver implements WindowsNsd.Driver {
         final Map<Long, ArrayDeque<String[]>> events = new HashMap<>();
         final Map<Integer, Long> indices = new HashMap<>();
+        final java.util.Set<Long> baseObservers = new java.util.HashSet<>();
         final java.util.Set<Long> unsettled = new java.util.HashSet<>();
         long next = 1;
         boolean supported = true;
@@ -37,6 +38,7 @@ public final class NsdBrowseTransportTest {
         int releases;
         int starts;
         long startError;
+        int baseStartError;
         private RuntimeException pollError;
         String query;
         public boolean supported() { return supported; }
@@ -45,6 +47,12 @@ public final class NsdBrowseTransportTest {
             starts++; query = name;
             if (startError != 0) return startError;
             long id = next++; events.put(id, new ArrayDeque<>()); indices.put(index, id); return id;
+        }
+        public synchronized int attachBaseLoss(long id) {
+            if (!events.containsKey(id)) throw new AssertionError("Attach after release");
+            if (baseStartError != 0) return baseStartError;
+            if (!baseObservers.add(id)) throw new AssertionError("Duplicate base observer");
+            return 0;
         }
         public synchronized String[] poll(long id, int timeout) {
             RuntimeException failure = pollError;
@@ -70,7 +78,7 @@ public final class NsdBrowseTransportTest {
         }
         public synchronized boolean release(long id) {
             if (events.remove(id) == null) throw new AssertionError("Double release");
-            indices.values().remove(id); releases++; return true;
+            indices.values().remove(id); baseObservers.remove(id); releases++; return true;
         }
         synchronized void event(int index, int status, String name, long ttl) {
             event(index, status, name, ttl, 0, ttl, ttl == 0);
@@ -89,6 +97,7 @@ public final class NsdBrowseTransportTest {
                     "" + ttl, ttl == 0 ? "1" : "0", "33"}); notifyAll();
         }
         synchronized int active() { return events.size(); }
+        synchronized int activeBaseObservers() { return baseObservers.size(); }
         synchronized boolean settled() { return unsettled.isEmpty(); }
     }
     private static class Callbacks implements WindowsNsd.Callback {
@@ -164,7 +173,8 @@ public final class NsdBrowseTransportTest {
         Thread worker = thread(browser);
         until(() -> cb.count("started") == 1, "start");
         check(driver.query.equals("_printer._sub._gesher._tcp.local"), "Actual subtype DNS query");
-        check(driver.active() == 2, "One actual request per interface");
+        check(driver.active() == 2 && driver.activeBaseObservers() == 2,
+                "One logical request and base observer per interface");
         String service = "Owned.שלום._gesher._tcp.local.";
         driver.event(7, 0, service, 3); driver.event(11, 0, service, 3);
         until(() -> cb.count("found") == 2, "both interfaces");
@@ -198,6 +208,12 @@ public final class NsdBrowseTransportTest {
         finish(worker);
         check(cb.count("stopped") == 1 && driver.active() == 0, "Cancellation completion releases all resources once");
         check(cb.count("failed") == 0, "No fake failure during normal lifecycle");
+        Driver partial = new Driver(); partial.baseStartError = 50;
+        Callbacks partialCallbacks = new Callbacks();
+        new WindowsNsd.Browser(partial, "_gesher._tcp", "_printer", partial::interfaces,
+                partialCallbacks, clock::get).run();
+        check(partialCallbacks.copy().equals(List.of("failed 0")), "A failed base attach never publishes discovery");
+        check(partial.active() == 0 && partial.releases == 1, "Partial start releases the accepted query");
         Driver retry = new Driver(); retry.cancelFailures = 2; Callbacks rc = new Callbacks();
         WindowsNsd.Browser rb = new WindowsNsd.Browser(retry, "_gesher._udp", null, retry::interfaces, rc, clock::get);
         Thread rt = thread(rb); until(() -> rc.count("started") == 1, "retry start"); rb.stop(); finish(rt);

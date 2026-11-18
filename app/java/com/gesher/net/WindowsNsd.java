@@ -23,6 +23,7 @@ public final class WindowsNsd {
         boolean supported();
         int[] interfaces() throws IOException;
         long start(String query, int ifIndex);
+        int attachBaseLoss(long handle);
         String[] poll(long handle, int timeoutMillis);
         int cancel(long handle);
         boolean release(long handle);
@@ -61,6 +62,7 @@ public final class WindowsNsd {
         public boolean supported() { return nativeSupported(); }
         public int[] interfaces() throws IOException { return nativeInterfaces(); }
         public long start(String query, int index) { return nativeStart(query, index); }
+        public int attachBaseLoss(long handle) { return nativeAttachBaseLoss(handle); }
         public String[] poll(long id, int timeout) { return nativePoll(id, timeout); }
         public int cancel(long id) { return nativeCancel(id); }
         public boolean release(long id) { return nativeRelease(id); }
@@ -91,6 +93,7 @@ public final class WindowsNsd {
     private static native boolean nativeSupported();
     private static native int[] nativeInterfaces() throws IOException;
     private static native long nativeStart(String query, int ifIndex);
+    private static native int nativeAttachBaseLoss(long handle);
     private static native String[] nativePoll(long id, int timeoutMillis);
     private static native int nativeCancel(long id);
     private static native boolean nativeRelease(long id);
@@ -318,6 +321,12 @@ public final class WindowsNsd {
                 long handle = driver.start(query, index);
                 if (handle <= 0) { failure = handle == -8 || handle == -56 ? 4 : 0; return; }
                 sources.put(index, new Source(index, handle, desired.get(index)));
+                // Keep the first accepted query tracked so partial start can
+                // retire it even if the independent base query fails.
+                if (observedSubtype != null) {
+                    int status = driver.attachBaseLoss(handle);
+                    if (status != 0) { failure = status == 8 || status == 56 ? 4 : 0; return; }
+                }
             }
         }
 

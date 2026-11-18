@@ -140,6 +140,7 @@ public final class NsdBrowseWindowsTest {
         manager.discoverServices(new DiscoveryRequest.Builder(1, subtypeType).setSubtype("_printer")
                 .setNetwork(new Network(100 + index)).build(), Runnable::run, subtype);
         await(() -> subtype.started.get() == 1, "subtype browse accepted");
+        check(active() == 2, "Subtype and base queries use the selected interface");
         peer(control, "announce-subtype-long");
         await(() -> subtype.found.get() == 1, "subtype PTR browse");
         check(subtype.info.getServiceType().equals(subtypeType + "."), "Subtype result base type");
