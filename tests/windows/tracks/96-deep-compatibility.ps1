@@ -30,6 +30,24 @@ Check 'framework: WifiInfo Builder, MLO, redaction and native Parcelable contrac
   else { $global:LASTEXITCODE = 1; "WifiInfo native Parcel evidence failed: $deepWifiInfoWireFailure" }
 } @('WifiInfoContractTest all passed:', 'parcel=true', 'WifiInfo native Parcel bytes match Android reference: 9 cases')
 
+$deepSoftApOut = FixesRun ($dvmFixes + 'gesher.services.SoftApValuesContractTest') 90
+$deepSoftApCode = $LASTEXITCODE
+. "$PSScriptRoot/../helpers/AssertSoftApValuesParcel.ps1"
+$deepSoftApWireOK = $false
+$deepSoftApWireFailure = ''
+try {
+  Assert-SoftApValuesParcelEvidence -Output $deepSoftApOut -Reference (Join-Path $PSScriptRoot '../../../docs/research/softap-values-android-reference-2026-11-18.json')
+  $deepSoftApWireOK = $true
+} catch { $deepSoftApWireFailure = $_.Exception.Message }
+Check 'framework: SoftAP/WPS values, target SDK guards and native Parcelable contracts' {
+  $global:LASTEXITCODE = $deepSoftApCode
+  $deepSoftApOut
+  if ($deepSoftApWireOK) { 'SoftAP/WPS native Parcel bytes match pinned Android16-r4: 12 cases' }
+  else { $global:LASTEXITCODE = 1; "SoftAP/WPS native Parcel evidence failed: $deepSoftApWireFailure" }
+} @('SoftApValuesContractTest all passed:', 'parcel=true', 'profile=android16-r4',
+    'SoftAP generated target-SDK table matches 4 boundaries',
+    'SoftAP/WPS native Parcel bytes match pinned Android16-r4: 12 cases')
+
 $deepNetworkOut = FixesRun ($dvmFixes + 'gesher.services.NetworkSnapshotContractTest') 90
 $deepNetworkCode = $LASTEXITCODE
 Check 'framework: network route, address, snapshot and proxy contracts with native Parcel' {
