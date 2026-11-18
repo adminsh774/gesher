@@ -85,6 +85,25 @@ Check 'framework: Wi-Fi Direct NSD values, coherent providers and complete nativ
     'P2P_NSD_PROFILE android16-r4; bp4a; sdk36; declarations=40',
     'P2P NSD native readers and Android16-r4 initial/rewrite bytes qualified: 20 cases')
 
+$deepP2pDiscoveryOut = FixesRun ($dvmFixes + 'gesher.services.WifiP2pDiscoveryValuesContractTest') 90
+$deepP2pDiscoveryCode = $LASTEXITCODE
+. "$PSScriptRoot/../helpers/AssertWifiP2pDiscoveryValuesParcel.ps1"
+$deepP2pDiscoveryWireOK = $false
+$deepP2pDiscoveryWireFailure = ''
+try {
+  Assert-WifiP2pDiscoveryValuesParcelEvidence -Output $deepP2pDiscoveryOut -Reference (Join-Path $PSScriptRoot '../../../docs/research/wifi-p2p-discovery-values-android-reference-2026-11-18.json')
+  $deepP2pDiscoveryWireOK = $true
+} catch { $deepP2pDiscoveryWireFailure = $_.Exception.Message }
+Check 'framework: Wi-Fi Direct discovery values and complete native readers' {
+  $global:LASTEXITCODE = $deepP2pDiscoveryCode
+  $deepP2pDiscoveryOut
+  if ($deepP2pDiscoveryWireOK) { 'P2P discovery native readers and pinned Android16-r4 bytes qualified: 17 cases' }
+  else { $global:LASTEXITCODE = 1; "P2P discovery native Parcel evidence failed: $deepP2pDiscoveryWireFailure" }
+} @('P2P_DISCOVERY_VALUES: PASS',
+    'P2P_DISCOVERY_PROVIDERS coherent production boot graph; complete original readers',
+    'P2P_DISCOVERY_PROFILE android16-r4; sdk36; declarations=41',
+    'P2P discovery native readers and pinned Android16-r4 bytes qualified: 17 cases')
+
 $deepNetworkOut = FixesRun ($dvmFixes + 'gesher.services.NetworkSnapshotContractTest') 90
 $deepNetworkCode = $LASTEXITCODE
 Check 'framework: network route, address, snapshot and proxy contracts with native Parcel' {
