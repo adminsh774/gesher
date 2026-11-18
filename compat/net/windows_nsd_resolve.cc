@@ -22,9 +22,51 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
+// The guest POSIX layer exports these names with Linux signatures. A Winsock
+// import-library member also defines the callable thunk alongside __imp_*, so
+// direct imports can collide with (or bypass) that guest ABI. Resolve the real
+// Windows entry points like compat/posix/src/winsock.cc and bluetooth_win.cc.
+struct WinsockApi {
+  decltype(&::bind) bind = nullptr;
+  decltype(&::sendto) sendto = nullptr;
+  decltype(&::setsockopt) setsockopt = nullptr;
+  decltype(&::select) select = nullptr;
+  DWORD error = 0;
+};
+const WinsockApi& winsock_api() {
+  static const WinsockApi api = [] {
+    WinsockApi value;
+    // WSA* imports already keep ws2_32 loaded. Retain any fallback load for the
+    // process lifetime too: active and retiring requests can still use it.
+    HMODULE module = GetModuleHandleW(L"ws2_32.dll");
+    if (!module) module = LoadLibraryExW(L"ws2_32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) {
+      value.error = GetLastError();
+      if (!value.error) value.error = ERROR_MOD_NOT_FOUND;
+      return value;
+    }
+    auto load = [&](auto& function, const char* name) {
+      FARPROC proc = GetProcAddress(module, name);
+      if (!proc) {
+        value.error = GetLastError();
+        if (!value.error) value.error = ERROR_PROC_NOT_FOUND;
+        return false;
+      }
+      function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
+          reinterpret_cast<void*>(proc));
+      return true;
+    };
+    load(value.bind, "bind") && load(value.sendto, "sendto") &&
+        load(value.setsockopt, "setsockopt") && load(value.select, "select");
+    return value;
+  }();
+  return api;
+}
+
 constexpr size_t kMaxRequests = 200;
 constexpr size_t kMaxInterfaces = 64;
 constexpr size_t kMaxEnumeratedInterfaces = 1024;
@@ -160,7 +202,7 @@ bool close_channels(Request* request) {
   return success;
 }
 bool option(SOCKET socket, int level, int name, const void* value, int length) {
-  return setsockopt(socket, level, name, static_cast<const char*>(value), length) == 0;
+  return winsock_api().setsockopt(socket, level, name, static_cast<const char*>(value), length) == 0;
 }
 DWORD open_channel(Request* request, const Adapter& adapter, int family) {
   size_t count = registry().sockets.load();
@@ -184,7 +226,7 @@ DWORD open_channel(Request* request, const Adapter& adapter, int family) {
   int level = family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
   if (family == AF_INET) {
     sockaddr_in bound{}; bound.sin_family = AF_INET; bound.sin_port = htons(5353);
-    if (bind(socket, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) != 0) return WSAGetLastError();
+    if (winsock_api().bind(socket, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) != 0) return WSAGetLastError();
     auto* group = reinterpret_cast<sockaddr_in*>(&membership.gr_group);
     group->sin_family = AF_INET; std::memcpy(&group->sin_addr, kGroup4, sizeof(kGroup4));
     DWORD network_index = htonl(index);
@@ -195,7 +237,7 @@ DWORD open_channel(Request* request, const Adapter& adapter, int family) {
         !option(socket, level, IP_RECVTTL, &yes, sizeof(yes))) return WSAGetLastError();
   } else {
     sockaddr_in6 bound{}; bound.sin6_family = AF_INET6; bound.sin6_port = htons(5353);
-    if (bind(socket, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) != 0) return WSAGetLastError();
+    if (winsock_api().bind(socket, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) != 0) return WSAGetLastError();
     auto* group = reinterpret_cast<sockaddr_in6*>(&membership.gr_group);
     group->sin6_family = AF_INET6; group->sin6_scope_id = index;
     std::memcpy(&group->sin6_addr, kGroup6, sizeof(kGroup6));
@@ -225,9 +267,12 @@ jlong open_request(JNIEnv* env, jclass) {
     id = registry().next_id++;
     registry().requests.emplace(id, request);
   }
-  WSADATA data{};
-  request->initialization_error = WSAStartup(MAKEWORD(2, 2), &data);
-  if (!request->initialization_error) request->winsock = true;
+  request->initialization_error = winsock_api().error;
+  if (!request->initialization_error) {
+    WSADATA data{};
+    request->initialization_error = WSAStartup(MAKEWORD(2, 2), &data);
+    if (!request->initialization_error) request->winsock = true;
+  }
   if (!request->initialization_error) {
     request->initialization_error = NotifyIpInterfaceChange(AF_UNSPEC, interface_changed,
         reinterpret_cast<void*>(id), FALSE, &request->interface_watch);
@@ -335,7 +380,7 @@ jboolean send(JNIEnv* env, jclass, jlong id, jint index, jbyteArray input) {
       target->sin6_scope_id = channel.interface_index;
       std::memcpy(&target->sin6_addr, kGroup6, sizeof(kGroup6)); length = sizeof(*target);
     }
-    int result = sendto(channel.socket, bytes.data(), bytes.size(), 0,
+    int result = winsock_api().sendto(channel.socket, bytes.data(), bytes.size(), 0,
         reinterpret_cast<sockaddr*>(&storage), length);
     if (result != static_cast<int>(bytes.size())) {
       DWORD error = WSAGetLastError();
@@ -365,7 +410,7 @@ jobject poll(JNIEnv* env, jclass, jlong id, jint timeout) {
     FD_SET(channel.socket, &sockets);
   }
   timeval wait{0, timeout * 1000};
-  int ready = select(0, &sockets, nullptr, nullptr, &wait);
+  int ready = winsock_api().select(0, &sockets, nullptr, nullptr, &wait);
   if (ready == SOCKET_ERROR) {
     io_error(env, "Cannot wait for DNS-SD packets", WSAGetLastError()); return nullptr;
   }

@@ -141,3 +141,30 @@ qualification; the script does not change a user's adapters.
 
 The exact measured scope, source provenance and pending gates are documented in
 [`nsd-windows-resolve-2026-11-18.md`](../../docs/research/nsd-windows-resolve-2026-11-18.md).
+
+## Native Windows import/link regression
+
+The normal native build also builds `nsd_windows_link_test`. It links the complete
+NSD transport with the real guest POSIX `bind`, `sendto`, `setsockopt` and `select`
+entries. The fixture retains those genuine function references without calling a
+socket, JNI or network operation. It supplies no replacement implementation.
+
+```sh
+cmake --build /path/to/configured/windows-build --target nsd_windows_link_test
+```
+
+Winsock import-library members define a callable thunk as well as an `__imp_*`
+slot. Directly importing the same names can collide with guest Linux signatures
+or select the wrong implementation. The transport therefore resolves exact
+WinSDK-typed pointers from the system `ws2_32.dll`, keeps the module alive for the
+process lifetime, and reports actual lookup failures through its existing
+initialization-error path before Winsock startup or interface enrollment.
+
+The former direct-call source is a meaningful negative control: linking it with
+this fixture and the real POSIX archive fails on those duplicate symbols. The
+repaired resolver and registration profiles passed complete x64/ARM64 PE links
+using separately hashed cached POSIX/import-library inputs; their PE import tables
+contain none of those four direct imports. This is a focused link profile, not a
+fresh complete current distribution build, Windows native loading, packet delivery
+or lifecycle qualification. The earlier translation-unit checks did not detect
+the actual published full-link failure, whose evidence remains retained.
