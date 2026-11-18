@@ -870,12 +870,16 @@ int Open(const std::wstring& name, int flags) {
   if (n.type == kNone) return errno = (flags & O_CREAT) != 0 ? EACCES : ENOENT, -1;
   if (n.type == kLink) {
     if ((flags & O_NOFOLLOW) != 0 && (flags & O_PATH) == 0) return errno = ELOOP, -1;
-    // Opening the link opens its file again (pipes and sockets: the same one).
+    // A proc-fd open requests a new open description, with the requested
+    // access, status and descriptor flags. Duplicating a pipe/device handle
+    // would silently share its original status and force CLOEXEC instead.
     if (n.link == "fd") {
-      HANDLE h = HandleFromFd(n.fd);
-      if (h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_DISK) {
-        return fcntl(n.fd, F_DUPFD_CLOEXEC, 0);
-      }
+      auto snapshot = CaptureDescriptor(n.fd);
+      if (!snapshot) return -1;
+      // NPFS does not expose a fresh endpoint on this existing byte queue
+      // through ReOpenFile. Fail rather than returning an alias with a
+      // different access direction or shared O_NONBLOCK state.
+      if (GetFileType(snapshot->handle) != FILE_TYPE_DISK) return errno = EOPNOTSUPP, -1;
     }
     std::string target;
     if (!ReadLink(name, &target)) return -1;

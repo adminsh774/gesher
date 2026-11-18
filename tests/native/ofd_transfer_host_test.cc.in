@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <pthread.h>
 #include <set>
 #include <spawn.h>
 #include <string>
@@ -57,6 +58,10 @@ constexpr BOOL TRUE = 1, FALSE = 0;
 constexpr DWORD ERROR_SUCCESS = 0, ERROR_NOT_ENOUGH_MEMORY = 8, ERROR_INVALID_HANDLE = 6,
     ERROR_INVALID_PARAMETER = 87, ERROR_ACCESS_DENIED = 5, ERROR_NOT_SUPPORTED = 50,
     ERROR_GEN_FAILURE = 31;
+constexpr DWORD ERROR_ALREADY_EXISTS = 183, WAIT_OBJECT_0 = 0, WAIT_ABANDONED = 128,
+    WAIT_TIMEOUT = 258, WAIT_FAILED = 0xffffffffu, SYNCHRONIZE = 0x100000, MUTEX_MODIFY_STATE = 1;
+constexpr DWORD BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2;
+#define BCRYPT_SUCCESS(value) ((value) >= 0)
 constexpr DWORD FILE_TYPE_DISK = 1, FILE_TYPE_CHAR = 2, FILE_TYPE_PIPE = 3;
 constexpr DWORD FILE_READ_DATA = 1, FILE_WRITE_DATA = 2, FILE_APPEND_DATA = 4;
 constexpr DWORD FILE_WRITE_THROUGH = 2, FILE_NO_INTERMEDIATE_BUFFERING = 8;
@@ -97,6 +102,8 @@ constexpr int kFirstNative = 10000;
 static std::array<int, 8192> crt = [] { std::array<int, 8192> out{}; out.fill(-1); return out; }();
 static std::set<int> owned;
 static std::map<const void*, size_t> views;
+static std::map<int, pthread_mutex_t*> mutexes;
+static std::set<std::string> mutex_names;
 static std::map<int, uint64_t> identities;
 static std::recursive_mutex descriptors;
 static uint64_t next_identity = 1;
@@ -150,10 +157,78 @@ static BOOL InitOnceExecuteOnce(PINIT_ONCE once, BOOL (*callback)(PINIT_ONCE, vo
 static HANDLE GetCurrentProcess() { return reinterpret_cast<HANDLE>(static_cast<intptr_t>(-3)); }
 static BOOL CloseHandle(HANDLE handle) {
   int fd = host::Native(handle);
+  auto mutex = host::mutexes.find(fd);
+  if (mutex != host::mutexes.end()) {
+    munmap(mutex->second, sizeof(pthread_mutex_t));
+    host::mutexes.erase(mutex);
+  }
   host::owned.erase(fd);
   host::identities.erase(fd);
   if (close(fd) < 0) { SetLastError(errno); return FALSE; }
   return TRUE;
+}
+// Declared kernel boundary: named, process-shared, robust recursive mutexes.
+// Metadata and admission are real cross-process resources in this fixture.
+static std::string MutexName(const wchar_t* name) {
+  std::string result = "/gesher-ofd-" + host::Narrow(name);
+  std::replace(result.begin(), result.end(), '\\', '_');
+  return result;
+}
+static HANDLE MapMutex(int fd, bool initialize) {
+  if (fd < 0) { SetLastError(errno); return nullptr; }
+  fd = host::Own(fd);
+  if (fd < 0) return nullptr;
+  if (initialize && ftruncate(fd, sizeof(pthread_mutex_t)) < 0) {
+    DWORD error = errno; CloseHandle(host::Handle(fd)); SetLastError(error); return nullptr;
+  }
+  auto* value = static_cast<pthread_mutex_t*>(mmap(nullptr, sizeof(pthread_mutex_t),
+      PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+  if (value == MAP_FAILED) {
+    DWORD error = errno; CloseHandle(host::Handle(fd)); SetLastError(error); return nullptr;
+  }
+  if (initialize) {
+    pthread_mutexattr_t attributes;
+    host::Require(pthread_mutexattr_init(&attributes) == 0 &&
+        pthread_mutexattr_setpshared(&attributes, PTHREAD_PROCESS_SHARED) == 0 &&
+        pthread_mutexattr_setrobust(&attributes, PTHREAD_MUTEX_ROBUST) == 0 &&
+        pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE) == 0 &&
+        pthread_mutex_init(value, &attributes) == 0);
+    pthread_mutexattr_destroy(&attributes);
+  }
+  host::mutexes.emplace(fd, value);
+  SetLastError(ERROR_SUCCESS);
+  return host::Handle(fd);
+}
+static HANDLE CreateMutexW(void*, BOOL owned, const wchar_t* name) {
+  host::Require(!owned);
+  const std::string path = MutexName(name);
+  int fd = shm_open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) { SetLastError(errno == EEXIST ? ERROR_ALREADY_EXISTS : errno); return nullptr; }
+  host::mutex_names.insert(path);
+  return MapMutex(fd, true);
+}
+static HANDLE OpenMutexW(DWORD access, BOOL inherit, const wchar_t* name) {
+  host::Require(access == (SYNCHRONIZE | MUTEX_MODIFY_STATE) && !inherit);
+  return MapMutex(shm_open(MutexName(name).c_str(), O_RDWR | O_CLOEXEC, 0), false);
+}
+static DWORD WaitForSingleObject(HANDLE handle, DWORD milliseconds) {
+  host::Require(milliseconds == 0);
+  auto found = host::mutexes.find(host::Native(handle));
+  host::Require(found != host::mutexes.end());
+  int result = pthread_mutex_trylock(found->second);
+  if (result == EOWNERDEAD) { pthread_mutex_consistent(found->second); return WAIT_ABANDONED; }
+  if (!result) return WAIT_OBJECT_0;
+  if (result == EBUSY) return WAIT_TIMEOUT;
+  SetLastError(result); return WAIT_FAILED;
+}
+static BOOL ReleaseMutex(HANDLE handle) {
+  auto found = host::mutexes.find(host::Native(handle));
+  host::Require(found != host::mutexes.end());
+  return pthread_mutex_unlock(found->second) == 0;
+}
+static LONG BCryptGenRandom(void*, unsigned char* bytes, ULONG size, DWORD flags) {
+  host::Require(flags == BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  return syscall(SYS_getrandom, bytes, size, 0) == size ? 0 : -1;
 }
 static BOOL SetHandleInformation(HANDLE handle, DWORD mask, DWORD flags) {
   host::Require(mask == HANDLE_FLAG_INHERIT);
@@ -583,6 +658,10 @@ int main(int argc, char** argv) {
   Check("real control pipes", pipe2(parent_to_child, O_CLOEXEC) == 0 && pipe2(child_to_parent, O_CLOEXEC) == 0);
   host::crt[40] = host::Own(parent_to_child[0]);
   host::crt[41] = host::Own(child_to_parent[1]);
+  Check("unmediated pipe status is not guessed", gesher::GetFileStatusFlags(40) == -1 && errno == EOPNOTSUPP);
+  Check("fresh pipe creator supplies known access and wait mode",
+      gesher::InitializePipeDescription(gesher::CaptureDescriptor(40), O_RDONLY) == 0 &&
+      gesher::InitializePipeDescription(gesher::CaptureDescriptor(41), O_WRONLY) == 0);
   Check("pipe read permission discovered", gesher::GetFileStatusFlags(40) == O_RDONLY);
   Check("pipe write permission discovered", gesher::GetFileStatusFlags(41) == O_WRONLY);
   Check("stateless device kind fixture", OpenFixture("/dev/null", 42, O_RDWR) == 42 &&
@@ -636,6 +715,10 @@ int main(int argc, char** argv) {
       gesher::SetFileStatusFlags(40, O_NONBLOCK) == 0 &&
       gesher::exec::SpawnWithFds(launch, nullptr, L"", bad, &info, 0) == ERROR_NOT_SUPPORTED);
   Check("restore pipe status after native refusal", gesher::SetFileStatusFlags(40, 0) == 0);
+  host::create_process_error = ERROR_ACCESS_DENIED;
+  Check("failed native launch rolls back pipe exposure", gesher::exec::SpawnWithFds(launch, nullptr, L"", bad, &info, 0) ==
+      ERROR_ACCESS_DENIED && gesher::GetFileStatusFlags(40) == O_RDONLY);
+  host::create_process_error = 0;
   bad = {{37, snapshot->handle, snapshot}};
   nonblocking.reset();
   gesher::exec::Launch native_launch{launch.application, L"--child 2"};
@@ -683,7 +766,8 @@ int main(int argc, char** argv) {
   close(parent_to_child[1]); close(child_to_parent[0]);
   for (int fd : {37, 38, 39, 42, 50, 7100}) CloseFixture(fd);
   snapshot.reset(); alias.reset();
-  Check("last alias releases mappings and native snapshots", host::owned.empty() && host::views.empty());
+  Check("last alias releases mappings and native snapshots", host::owned.empty() && host::views.empty() && host::mutexes.empty());
+  for (const auto& name : host::mutex_names) shm_unlink(name.c_str());
   std::printf("Production OFD/exec transfer: %d assertions, %d failures\n", checks, failures);
   return failures ? 1 : 0;
 }

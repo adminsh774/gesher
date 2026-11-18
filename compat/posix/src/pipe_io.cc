@@ -3,6 +3,7 @@
 #include "pipe_io.h"
 #include "internal.h"
 #include "record_lock_descriptors.h"
+#include "ofd_internal.h"
 
 #include <bcrypt.h>
 #include <fcntl.h>
@@ -11,11 +12,11 @@
 #include <pthread.h>
 #include <winternl.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 
 namespace gesher {
 namespace {
-struct PipeInformation { ULONG read_mode, completion_mode; };
 int QueryPipe(HANDLE file, void* value, ULONG size, FILE_INFORMATION_CLASS kind) {
   using Query = LONG(WINAPI*)(HANDLE, PIO_STATUS_BLOCK, void*, ULONG, FILE_INFORMATION_CLASS);
   using Error = ULONG(WINAPI*)(LONG);
@@ -28,46 +29,109 @@ int QueryPipe(HANDLE file, void* value, ULONG size, FILE_INFORMATION_CLASS kind)
   return result < 0 ? (errno = ErrnoFromWin32(convert(result)), -1) : 0;
 }
 
-struct PipeIo {
-  HANDLE file = nullptr, thread = nullptr;
-  void* bytes = nullptr;
-  DWORD count = 0, transferred = 0, error = ERROR_SUCCESS;
-  bool writing = false;
-};
-DWORD WINAPI RunPipeIo(void* raw) {
-  auto* operation = static_cast<PipeIo*>(raw);
-  const BOOL done = operation->writing
-      ? WriteFile(operation->file, operation->bytes, operation->count, &operation->transferred, nullptr)
-      : ReadFile(operation->file, operation->bytes, operation->count, &operation->transferred, nullptr);
-  operation->error = done ? ERROR_SUCCESS : GetLastError();
-  return 0;
-}
-void CancelPipeIo(void* raw) {
-  auto* operation = static_cast<PipeIo*>(raw);
-  if (!operation->thread) return;
-  // Cancellation can race the worker's entry into ReadFile/WriteFile. Retry
-  // until the actual worker has exited; a single ERROR_NOT_FOUND is not proof
-  // of retirement. Its caller-owned buffer cannot be released before then.
-  while (WaitForSingleObject(operation->thread, 0) == WAIT_TIMEOUT) {
-    CancelSynchronousIo(operation->thread);
-    WaitForSingleObject(operation->thread, 1);
+class PipeAdmission {
+ public:
+  ~PipeAdmission() { if (mutex_) ReleaseMutex(mutex_); }
+  int Acquire(const DescriptorSnapshotPtr& snapshot, bool waiting, HANDLE canceled = nullptr,
+              bool nonblocking_io = false, bool require_known = true) {
+    auto& description = *snapshot->description;
+    if (!description.OwnedPipe() || (require_known && !description.KnownPipeStatus()))
+      return errno = EOPNOTSUPP, -1;
+    for (;;) {
+      if (canceled && WaitForSingleObject(canceled, 0) == WAIT_OBJECT_0) return errno = EINTR, -1;
+      DWORD wait = WaitForSingleObject(description.pipe_mutex, waiting ? 10 : 0);
+      if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
+        mutex_ = description.pipe_mutex;
+        return !require_known || description.KnownPipeStatus() ? 0 : (errno = EOPNOTSUPP, -1);
+      }
+      if (wait != WAIT_TIMEOUT) return FailWithLastError();
+      if (!waiting) return errno = nonblocking_io ? EAGAIN : EOPNOTSUPP, -1;
+    }
   }
-  CloseHandle(operation->thread);
-  operation->thread = nullptr;
-}
-}
+ private:
+  HANDLE mutex_ = nullptr;
+};
 
-int PipeStatusFlags(HANDLE file, int flags) {
-  PipeInformation info{};
-  if (QueryPipe(file, &info, sizeof(info), FilePipeInformation) < 0) return -1;
-  return (flags & ~O_NONBLOCK) | (info.completion_mode != 0 ? O_NONBLOCK : 0);
+// I/O stays on the calling thread. A thread-pool wait runs a callback only
+// when cancellation is requested; ordinary transfers allocate no worker stack.
+struct NativePipeOperation {
+  HANDLE file = nullptr, thread = nullptr;
+  OVERLAPPED overlapped{};
+  PTP_WAIT wait = nullptr;
+  std::atomic<bool> active{true};
+  ~NativePipeOperation() {
+    active.store(false, std::memory_order_release);
+    if (wait) {
+      SetThreadpoolWait(wait, nullptr, nullptr);
+      WaitForThreadpoolWaitCallbacks(wait, TRUE);
+      CloseThreadpoolWait(wait);
+    }
+    if (thread) CloseHandle(thread);
+    if (overlapped.hEvent) CloseHandle(overlapped.hEvent);
+  }
+};
+void CALLBACK CancelNativePipe(PTP_CALLBACK_INSTANCE, void* raw, PTP_WAIT, TP_WAIT_RESULT) {
+  auto* operation = static_cast<NativePipeOperation*>(raw);
+  // Retry the entry race: ERROR_NOT_FOUND can mean ReadFile has not entered
+  // the kernel yet. Retirement joins this callback before the caller may
+  // issue another I/O operation or release the buffer/OVERLAPPED.
+  while (operation->active.load(std::memory_order_acquire)) {
+    CancelIoEx(operation->file, &operation->overlapped);
+    CancelSynchronousIo(operation->thread);
+    Sleep(1);
+  }
+}
+int CompletePipeIo(BOOL done, DWORD transferred, DWORD error, bool writing) {
+  if (done || error == ERROR_MORE_DATA) {
+    if (writing && transferred == 0) return errno = EAGAIN, -1;
+    return static_cast<int>(transferred);
+  }
+  if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED)
+    return writing ? (errno = EPIPE, -1) : 0;
+  if (error == ERROR_NO_DATA) return errno = writing ? EPIPE : EAGAIN, -1;
+  if (error == ERROR_OPERATION_ABORTED) return errno = EINTR, -1;
+  if (error == ERROR_NOACCESS || error == ERROR_INVALID_USER_BUFFER) return errno = EFAULT, -1;
+  return errno = ErrnoFromWin32(error), -1;
+}
+int NativePipeTransfer(HANDLE file, void* bytes, unsigned count, bool writing,
+                       bool immediate, HANDLE canceled) {
+  DWORD transferred = 0;
+  if (immediate) {
+    const BOOL done = writing ? WriteFile(file, bytes, count, &transferred, nullptr)
+                              : ReadFile(file, bytes, count, &transferred, nullptr);
+    return CompletePipeIo(done, transferred, done ? ERROR_SUCCESS : GetLastError(), writing);
+  }
+  NativePipeOperation operation;
+  operation.file = file;
+  operation.overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!operation.overlapped.hEvent) return FailWithLastError();
+  if (canceled) {
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+          &operation.thread, THREAD_TERMINATE, FALSE, 0)) return FailWithLastError();
+    operation.wait = CreateThreadpoolWait(CancelNativePipe, &operation, nullptr);
+    if (!operation.wait) return FailWithLastError();
+    SetThreadpoolWait(operation.wait, canceled, nullptr);
+  }
+  // A valid, unique OVERLAPPED is legal for synchronous handles too. It also
+  // lets an external asynchronous pipe complete without relying on UCRT's
+  // unspecified ReadFile(NULL) behavior for that handle type.
+  BOOL done = writing ? WriteFile(file, bytes, count, &transferred, &operation.overlapped)
+                       : ReadFile(file, bytes, count, &transferred, &operation.overlapped);
+  DWORD error = done ? ERROR_SUCCESS : GetLastError();
+  if (!done && error == ERROR_IO_PENDING) {
+    done = GetOverlappedResult(file, &operation.overlapped, &transferred, TRUE);
+    error = done ? ERROR_SUCCESS : GetLastError();
+  }
+  operation.active.store(false, std::memory_order_release);
+  return CompletePipeIo(done, transferred, error, writing);
+}
 }
 
 int SetPipeNonBlocking(HANDLE file, bool nonblocking) {
-  // Wait mode belongs to the kernel FILE_OBJECT, so dup and explicitly
-  // inherited handles observe the same change without copying metadata.
+  // The caller owns endpoint admission, or the endpoint is unpublished.
   DWORD mode = PIPE_READMODE_BYTE | (nonblocking ? PIPE_NOWAIT : PIPE_WAIT);
-  return SetNamedPipeHandleState(file, &mode, nullptr, nullptr) ? 0 : FailWithLastError();
+  if (SetNamedPipeHandleState(file, &mode, nullptr, nullptr)) return 0;
+  return GetLastError() == ERROR_PIPE_BUSY ? (errno = EOPNOTSUPP, -1) : FailWithLastError();
 }
 
 int CreatePipeDescriptors(int descriptors[2], int flags) {
@@ -113,6 +177,8 @@ int CreatePipeDescriptors(int descriptors[2], int flags) {
     if (slots[i] < 0) { error = gesher_errno_from_crt(errno); break; }
     handles[i] = nullptr;
     if (RegisterOfd(slots[i], (i == 0 ? O_RDONLY : O_WRONLY) | (flags & O_NONBLOCK)) < 0) error = errno;
+    if (!error && InitializePipeDescription(CaptureDescriptor(slots[i]),
+          (i == 0 ? O_RDONLY : O_WRONLY) | (flags & O_NONBLOCK)) < 0) error = errno;
   }
   if (error) {
     for (int i = 0; i != 2; ++i) {
@@ -126,59 +192,57 @@ int CreatePipeDescriptors(int descriptors[2], int flags) {
   return 0;
 }
 
-int TransferPipe(HANDLE file, void* bytes, unsigned count, bool writing) {
-  if (!count) return 0;
-  if (!bytes) return errno = EFAULT, -1;
-  int flags = PipeStatusFlags(file, 0);
-  if (flags < 0) return -1;
-  if (writing && (flags & O_NONBLOCK) != 0 && count > 4096) {
-    FILE_PIPE_LOCAL_INFORMATION info{};
-    if (QueryPipe(file, &info, sizeof(info), FilePipeLocalInformation) < 0) return -1;
-    if (info.NamedPipeState != 3) return errno = EPIPE, -1;
-    if (!info.WriteQuotaAvailable) return errno = EAGAIN, -1;
-    count = std::min<unsigned>(count, info.WriteQuotaAvailable);
+namespace {
+int TransferPipeBody(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count,
+                     bool writing, HANDLE canceled) {
+  if (canceled && WaitForSingleObject(canceled, 0) == WAIT_OBJECT_0) return errno = EINTR, -1;
+  auto& description = *snapshot->description;
+  PipeAdmission admission;
+  bool immediate = false;
+  if (description.OwnedPipe()) {
+    const bool nonblocking = description.KnownPipeStatus() && (description.Flags() & O_NONBLOCK) != 0;
+    if (admission.Acquire(snapshot, !nonblocking, canceled, nonblocking, false) < 0) return -1;
+    immediate = description.KnownPipeStatus() && (description.Flags() & O_NONBLOCK) != 0;
+    if (writing && immediate && count > 4096) {
+      FILE_PIPE_LOCAL_INFORMATION info{};
+      if (QueryPipe(snapshot->handle, &info, sizeof(info), FilePipeLocalInformation) < 0) return -1;
+      // Quota is a native admission hint, not a byte count: pending reads
+      // reserve quota too. Let the actual write decide EAGAIN/peer failure.
+      const unsigned amount = info.WriteQuotaAvailable ? info.WriteQuotaAvailable : 4096;
+      count = std::min(count, amount);
+    }
   }
-  // Synchronous handles are required by arbitrary native UCRT children. Keep
-  // their blocking kernel call on one joinable worker while the caller waits
-  // at cancellation points. At most one worker exists per active transfer;
-  // completion/cancellation always joins it before releasing any I/O storage.
-  PipeIo operation;
-  operation.file = file;
-  operation.bytes = bytes;
-  operation.count = count;
-  operation.writing = writing;
-  operation.thread = CreateThread(nullptr, 64 * 1024, RunPipeIo, &operation,
-                                   STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-  if (!operation.thread) return FailWithLastError();
-  DWORD wait = WAIT_TIMEOUT;
-  pthread_cleanup_push(CancelPipeIo, &operation);
-  do {
-    pthread_testcancel();
-    wait = WaitForSingleObject(operation.thread, 10);
-  } while (wait == WAIT_TIMEOUT);
-  pthread_cleanup_pop(0);
-  if (wait != WAIT_OBJECT_0) {
-    const DWORD error = GetLastError();
-    CancelPipeIo(&operation);
-    return errno = ErrnoFromWin32(error), -1;
-  }
-  CloseHandle(operation.thread);
-  if (operation.error == ERROR_SUCCESS || operation.error == ERROR_MORE_DATA) {
-    if (writing && operation.transferred == 0) return errno = EAGAIN, -1;
-    return static_cast<int>(operation.transferred);
-  }
-  if (operation.error == ERROR_BROKEN_PIPE || operation.error == ERROR_PIPE_NOT_CONNECTED)
-    return writing ? (errno = EPIPE, -1) : 0;
-  if (operation.error == ERROR_NO_DATA) return errno = writing ? EPIPE : EAGAIN, -1;
-  if (operation.error == ERROR_OPERATION_ABORTED) return errno = EINTR, -1;
-  if (operation.error == ERROR_NOACCESS || operation.error == ERROR_INVALID_USER_BUFFER)
-    return errno = EFAULT, -1;
-  return errno = ErrnoFromWin32(operation.error), -1;
+  return NativePipeTransfer(snapshot->handle, bytes, count, writing, immediate, canceled);
+}
 }
 
-short PollPipeHandle(HANDLE file, int flags, short events) {
+int TransferPipe(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count, bool writing) {
+  if (!count) return 0;
+  if (!bytes) return errno = EFAULT, -1;
+  // winpthreads cancellation uses longjmp. Defer delivery until every native
+  // request, wait callback and admission lock has retired. A disabled caller
+  // gets no cancellation callback and retains its pending cancellation.
+  int previous = PTHREAD_CANCEL_DISABLE;
+  int error = pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous);
+  if (error) return errno = gesher_errno_from_crt(error), -1;
+  HANDLE canceled = previous == PTHREAD_CANCEL_ENABLE ? static_cast<HANDLE>(pthread_getevent()) : nullptr;
+  int result;
+  if (previous == PTHREAD_CANCEL_ENABLE && !canceled) result = (errno = ENOMEM, -1);
+  else result = TransferPipeBody(snapshot, bytes, count, writing, canceled);
+  const int saved = errno;
+  pthread_setcancelstate(previous, nullptr);
+  pthread_testcancel();
+  errno = saved;
+  return result;
+}
+
+int PollPipeHandle(const DescriptorSnapshotPtr& snapshot, short events, short* ready) {
+  *ready = 0;
+  PipeAdmission admission;
+  if (admission.Acquire(snapshot, false) < 0) return -1;
+  const int flags = snapshot->description->Flags();
   FILE_PIPE_LOCAL_INFORMATION info{};
-  if (QueryPipe(file, &info, sizeof(info), FilePipeLocalInformation) < 0) return POLLERR;
+  if (QueryPipe(snapshot->handle, &info, sizeof(info), FilePipeLocalInformation) < 0) return -1;
   short result = 0;
   const bool disconnected = info.NamedPipeState != 3;
   if ((flags & O_ACCMODE) != O_WRONLY) {
@@ -189,6 +253,20 @@ short PollPipeHandle(HANDLE file, int flags, short events) {
     if (disconnected) result |= POLLERR;
     else if (info.WriteQuotaAvailable >= 4096) result |= events & (POLLOUT | POLLWRNORM);
   }
-  return result;
+  *ready = result;
+  return 0;
+}
+
+int PipeBytesAvailable(const DescriptorSnapshotPtr& snapshot, int* bytes) {
+  if (!bytes) return errno = EFAULT, -1;
+  PipeAdmission admission;
+  if (admission.Acquire(snapshot, false) < 0) return -1;
+  // The writer's quota is not the queue length, especially while a reader
+  // is pending or after its last peer closes. Do not manufacture FIONREAD.
+  if ((snapshot->description->Flags() & O_ACCMODE) == O_WRONLY) return errno = EOPNOTSUPP, -1;
+  FILE_PIPE_LOCAL_INFORMATION info{};
+  if (QueryPipe(snapshot->handle, &info, sizeof(info), FilePipeLocalInformation) < 0) return -1;
+  *bytes = static_cast<int>(std::min<ULONG>(info.ReadDataAvailable, 0x7fffffffu));
+  return 0;
 }
 }

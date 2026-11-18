@@ -33,7 +33,7 @@ WINSOCK_SHA256='190b659777f3df317e4dc90f9df322a95bd2c840ea00ad2976f9dbf56935b02d
 # shared Windows host/guest event-loop fixture. Affinity behavior is covered by
 # tools/test_ordinary_os_contracts.py; filesystem statistics by
 # tools/test_statvfs_contracts.py, the Windows POSIX probe and both ELF fixtures.
-SYSTEM_SHA256='2b374aa6bf1b9030f4a8ce810462033d36643e274ee3a62ed1005db0d6efc667'
+SYSTEM_SHA256='3e6fc1241b54dbe11a203b01e208f2dba372101e4a54ea96d839da89f6e1c2b0'
 # These exact fcntl preamble substitutions preserve the lock-pointer path
 # and every other fcntl/socket byte. Getters consume no operand; only supported
 # integer commands consume a promoted int. No function-sized exclusion is added.
@@ -152,7 +152,24 @@ RECEIPT_SOURCE_BLOCK=b'''  if ($null -ne $SourceIdentity) {
 # then EVERY earlier preservation assertion below still runs on its result.
 # Coupled OFD/stdio/pipe source files are pinned by the same qualification.
 # No supplier, socket core, fixture predicate, deadline or DAG is exempted.
-OFD_QUALIFICATION_SHA256 = 'd491de4aaf0c5170030ce05ca178788756025be3d4c078e7bdcef0e723e7692e'
+OFD_QUALIFICATION_SHA256 = '4184a995aad65820395e33917fa56cb77ecfdf27935c45447c19656cb4fffc8a'
+# Valid pipes can now fail a control operation explicitly. These two exact
+# non-socket dispatch substitutions are the only PollFdsImpl changes allowed;
+# normalize them before comparing every byte of the original native poll core.
+PIPE_POLL_ERROR_REPLACEMENTS = (
+ (b'''    } else if (!PollFile(p)) {
+      waiting_files = true;
+''', b'''    } else {
+      int result = PollFile(p);
+      if (result < 0) return -1;
+      if (!result) waiting_files = true;
+'''),
+ (b'''        if (!PollFile(p)) waiting_files = true;
+''', b'''        int result = PollFile(p);
+        if (result < 0) return -1;
+        if (!result) waiting_files = true;
+'''),
+)
 def preceding_ofd_sources():
  folder=ROOT/'tools/net-tcp-priority/qualified'
  raw=(folder/'ofd-stream-source.json').read_bytes()
@@ -186,7 +203,13 @@ def preceding_ofd_sources():
    paths[1]:[b'bool SocketIo('],
  }.items():
   current=(ROOT/path).read_bytes()
-  for marker in markers:assert function(current,marker)==function(previous[path],marker),(path,marker)
+  for marker in markers:
+   actual=function(current,marker);expected=function(previous[path],marker)
+   if marker==b'static int PollFdsImpl(':
+    for before,after in PIPE_POLL_ERROR_REPLACEMENTS:
+     assert actual.count(after)==expected.count(before)==1,(path,marker)
+     actual=actual.replace(after,before,1)
+   assert actual==expected,(path,marker)
  return previous
 def old(path):return subprocess.check_output(['git','-C',str(ROOT),'show',BASE+':'+path])
 def check():
@@ -232,9 +255,12 @@ def check():
     assert after not in expected and before not in actual,path
     expected=expected.replace(before,after,1)
    expected=expected.replace(b'#include <string>\n',b'#include <string>\n#include <limits>\n',1)
+   # Non-TCP POSIX contracts may change only in these reviewed regions;
+   # SYSTEM_SHA256 below still pins every byte, including file-advice validation.
    actual_cursor=expected_cursor=0
    for start,end in [(b'// --- statvfs ---',b'\n// --- mount ---'),
                      (b'int sched_getaffinity(',b'\nint unshare('),
+                     (b'int posix_fadvise(',b'\nint posix_fallocate('),
                      (b'int posix_fallocate(',b'\nint fallocate('),
                      (b'ssize_t writev(',b'\nssize_t preadv('),
                      (b'int memfd_create(',b'\n// --- strsignal,')]:
@@ -272,16 +298,17 @@ def check():
  assert pin['ordered_patch_sha256']=={'minimum-detached-retirement.patch':'ebc5aac990c6ec075431d0c25a9b74ecadc0940da1bdad9503f358d4fe3431ad','minimum-noattach-join.patch':'c4f47903af720542a584fa743932316d86c45683da70a4c8620d7a71d3eb7f96'}
  for name,digest in pin['ordered_patch_sha256'].items():assert hashlib.sha256((ROOT/'tools/host-pthread-authority'/name).read_bytes()).hexdigest()==digest
  for path in ['tools/net-tcp-priority/manifest.py','tools/host-pthread-authority/minimum_receipt.py']:ast.parse((ROOT/path).read_text(encoding='utf-8'))
- print('TCP_SELECTED_POLICY_PASS exact_OFD_stdio_pipe_transition original_socket_ownership_and_native_poll=EXACT original_product3 reviewed_nested_epoll_fd reviewed_device_lookup_only reviewed_sendmsg_control reviewed_statvfs_affinity_file_allocation_writev_and_memfd_only reviewed_fcntl_argument_selection_only canonical_Recv originalworkflow original_fixture_assertions_deadlines=EXACT reviewed_select_and_owner_thread_diagnostics_only controller_execution_tail original_import_NDK_build_roles=EXACT new_two_supplier_DAG=BOUNDED source12_patch2_exact native_processes_started=0')
+ print('TCP_SELECTED_POLICY_PASS exact_OFD_stdio_pipe_transition reviewed_pipe_control_errors original_socket_ownership_and_native_poll=EXACT original_product3 reviewed_nested_epoll_fd reviewed_device_lookup_only reviewed_sendmsg_control reviewed_statvfs_affinity_file_advice_allocation_writev_and_memfd_only reviewed_fcntl_argument_selection_only canonical_Recv originalworkflow original_fixture_assertions_deadlines=EXACT reviewed_select_and_owner_thread_diagnostics_only controller_execution_tail original_import_NDK_build_roles=EXACT new_two_supplier_DAG=BOUNDED source12_patch2_exact native_processes_started=0')
 def transition_negative_controls():
  from unittest.mock import patch
  original=Path.read_bytes
  cases=[
   ('compat/posix/src/fd.cc',b'--state->description->descriptor_refs == 0',b'--state->description->descriptor_refs == 1'),
-  ('compat/posix/src/fd.cc',b'return TransferPipe(snapshot->handle, bytes, count, false);',b'return 0;'),
+  ('compat/posix/src/fd.cc',b'return TransferPipe(snapshot, bytes, count, false);',b'return 0;'),
   ('compat/posix/src/system.cc',b'gesher::ws::RecvOwned(state.socket,',b'gesher::ws::SendOwned(state.socket,'),
   ('compat/posix/src/pipe_io.cc',b'if (!count) return 0;',b'if (!count) return 1;'),
   ('tools/net-tcp-priority/qualified/ofd-stream-source.patch',b'@@',b'@x'),
+  ('compat/posix/src/fd.cc',b'if (result < 0) return -1;',b'if (result < 0) return 0;'),
  ]
  for name,before,after in cases:
   target=ROOT/name

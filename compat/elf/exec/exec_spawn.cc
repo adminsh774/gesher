@@ -505,6 +505,7 @@ DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::
     count = std::max(count, file.fd + 1);
   }
   std::vector<gesher::DescriptorSnapshotPtr> snapshots(static_cast<size_t>(count));
+  std::vector<std::unique_ptr<gesher::NativeFileDescriptionExport>> native_exports;
   for (const ChildFd& file : fds) {
     auto snapshot = file.snapshot ? file.snapshot : gesher::CaptureFileHandle(file.handle);
     if (!snapshot) return errno_error();
@@ -512,7 +513,9 @@ DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::
     if (file.snapshot && file.handle != snapshot->handle) return ERROR_INVALID_PARAMETER;
     if (!transport) {
       if (file.fd >= 7000) return ERROR_NOT_SUPPORTED;
-      if (gesher::ValidateNativeFileDescription(snapshot) < 0) return errno_error();
+      auto reservation = std::make_unique<gesher::NativeFileDescriptionExport>();
+      if (reservation->Prepare(snapshot) < 0) return errno_error();
+      native_exports.push_back(std::move(reservation));
     }
     snapshots[static_cast<size_t>(file.fd)] = std::move(snapshot);
   }
@@ -634,6 +637,7 @@ DWORD SpawnWithFds(const Launch& launch, const wchar_t* environment, const std::
   BOOL started = CreateProcessW(launch.application.c_str(), command_line.data(), nullptr, nullptr, attributes ? TRUE : FALSE,
       flags, const_cast<wchar_t*>(environment), cwd.empty() ? nullptr : cwd.c_str(), &startup.StartupInfo, info);
   DWORD error = started ? ERROR_SUCCESS : GetLastError();
+  if (started) for (auto& reservation : native_exports) reservation->Commit();
   if (attributes) DeleteProcThreadAttributeList(attributes);
   return error;
 }

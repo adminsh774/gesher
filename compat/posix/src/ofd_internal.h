@@ -16,6 +16,11 @@ struct OpenFileDescription {
     uint64_t magic;
     uint32_t version;
     volatile LONG flags;
+    // Only runtime-created endpoints have an admission capability. This is
+    // immutable after publication and does not retain either pipe peer.
+    char pipe_gate[33];
+    volatile LONG pipe_native;
+    volatile LONG pipe_transition;
   };
   std::atomic<DescriptorKind> kind{DescriptorKind::kFile};
   std::atomic<int> local_flags{0};
@@ -24,12 +29,17 @@ struct OpenFileDescription {
   std::atomic<bool> initialized{false};
   std::atomic<Shared*> shared{nullptr};
   HANDLE mapping = nullptr;
+  HANDLE pipe_mutex = nullptr;
   std::mutex mutex;
   ~OpenFileDescription();
   int Flags() const;
   void SetFlags(int flags);
   HANDLE Share();  // caller holds mutex; borrowed handle, nullptr on error
   bool Adopt(HANDLE inherited);  // takes ownership only on success
+  bool OwnedPipe() const;
+  bool KnownPipeStatus() const;
+  void ExposePipe(bool exposed);
+  void PipeTransition(bool changing);
 };
 
 // Flags retained by Linux F_GETFL, excluding creation-only options.

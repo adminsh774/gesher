@@ -21,6 +21,11 @@ target_compile_options(ofd_spawn_test PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(ofd_spawn_test PRIVATE gesher_exec_spawn)
 add_dependencies(ofd_spawn_test ofd_native_child)
 
+add_executable(pipe_native_process_test ${CMAKE_SOURCE_DIR}/tests/native/pipe_native_process_test.cc)
+target_compile_options(pipe_native_process_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(pipe_native_process_test PRIVATE gesher_exec_spawn)
+add_dependencies(pipe_native_process_test ofd_native_child)
+
 add_executable(gesher-exec
   ${CMAKE_CURRENT_LIST_DIR}/gesher_exec.cc
   ${CMAKE_CURRENT_LIST_DIR}/spawn_actions.cc

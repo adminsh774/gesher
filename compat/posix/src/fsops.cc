@@ -642,7 +642,7 @@ FILE* fdopen(int fd, const char* mode) {
   if (!ParseMode(mode, &requested, crt_mode)) return errno = EINVAL, nullptr;
   auto snapshot = gesher::CaptureDescriptor(fd);
   if (!snapshot) return nullptr;
-  int actual = gesher::FileDescriptionFlags(snapshot);
+  int actual = gesher::FileDescriptionIoFlags(snapshot);
   if (actual < 0) return nullptr;
   int access = actual & O_ACCMODE;
   if (access != O_RDWR && access != (requested & O_ACCMODE)) return errno = EINVAL, nullptr;

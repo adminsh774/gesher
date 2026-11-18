@@ -592,7 +592,7 @@ off_t lseek(int fd, off_t offset, int whence) {
                   gesher::DeviceFromFd(fd, &device);
   }
   if (!snapshot) return -1;
-  const int flags = gesher::FileDescriptionFlags(snapshot);
+  const int flags = gesher::FileDescriptionIoFlags(snapshot);
   if (flags < 0) return -1;
   if ((flags & O_PATH) != 0) return errno = EBADF, -1;
   if (whence < SEEK_SET || whence > SEEK_HOLE) return errno = EINVAL, -1;
@@ -735,7 +735,7 @@ namespace gesher {
 int64_t WriteFileDescriptionAt(const DescriptorSnapshotPtr& snapshot, const void* bytes,
                               unsigned count, int64_t offset) {
   if (offset < 0) return errno = EINVAL, -1;
-  const int flags = FileDescriptionFlags(snapshot);
+  const int flags = FileDescriptionIoFlags(snapshot);
   if (flags < 0) return -1;
   if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_RDONLY) return errno = EBADF, -1;
   if (snapshot->kind != DescriptorKind::kFile || GetFileType(snapshot->handle) != FILE_TYPE_DISK)

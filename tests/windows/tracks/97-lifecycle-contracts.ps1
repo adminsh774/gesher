@@ -28,7 +28,9 @@ foreach ($fixture in @(
   @{ Exe = 'stdio_ofd_test.exe'; Markers = @('stdio OFD contracts:', ' checks, 0 failures');
      Label = 'shared stdio buffers, append flags, descriptor ownership and concurrent close' },
   @{ Exe = 'pipe_kernel_test.exe'; Markers = @('pipe kernel contracts:', ' checks, 0 failures');
-     Label = 'kernel pipe admission, cancellation, aliases and independent procfs reopening' },
+     Label = 'kernel pipe admission, cancellation, aliases and truthful unsupported operations' },
+  @{ Exe = 'pipe_native_process_test.exe'; Markers = @('pipe native process contracts:', ' checks, 0 failures');
+     Label = 'native peer lifetime, shared process admission and external sync/async pipe I/O' },
   @{ Exe = 'ofd_spawn_test.exe'; Markers = @('OFD Windows spawn:', ' checks, 0 failures');
      Label = 'actual importer discovery, shared file descriptions and native PE interoperability' },
   @{ Exe = 'media_input_surface_callback_test.exe'; Markers = @('input surface callback contracts:', ' checks, 0 failures');

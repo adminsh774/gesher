@@ -31,14 +31,33 @@ DescriptorSnapshotPtr CaptureFileHandle(HANDLE file);
 // A new descriptor alias with independent descriptor flags. The snapshot
 // retains its reference; the new slot owns an explicit native duplicate.
 int AttachFileDescription(const DescriptorSnapshotPtr& snapshot, bool close_on_exec);
-// Native inspection and mode changes can wait behind synchronous I/O. Call
-// these after releasing descriptor publication/registry locks; the snapshot
-// pins the exact object even when its original fd is closed or replaced.
+// Owned pipe status is cached with its actual kernel mode. Unmediated pipe
+// status may be unavailable; never query behind pending synchronous I/O.
 int FileDescriptionFlags(const DescriptorSnapshotPtr& snapshot);
 int SetFileDescriptionFlags(const DescriptorSnapshotPtr& snapshot, int flags);
+// For I/O admission only: retains exact access even if an external pipe's
+// wait policy is unknown. Do not use this to report F_GETFL status.
+int FileDescriptionIoFlags(const DescriptorSnapshotPtr& snapshot);
+// Call only for a freshly created, unpublished synchronous pipe endpoint.
+// Its access and wait mode are supplied by the creator, before any I/O.
+int InitializePipeDescription(const DescriptorSnapshotPtr& snapshot, int flags);
 // Native Windows programs do not import Gesher metadata. Reject descriptions
 // whose current behavior cannot be supplied by the inherited kernel handle.
 int ValidateNativeFileDescription(const DescriptorSnapshotPtr& snapshot);
+// Reserve the known pipe policy through CreateProcess. Failure rolls back;
+// success records that native code can now use/change the endpoint directly.
+class NativeFileDescriptionExport {
+ public:
+  NativeFileDescriptionExport() = default;
+  ~NativeFileDescriptionExport();
+  NativeFileDescriptionExport(const NativeFileDescriptionExport&) = delete;
+  NativeFileDescriptionExport& operator=(const NativeFileDescriptionExport&) = delete;
+  int Prepare(const DescriptorSnapshotPtr& snapshot);
+  void Commit() { committed_ = true; }
+ private:
+  std::shared_ptr<OpenFileDescription> description_;
+  bool committed_ = false;
+};
 // Raw-handle consumers such as the shell retain this snapshot and use the
 // same I/O policy as descriptor callers, including shared status and devices.
 int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count);
@@ -64,7 +83,7 @@ int InitializeInheritedFileDescriptions();
 
 namespace ofd_transfer {
 inline constexpr uint64_t kMagic = 0x3144464f52485347ull;  // GSHROFD1
-inline constexpr uint32_t kVersion = 1;
+inline constexpr uint32_t kVersion = 2;
 inline constexpr uint32_t kDescriptorLimit = 8192;
 struct Header {
   uint64_t magic;

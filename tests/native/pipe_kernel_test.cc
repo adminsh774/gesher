@@ -1,5 +1,6 @@
-// Public pipe contracts run unchanged against Linux and the Windows runtime.
+// Shared public pipe contracts plus explicit Windows capability failures.
 // Every potentially blocking phase has the test runner's process deadline.
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+#include <vector>
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
@@ -25,6 +27,20 @@ static void Check(const char* name, bool ok) {
 }
 static void Phase(const char* name) { std::printf("PIPE_KERNEL_PHASE %s\n", name); std::fflush(stdout); }
 static void Pause() { timespec delay{0, 1000000}; nanosleep(&delay, nullptr); }
+static void AwaitActive(int fd) {
+#ifdef _WIN32
+  bool active = false;
+  for (int retry = 0; retry != 2000 && !active; ++retry) {
+    pollfd descriptor{fd, POLLIN, 0};
+    active = poll(&descriptor, 1, 0) == -1 && errno == EOPNOTSUPP;
+    if (!active) Pause();
+  }
+  Check("owned operation reached pipe admission", active);
+#else
+  (void)fd;
+  for (int retry = 0; retry != 10; ++retry) Pause();
+#endif
+}
 
 struct RaceRead { int fd, result = -9, error = 0; std::atomic<bool>* start; };
 static void* ReadOnce(void* raw) {
@@ -89,6 +105,16 @@ static void Reopen() {
       Check("restore original nonblocking status", fcntl(ends[source], F_SETFL, O_NONBLOCK) == 0);
       char path[80]; std::snprintf(path, sizeof(path), "/proc/self/fd/%d", ends[source]);
       int opened = open(path, access | O_NONBLOCK | O_CLOEXEC);
+#ifdef _WIN32
+      Check("unsupported fresh pipe open reports an operation error", opened == -1 && errno == EOPNOTSUPP);
+      if (opened >= 0) close(opened);
+      Check("failed reopen preserves original and alias status", (fcntl(ends[source], F_GETFL) & O_NONBLOCK) != 0 &&
+            (fcntl(alias, F_GETFL) & O_NONBLOCK) != 0);
+      Check("failed reopen does not change descriptor flags", fcntl(ends[source], F_GETFD) == 0 && fcntl(alias, F_GETFD) == 0);
+      char byte = 0;
+      Check("failed reopen leaves the real byte queue usable", write(ends[1], "i", 1) == 1 && read(ends[0], &byte, 1) == 1 && byte == 'i');
+      Check("unsupported reopen without CLOEXEC fails too", open(path, access | O_NONBLOCK) == -1 && errno == EOPNOTSUPP);
+#else
       Check("procfs reopens pipe with requested access", opened >= 0 && (fcntl(opened, F_GETFL) & O_ACCMODE) == access);
       if (opened >= 0) {
         Check("procfs honors CLOEXEC", fcntl(opened, F_GETFD) == FD_CLOEXEC);
@@ -110,6 +136,7 @@ static void Reopen() {
       int inherited = open(path, access | O_NONBLOCK);
       Check("procfs does not invent CLOEXEC", inherited >= 0 && fcntl(inherited, F_GETFD) == 0);
       if (inherited >= 0) close(inherited);
+#endif
       close(alias); close(ends[0]); close(ends[1]);
     }
   }
@@ -123,26 +150,44 @@ static void Cancellation() {
   RaceRead alias_wait{ends[0], -9, 0, &start};
   pthread_t waiting;
   Check("alias-status reader starts", pthread_create(&waiting, nullptr, ReadOnce, &alias_wait) == 0);
-  for (int retry = 0; retry != 10; ++retry) Pause();
+  AwaitActive(ends[0]);
   Check("F_GETFL does not wait for blocked I/O", fcntl(ends[0], F_GETFL) >= 0);
+#ifdef _WIN32
+  Check("active mode transition fails without changing flags", fcntl(ends[0], F_SETFL, O_NONBLOCK) == -1 &&
+        errno == EOPNOTSUPP && (fcntl(ends[0], F_GETFL) & O_NONBLOCK) == 0);
+  pollfd busy{ends[0], POLLIN, 0};
+  Check("active zero-timeout poll returns an error without false readiness", poll(&busy, 1, 0) == -1 &&
+        errno == EOPNOTSUPP && busy.revents == 0);
+  int available = 919;
+  Check("active FIONREAD fails without manufacturing a count", ioctl(ends[0], FIONREAD, &available) == -1 &&
+        errno == EOPNOTSUPP && available == 919);
+#else
   Check("F_SETFL does not wait for blocked I/O", fcntl(ends[0], F_SETFL, O_NONBLOCK) == 0);
+#endif
   Check("peer can complete existing read", write(ends[1], "s", 1) == 1);
   Check("alias-status reader joins", pthread_join(waiting, nullptr) == 0);
+  Check("existing read delivered the real byte", alias_wait.result == 1);
+  Check("idle endpoint permits mode changes", fcntl(ends[0], F_SETFL, O_NONBLOCK) == 0);
   char spare;
   while (read(ends[0], &spare, 1) > 0) {}
   Check("blocking mode restored", fcntl(ends[0], F_SETFL, 0) == 0);
   Phase("repeated-cancellation-retirement");
 #ifdef _WIN32
-  DWORD handles_before = 0; GetProcessHandleCount(GetCurrentProcess(), &handles_before);
+  DWORD handles_before = 0;
 #endif
-  for (int iteration = 0; iteration != 16; ++iteration) {
+  for (int iteration = 0; iteration != 17; ++iteration) {
     RaceRead state{ends[0], -9, 0, &start};
     pthread_t caller;
     Check("blocking read caller starts", pthread_create(&caller, nullptr, ReadOnce, &state) == 0);
-    for (int retry = 0; retry != 10; ++retry) Pause();
+    AwaitActive(ends[0]);
     Check("blocking caller can be canceled", pthread_cancel(caller) == 0);
     void* result = nullptr;
     Check("canceled reader joins", pthread_join(caller, &result) == 0 && result == PTHREAD_CANCELED);
+#ifdef _WIN32
+    // Warm the shared Windows thread-pool infrastructure once; compare actual
+    // per-operation resources only after its first cancellation callback.
+    if (iteration == 0) GetProcessHandleCount(GetCurrentProcess(), &handles_before);
+#endif
   }
 #ifdef _WIN32
   DWORD handles_after = 0; GetProcessHandleCount(GetCurrentProcess(), &handles_after);
@@ -159,6 +204,72 @@ static void Cancellation() {
   if (replacement != old_slot) close(replacement);
   snapshot.reset();
 #endif
+  close(ends[0]); close(ends[1]);
+}
+
+struct FullWrite { int fd; const char* data; size_t size; ssize_t result = -1; };
+static void* WriteAll(void* raw) {
+  auto* state = static_cast<FullWrite*>(raw);
+  state->result = write(state->fd, state->data, state->size);
+  return nullptr;
+}
+static void BlockingCompletion() {
+  Phase("blocking-full-write-with-real-reader");
+  int ends[2]; Check("blocking writer fixture", pipe(ends) == 0);
+  std::vector<char> payload(65537, 'b');
+  FullWrite state{ends[1], payload.data(), payload.size()};
+  pthread_t writer;
+  Check("blocking writer starts", pthread_create(&writer, nullptr, WriteAll, &state) == 0);
+  char buffer[8192];
+  size_t total = 0;
+  bool contents = true;
+  while (total < payload.size()) {
+    ssize_t count = read(ends[0], buffer, std::min(sizeof(buffer), payload.size() - total));
+    if (count <= 0) break;
+    for (ssize_t i = 0; i < count; ++i) contents = contents && buffer[i] == 'b';
+    total += static_cast<size_t>(count);
+  }
+  Check("blocking write completes the whole real request", pthread_join(writer, nullptr) == 0 &&
+        state.result == static_cast<ssize_t>(payload.size()) && total == payload.size() && contents);
+#ifdef _WIN32
+  int available = 919;
+  Check("writer FIONREAD is unsupported instead of quota subtraction", ioctl(ends[1], FIONREAD, &available) == -1 &&
+        errno == EOPNOTSUPP && available == 919);
+#endif
+  close(ends[0]); close(ends[1]);
+}
+
+struct DisabledRead {
+  int fd;
+  std::atomic<bool> entered{false}, completed{false};
+  ssize_t result = -1;
+  char byte = 0;
+};
+static void* ReadWithCancellationDisabled(void* raw) {
+  auto* state = static_cast<DisabledRead*>(raw);
+  int previous;
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous);
+  state->entered.store(true);
+  state->result = read(state->fd, &state->byte, 1);
+  state->completed.store(true);
+  pthread_setcancelstate(previous, nullptr);
+  pthread_testcancel();
+  return nullptr;
+}
+static void DisabledCancellation() {
+  Phase("disabled-cancellation-preserves-I/O-and-pending-request");
+  int ends[2]; Check("disabled cancellation fixture", pipe(ends) == 0);
+  DisabledRead state{ends[0]};
+  pthread_t reader;
+  Check("disabled caller starts", pthread_create(&reader, nullptr, ReadWithCancellationDisabled, &state) == 0);
+  while (!state.entered.load()) Pause();
+  Check("disabled cancellation request is accepted", pthread_cancel(reader) == 0);
+  for (int retry = 0; retry != 10; ++retry) Pause();
+  Check("disabled cancellation did not end the read", !state.completed.load());
+  Check("real writer completes disabled read", write(ends[1], "d", 1) == 1);
+  void* result = nullptr;
+  Check("pending cancellation survives reenable", pthread_join(reader, &result) == 0 && result == PTHREAD_CANCELED &&
+        state.completed.load() && state.result == 1 && state.byte == 'd');
   close(ends[0]); close(ends[1]);
 }
 
@@ -209,7 +320,9 @@ int main() {
   NativeReopenEvidence();
 #endif
   Admission();
+  BlockingCompletion();
   Cancellation();
+  DisabledCancellation();
   Reopen();
   std::printf("pipe kernel contracts: %d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Execute production kernel-pipe operations at a declared Linux OS boundary.
 
-The boundary models Windows message-write error conventions using real Linux
-pipes, real blocking threads, signals, descriptor aliases and cancellation.
-It does not validate NPFS, CreateNamedPipe/UCRT inheritance, or ReOpenFile;
-the Windows pipe_kernel_test target is required for those contracts.
+The boundary models Windows message-write errors and thread-pool wait APIs
+using real Linux pipes, mutexes, blocking callers, signals and cancellation.
+It validates production admission, immediate paths and callback retirement,
+not NPFS, Windows cancellation delivery or actual thread-pool resource cost.
+The native Windows pipe component is required for those contracts.
 """
 import argparse
 import hashlib
@@ -23,7 +24,8 @@ def main():
     parser.add_argument('--sanitize', action='store_true')
     args = parser.parse_args()
     source = (ROOT / 'compat/posix/src/pipe_io.cc').read_text()
-    first, create, after = 'namespace gesher {', 'int CreatePipeDescriptors(', 'int TransferPipe('
+    first, create, after = ('namespace gesher {', 'int CreatePipeDescriptors(',
+                            'namespace {\nint TransferPipeBody(')
     if any(source.count(marker) != 1 for marker in (first, create, after)):
         raise ValueError('production pipe boundaries changed')
     implementation = source[source.index(first):source.index(create)] + source[source.index(after):]

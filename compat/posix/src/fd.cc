@@ -367,7 +367,7 @@ RetiredDescriptor::~RetiredDescriptor() {
   errno = saved;
 }
 int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count) {
-  const int flags = FileDescriptionFlags(snapshot);
+  const int flags = FileDescriptionIoFlags(snapshot);
   if (flags < 0) return -1;
   if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_WRONLY) return errno = EBADF, -1;
   if (snapshot->kind == DescriptorKind::kUnshareable) return errno = EOPNOTSUPP, -1;
@@ -376,12 +376,12 @@ int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsi
     return ReadDevice(snapshot->kind == DescriptorKind::kZero ? Device::kZero : Device::kRandom, bytes, count);
   }
   if (GetFileType(snapshot->handle) == FILE_TYPE_PIPE)
-    return TransferPipe(snapshot->handle, bytes, count, false);
+    return TransferPipe(snapshot, bytes, count, false);
   if (count == 0 && GetFileType(snapshot->handle) != FILE_TYPE_DISK) return 0;
   return TransferFileHandle(snapshot->handle, bytes, count, false, false);
 }
 int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* bytes, unsigned count) {
-  const int flags = FileDescriptionFlags(snapshot);
+  const int flags = FileDescriptionIoFlags(snapshot);
   if (flags < 0) return -1;
   if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_RDONLY) return errno = EBADF, -1;
   if (snapshot->kind == DescriptorKind::kUnshareable) return errno = EOPNOTSUPP, -1;
@@ -389,7 +389,7 @@ int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* byte
   if (snapshot->kind == DescriptorKind::kZero) return static_cast<int>(count);
   const bool append = (flags & O_APPEND) != 0 && GetFileType(snapshot->handle) == FILE_TYPE_DISK;
   int result = GetFileType(snapshot->handle) == FILE_TYPE_PIPE
-      ? TransferPipe(snapshot->handle, const_cast<void*>(bytes), count, true)
+      ? TransferPipe(snapshot, const_cast<void*>(bytes), count, true)
       : TransferFileHandle(snapshot->handle, const_cast<void*>(bytes), count, true, append);
   if (result > 0 && HasPollWaiters() && GetFileType(snapshot->handle) == FILE_TYPE_PIPE) WakePollers();
   return result;
@@ -591,7 +591,7 @@ constexpr short kOut = POLLOUT | POLLWRNORM;
 // Readiness of a non-socket fd: pipes are readable when data is buffered or
 // the writer is gone; files and other devices are always ready. Returns false
 // for a pipe that has nothing yet.
-bool PollFile(pollfd* p) {
+int PollFile(pollfd* p) {
   // The NUL fd reserves a number, but an epoll is readable only when its
   // interest list has a reportable event. It is never a writable file.
   if (gesher::PollEpoll(p->fd, p->events, &p->revents)) return p->revents != 0;
@@ -609,8 +609,8 @@ bool PollFile(pollfd* p) {
     }
     snapshot = gesher::CaptureDescriptor(p->fd);
   }
-  const int flags = snapshot ? gesher::FileDescriptionFlags(snapshot) : -1;
-  p->revents = flags < 0 ? POLLNVAL : gesher::PollPipeHandle(snapshot->handle, flags, p->events);
+  if (!snapshot) return -1;
+  if (gesher::PollPipeHandle(snapshot, p->events, &p->revents) < 0) return -1;
   return p->revents != 0;
 }
 
@@ -714,8 +714,10 @@ static int PollFdsImpl(pollfd* fds, nfds_t nfds, int timeout, HANDLE interrupt, 
                    ((p->events & POLLPRI) != 0 ? ws::kPollPri : 0);
       sockets.push_back({state.socket, events, 0, state.description});
       socket_index.push_back(i);
-    } else if (!PollFile(p)) {
-      waiting_files = true;
+    } else {
+      int result = PollFile(p);
+      if (result < 0) return -1;
+      if (!result) waiting_files = true;
     }
   }
   if (observer) observer(context);  // real snapshots held; no descriptor/table lock
@@ -835,7 +837,9 @@ static int PollFdsImpl(pollfd* fds, nfds_t nfds, int timeout, HANDLE interrupt, 
         if (p->fd < 0 || p->revents != 0 || LookupSocket(p->fd, &state) || LookupEventFd(p->fd)) {
           continue;
         }
-        if (!PollFile(p)) waiting_files = true;
+        int result = PollFile(p);
+        if (result < 0) return -1;
+        if (!result) waiting_files = true;
       }
     }
     ready = count_ready();

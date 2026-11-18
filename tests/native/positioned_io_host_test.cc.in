@@ -242,6 +242,10 @@ static int FileDescriptionFlags(const DescriptorSnapshotPtr& value) {
   if (before_status) before_status();
   return value ? ::fcntl(value->handle->fd, F_GETFL) : (errno = EBADF, -1);
 }
+static int FileDescriptionIoFlags(const DescriptorSnapshotPtr& value) {
+  // Linux exposes native access/status without a synchronous-pipe query.
+  return FileDescriptionFlags(value);
+}
 static bool IsBinderFd(int) { return false; }
 static bool LookupEventFd(int) { return false; }
 static bool PollEpoll(int, short, short*) { return false; }

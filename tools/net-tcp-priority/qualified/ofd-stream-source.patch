@@ -1,25 +1,25 @@
 diff --git a/compat/posix/src/fd.cc b/compat/posix/src/fd.cc
-index 7b426fd997..5d97d3b3d1 100644
 --- a/compat/posix/src/fd.cc
 +++ b/compat/posix/src/fd.cc
 @@ -11,0 +12 @@
 +#include <pthread.h>
-@@ -16,0 +18 @@
+@@ -17 +18,3 @@
+-
 +#include <gesher/file_description.h>
-@@ -17,0 +20 @@
++
 +#include <algorithm>
 @@ -25,0 +29 @@
 +#include "descriptor_resources.h"
 @@ -27,0 +32 @@
 +#include "pipe_io.h"
-@@ -81,4 +86,2 @@ bool ReplaceSocket(int fd, const SocketFd* source, SocketFd* previous, bool* las
+@@ -81,4 +86,2 @@
 -// /dev/zero and /dev/random fds (path.cc), also guarded by table_mutex.
 -std::unordered_map<int, Device> devices;
 -std::atomic<size_t> device_count{0};
 -
 +// Stateless logical devices live in the executable-owned description table,
 +// so all modules and explicitly inherited descriptors agree on their type.
-@@ -86,5 +89,3 @@ bool LookupDevice(int fd, Device* device) {
+@@ -86,5 +89,3 @@
 -  if (device_count.load(std::memory_order_acquire) == 0) return false;
 -  std::lock_guard<std::mutex> lock(table_mutex);
 -  auto it = devices.find(fd);
@@ -28,32 +28,32 @@ index 7b426fd997..5d97d3b3d1 100644
 +  DescriptorKind kind = GetDescriptorKind(fd);
 +  if (kind != DescriptorKind::kZero && kind != DescriptorKind::kRandom) return false;
 +  *device = kind == DescriptorKind::kZero ? Device::kZero : Device::kRandom;
-@@ -94,5 +95 @@ bool LookupDevice(int fd, Device* device) {
+@@ -94,5 +95 @@
 -void ForgetDevice(int fd) {
 -  if (device_count.load(std::memory_order_acquire) == 0) return;
 -  std::lock_guard<std::mutex> lock(table_mutex);
 -  if (devices.erase(fd) != 0) device_count.fetch_sub(1, std::memory_order_release);
 -}
 +void ForgetDevice(int) {}  // retiring the OFD retires its logical device kind
-@@ -100,0 +98,2 @@ int ReadDevice(Device device, void* buf, unsigned int count) {
+@@ -100,0 +98,2 @@
 +  if (count == 0) return 0;
 +  if (!buf) return errno = EFAULT, -1;
-@@ -118,0 +118,5 @@ int ReserveFd() {
+@@ -118,0 +118,5 @@
 +  else if (SetDescriptorKind(fd, DescriptorKind::kUnshareable) < 0) {
 +    int error = errno;
 +    _close(fd);
 +    return errno = error, -1;
 +  }
-@@ -140,0 +145 @@ int RegisterSocket(const SocketFd& state) {
+@@ -140,0 +145 @@
 +      ForgetOfd(fd);
-@@ -161,4 +166,2 @@ void RegisterDevice(int fd, Device device) {
+@@ -161,4 +166,2 @@
 -  std::lock_guard<std::mutex> lock(table_mutex);
 -  if (devices.insert_or_assign(fd, device).second) {
 -    device_count.fetch_add(1, std::memory_order_release);
 -  }
 +  // The OFD was allocated by FdFromHandle before this descriptor is published.
 +  SetDescriptorKind(fd, device == Device::kZero ? DescriptorKind::kZero : DescriptorKind::kRandom);
-@@ -174,0 +178,84 @@ namespace {
+@@ -174,0 +178,84 @@
 +void ReleaseCanceledSnapshot(void* raw) {
 +  static_cast<gesher::DescriptorSnapshotPtr*>(raw)->reset();
 +}
@@ -138,20 +138,20 @@ index 7b426fd997..5d97d3b3d1 100644
 +  return true;
 +}
 +
-@@ -187,0 +275,5 @@ int CloseFdBody(int fd, bool unpublished, SocketFd* deferred = nullptr) {
+@@ -187,0 +275,5 @@
 +    const int close_errno = errno;
 +    if (result == 0 || gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) {
 +      gesher::ForgetOfd(fd);
 +    }
 +    errno = close_errno;
-@@ -208 +300,5 @@ int CloseFdBody(int fd, bool unpublished, SocketFd* deferred = nullptr) {
+@@ -208 +300,5 @@
 -    if (unpublished && crt_closed < 0) return -1;
 +    const int crt_errno = errno;
 +    if (crt_closed == 0 || gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) {
 +      gesher::ForgetOfd(fd);
 +    }
 +    if (unpublished && crt_closed < 0) return errno = crt_errno, -1;
-@@ -238,0 +335,62 @@ int CloseUnpublishedDuplicate(int fd) {
+@@ -238,0 +335,62 @@
 +void RetiredDescriptor::Retire(int fd) {
 +  // CRT has released the old handle while its fd number is still protected
 +  // from participating reuse. Retire precisely the virtual owners belonging
@@ -187,7 +187,7 @@ index 7b426fd997..5d97d3b3d1 100644
 +  errno = saved;
 +}
 +int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count) {
-+  const int flags = FileDescriptionFlags(snapshot);
++  const int flags = FileDescriptionIoFlags(snapshot);
 +  if (flags < 0) return -1;
 +  if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_WRONLY) return errno = EBADF, -1;
 +  if (snapshot->kind == DescriptorKind::kUnshareable) return errno = EOPNOTSUPP, -1;
@@ -196,12 +196,12 @@ index 7b426fd997..5d97d3b3d1 100644
 +    return ReadDevice(snapshot->kind == DescriptorKind::kZero ? Device::kZero : Device::kRandom, bytes, count);
 +  }
 +  if (GetFileType(snapshot->handle) == FILE_TYPE_PIPE)
-+    return TransferPipe(snapshot->handle, bytes, count, false);
++    return TransferPipe(snapshot, bytes, count, false);
 +  if (count == 0 && GetFileType(snapshot->handle) != FILE_TYPE_DISK) return 0;
 +  return TransferFileHandle(snapshot->handle, bytes, count, false, false);
 +}
 +int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* bytes, unsigned count) {
-+  const int flags = FileDescriptionFlags(snapshot);
++  const int flags = FileDescriptionIoFlags(snapshot);
 +  if (flags < 0) return -1;
 +  if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_RDONLY) return errno = EBADF, -1;
 +  if (snapshot->kind == DescriptorKind::kUnshareable) return errno = EOPNOTSUPP, -1;
@@ -209,32 +209,32 @@ index 7b426fd997..5d97d3b3d1 100644
 +  if (snapshot->kind == DescriptorKind::kZero) return static_cast<int>(count);
 +  const bool append = (flags & O_APPEND) != 0 && GetFileType(snapshot->handle) == FILE_TYPE_DISK;
 +  int result = GetFileType(snapshot->handle) == FILE_TYPE_PIPE
-+      ? TransferPipe(snapshot->handle, const_cast<void*>(bytes), count, true)
++      ? TransferPipe(snapshot, const_cast<void*>(bytes), count, true)
 +      : TransferFileHandle(snapshot->handle, const_cast<void*>(bytes), count, true, append);
 +  if (result > 0 && HasPollWaiters() && GetFileType(snapshot->handle) == FILE_TYPE_PIPE) WakePollers();
 +  return result;
 +}
-@@ -257,0 +416,6 @@ int read(int fd, void* buf, unsigned int count) {
+@@ -257,0 +416,6 @@
 +    count = std::min(count, 0x7ffff000u);
 +    int result;
 +    if (NativeFileIo(fd, buf, count, false, &result) || NativePipeIo(fd, buf, count, false, &result)) return result;
 +    int flags = gesher::GetFileStatusFlags(fd);
 +    if (flags < 0) return -1;
 +    if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_WRONLY) return errno = EBADF, -1;
-@@ -260 +423,0 @@ int read(int fd, void* buf, unsigned int count) {
+@@ -260 +423,0 @@
 -    int result;
-@@ -270,0 +434 @@ int write(int fd, const void* buf, unsigned int count) {
+@@ -270,0 +434 @@
 +    count = std::min(count, 0x7ffff000u);
-@@ -271,0 +436,5 @@ int write(int fd, const void* buf, unsigned int count) {
+@@ -271,0 +436,5 @@
 +    if (NativeFileIo(fd, const_cast<void*>(buf), count, true, &result) ||
 +        NativePipeIo(fd, const_cast<void*>(buf), count, true, &result)) return result;
 +    int flags = gesher::GetFileStatusFlags(fd);
 +    if (flags < 0) return -1;
 +    if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_RDONLY) return errno = EBADF, -1;
-@@ -286,0 +456,2 @@ int dup(int fd) {
+@@ -286,0 +456,2 @@
 +  // Resolve/allocate the source description before publishing any new fd.
 +  if (!gesher::CaptureDescriptor(fd)) return -1;
-@@ -293,0 +465,11 @@ int dup(int fd) {
+@@ -293,0 +465,11 @@
 +    if (fd2 >= 0) {
 +      int error = gesher::DupOfd(fd, fd2) < 0 ? errno : 0;
 +      HANDLE h2 = gesher::HandleFromFd(fd2);
@@ -246,8 +246,11 @@ index 7b426fd997..5d97d3b3d1 100644
 +        return errno = error, -1;
 +      }
 +    }
-@@ -298 +480,7 @@ int dup(int fd) {
+@@ -298,4 +480,10 @@
 -  return gesher::RegisterSocket(state);
+-}
+-
+-int dup2(int fd, int fd2) {
 +  int fd2 = gesher::RegisterSocket(state);
 +  if (fd2 >= 0 && gesher::DupOfd(fd, fd2) < 0) {
 +    int error = errno;
@@ -255,18 +258,18 @@ index 7b426fd997..5d97d3b3d1 100644
 +    return errno = error, -1;
 +  }
 +  return fd2;
-@@ -301 +489 @@ int dup(int fd) {
--int dup2(int fd, int fd2) {
++}
++
 +static int DupTo(int fd, int fd2, bool cloexec) {
-@@ -307,2 +495,3 @@ int dup2(int fd, int fd2) {
+@@ -307,2 +495,3 @@
 -    if (fd == fd2) return _get_osfhandle(fd) != -1 ? fd : (errno = EBADF, -1);
 -    if (gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
 +    if (fd2 < 0 || fd2 >= 8192) return errno = EBADF, -1;
 +    if (fd == fd2) return gesher::HandleFromFd(fd) != INVALID_HANDLE_VALUE ? fd : (errno = EBADF, -1);
 +    if (!gesher::CaptureDescriptor(fd)) return -1;
-@@ -328,0 +518 @@ int dup2(int fd, int fd2) {
+@@ -328,0 +518 @@
 +    gesher::ForgetOfd(fd2);
-@@ -335,0 +526,10 @@ int dup2(int fd, int fd2) {
+@@ -335,0 +526,10 @@
 +    if (gesher::DupOfd(fd, fd2) < 0 && !metadata_error) metadata_error = errno;
 +    HANDLE h2 = gesher::HandleFromFd(fd2);
 +    if (h2 == INVALID_HANDLE_VALUE) {
@@ -277,15 +280,18 @@ index 7b426fd997..5d97d3b3d1 100644
 +      // Keep this inside the same descriptor transaction as replacement.
 +      if (!metadata_error) metadata_error = gesher::ErrnoFromWin32(GetLastError());
 +    }
-@@ -344,0 +545,7 @@ int dup2(int fd, int fd2) {
+@@ -342,0 +543,7 @@
++}
++
 +int dup2(int fd, int fd2) { return DupTo(fd, fd2, false); }
 +
 +int dup3(int oldfd, int newfd, int flags) {
 +  if (oldfd == newfd || (flags & ~O_CLOEXEC) != 0) return errno = EINVAL, -1;
 +  return DupTo(oldfd, newfd, (flags & O_CLOEXEC) != 0);
-+}
-+
-@@ -391,15 +598,13 @@ bool PollFile(pollfd* p) {
+@@ -387 +594 @@
+-bool PollFile(pollfd* p) {
++int PollFile(pollfd* p) {
+@@ -391,18 +598,17 @@
 -  HANDLE h = gesher::HandleFromFd(p->fd);
 -  if (h == INVALID_HANDLE_VALUE) {
 -    p->revents = POLLNVAL;
@@ -301,6 +307,9 @@ index 7b426fd997..5d97d3b3d1 100644
 -    // returns 0. (PeekNamedPipe fails the same way on a pipe's write end.)
 -    p->revents = POLLHUP | (p->events & kIn) | (p->events & kOut);
 -    return true;
+-  }
+-  p->revents = (avail > 0 ? p->events & kIn : 0) | (p->events & kOut);
+-  return (p->events & kIn) == 0 || avail > 0;
 +  gesher::DescriptorSnapshotPtr snapshot;
 +  {
 +    gesher::record_locks::DescriptorGuard guard;
@@ -314,42 +323,60 @@ index 7b426fd997..5d97d3b3d1 100644
 +      return true;
 +    }
 +    snapshot = gesher::CaptureDescriptor(p->fd);
-@@ -407,2 +612,3 @@ bool PollFile(pollfd* p) {
--  p->revents = (avail > 0 ? p->events & kIn : 0) | (p->events & kOut);
--  return (p->events & kIn) == 0 || avail > 0;
-+  const int flags = snapshot ? gesher::FileDescriptionFlags(snapshot) : -1;
-+  p->revents = flags < 0 ? POLLNVAL : gesher::PollPipeHandle(snapshot->handle, flags, p->events);
++  }
++  if (!snapshot) return -1;
++  if (gesher::PollPipeHandle(snapshot, p->events, &p->revents) < 0) return -1;
 +  return p->revents != 0;
+@@ -511,2 +717,4 @@
+-    } else if (!PollFile(p)) {
+-      waiting_files = true;
++    } else {
++      int result = PollFile(p);
++      if (result < 0) return -1;
++      if (!result) waiting_files = true;
+@@ -632 +840,3 @@
+-        if (!PollFile(p)) waiting_files = true;
++        int result = PollFile(p);
++        if (result < 0) return -1;
++        if (!result) waiting_files = true;
 diff --git a/compat/posix/src/system.cc b/compat/posix/src/system.cc
-index 6611cb2306..6c46453f93 100644
 --- a/compat/posix/src/system.cc
 +++ b/compat/posix/src/system.cc
-@@ -28,0 +29 @@
+@@ -29 +29,5 @@
+-
 +#include <gesher/file_description.h>
-@@ -29,0 +31,3 @@
++
 +#include <array>
 +#include <memory>
 +#include <new>
-@@ -394,2 +397,0 @@ int fcntl(int fd, int cmd, ...) {
+@@ -36,0 +41 @@
++#include "pipe_io.h"
+@@ -333,0 +339 @@
++    if (!argp && (request == FIONREAD || request == FIONBIO)) return errno = EFAULT, -1;
+@@ -350,2 +356,9 @@
 -  HANDLE h = gesher::HandleFromFd(fd);
 -  if (h == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
-@@ -405,16 +407,22 @@ int fcntl(int fd, int cmd, ...) {
++  auto snapshot = gesher::CaptureDescriptor(fd);
++  if (!snapshot) return -1;
++  HANDLE h = snapshot->handle;
++  if (!argp && (request == FIONREAD || request == FIONBIO)) return errno = EFAULT, -1;
++  if (request == FIONBIO && GetFileType(h) == FILE_TYPE_PIPE) {
++    int flags = gesher::FileDescriptionFlags(snapshot);
++    if (flags < 0) return -1;
++    return gesher::SetFileDescriptionFlags(snapshot, *argp ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
++  }
+@@ -355,4 +368 @@
+-      DWORD avail = 0;
+-      if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) avail = 0;  // writer gone
+-      *argp = static_cast<int>(avail > 0x7FFFFFFF ? 0x7FFFFFFF : avail);
+-      return 0;
++      return gesher::PipeBytesAvailable(snapshot, argp);
+@@ -394,2 +403,0 @@
+-  HANDLE h = gesher::HandleFromFd(fd);
+-  if (h == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
+@@ -405,2 +413,39 @@
 -  gesher::SocketFd state;
 -  if (gesher::LookupSocket(fd, &state)) {
--    switch (cmd) {
--      case F_GETFL:
--        return O_RDWR | (state.description->nonblocking.load() ? O_NONBLOCK : 0);
--      case F_SETFL:
--        {
--          gesher::record_locks::DescriptorGuard descriptor_guard;
--          gesher::SocketFd current;
--          if (!gesher::LookupSocket(fd, &current) || current.description != state.description) return errno = EBADF, -1;
--          std::lock_guard<std::mutex> lock(state.description->status_mutex);
--          const bool on = (arg & O_NONBLOCK) != 0;
--          if (on != state.description->nonblocking.load()) {
--            if (!state.description->native_nonblocking_datagram &&
--                gesher::ws::SetNonBlocking(state.socket, on) < 0) return -1;
--            state.description->nonblocking.store(on);
 +  gesher::DescriptorSnapshotPtr status_snapshot;
 +  {
 +    gesher::record_locks::DescriptorGuard descriptor_guard;
@@ -372,8 +399,7 @@ index 6611cb2306..6c46453f93 100644
 +                  gesher::ws::SetNonBlocking(state.socket, on) < 0) return -1;
 +              state.description->nonblocking.store(on);
 +            }
-@@ -422 +430,13 @@ int fcntl(int fd, int cmd, ...) {
--        }
++          }
 +          return 0;
 +        case F_GETFD:
 +          return FD_CLOEXEC;  // sockets are never inherited (winsock.cc)
@@ -387,24 +413,51 @@ index 6611cb2306..6c46453f93 100644
 +      if (cmd == F_GETFL) return O_RDWR | (gesher::IsNonBlocking(*e) ? O_NONBLOCK : 0);
 +      if (cmd == F_SETFL) {
 +        gesher::SetNonBlocking(*e, (arg & O_NONBLOCK) != 0);
-@@ -424,2 +444,8 @@ int fcntl(int fd, int cmd, ...) {
--      case F_GETFD:
--        return FD_CLOEXEC;  // sockets are never inherited (winsock.cc)
++        return 0;
 +      }
 +    }
-+    switch (cmd) {
+@@ -408,14 +453,9 @@
+-      case F_GETFL:
+-        return O_RDWR | (state.description->nonblocking.load() ? O_NONBLOCK : 0);
+-      case F_SETFL:
+-        {
+-          gesher::record_locks::DescriptorGuard descriptor_guard;
+-          gesher::SocketFd current;
+-          if (!gesher::LookupSocket(fd, &current) || current.description != state.description) return errno = EBADF, -1;
+-          std::lock_guard<std::mutex> lock(state.description->status_mutex);
+-          const bool on = (arg & O_NONBLOCK) != 0;
+-          if (on != state.description->nonblocking.load()) {
+-            if (!state.description->native_nonblocking_datagram &&
+-                gesher::ws::SetNonBlocking(state.socket, on) < 0) return -1;
+-            state.description->nonblocking.store(on);
+-          }
 +      case F_GETFD: {
 +        DWORD flags = 0;
 +        if (!GetHandleInformation(h, &flags)) return gesher::FailWithLastError();
 +        return (flags & HANDLE_FLAG_INHERIT) != 0 ? 0 : FD_CLOEXEC;
 +      }
-@@ -426,0 +453,4 @@ int fcntl(int fd, int cmd, ...) {
++      case F_SETFD:
 +        if (!SetHandleInformation(h, HANDLE_FLAG_INHERIT,
 +                                  (arg & FD_CLOEXEC) != 0 ? 0 : HANDLE_FLAG_INHERIT)) {
 +          return gesher::FailWithLastError();
-+        }
-@@ -428,21 +458,8 @@ int fcntl(int fd, int cmd, ...) {
--      default:
+@@ -424,4 +464,12 @@
+-      case F_GETFD:
+-        return FD_CLOEXEC;  // sockets are never inherited (winsock.cc)
+-      case F_SETFD:
+-        return 0;
++      case F_GETFL:
++      case F_SETFL:
++        status_snapshot = gesher::CaptureDescriptor(fd);
++        if (!status_snapshot) return -1;
++        break;
++      case F_DUPFD:
++      case F_DUPFD_CLOEXEC: {
++        return gesher::record_locks::DuplicateAtLeast(fd, static_cast<int>(arg), cmd == F_DUPFD_CLOEXEC);
++      }
++      case F_ADD_SEALS:
++      case F_GET_SEALS:
++        return 0;  // seals are advisory here
+@@ -429,36 +477,7 @@
 -        break;  // F_DUPFD and the rest below
 -    }
 -  }
@@ -425,15 +478,7 @@ index 6611cb2306..6c46453f93 100644
 -      if (!SetHandleInformation(h, HANDLE_FLAG_INHERIT,
 -                                (arg & FD_CLOEXEC) != 0 ? 0 : HANDLE_FLAG_INHERIT)) {
 -        return gesher::FailWithLastError();
-+      case F_GETFL:
-+      case F_SETFL:
-+        status_snapshot = gesher::CaptureDescriptor(fd);
-+        if (!status_snapshot) return -1;
-+        break;
-+      case F_DUPFD:
-+      case F_DUPFD_CLOEXEC: {
-+        return gesher::record_locks::DuplicateAtLeast(fd, static_cast<int>(arg), cmd == F_DUPFD_CLOEXEC);
-@@ -450,8 +467,5 @@ int fcntl(int fd, int cmd, ...) {
+-      }
 -      return 0;
 -    case F_GETFL:
 -      return O_RDWR;
@@ -442,23 +487,21 @@ index 6611cb2306..6c46453f93 100644
 -    case F_DUPFD:
 -    case F_DUPFD_CLOEXEC: {
 -      return gesher::record_locks::DuplicateAtLeast(fd, static_cast<int>(arg), cmd == F_DUPFD_CLOEXEC);
-+      case F_ADD_SEALS:
-+      case F_GET_SEALS:
-+        return 0;  // seals are advisory here
-+      default:
-+        return errno = EINVAL, -1;
-@@ -459,5 +472,0 @@ int fcntl(int fd, int cmd, ...) {
+-    }
 -    case F_ADD_SEALS:
 -    case F_GET_SEALS:
 -      return 0;  // seals are advisory here
 -    default:
 -      return errno = EINVAL, -1;
-@@ -464,0 +474,4 @@ int fcntl(int fd, int cmd, ...) {
+-  }
++        return errno = EINVAL, -1;
++    }
++  }
 +  // The snapshot retains the selected object and description across concurrent
 +  // close/dup2. Native mode operations must not hold the publication lock.
 +  return cmd == F_GETFL ? gesher::FileDescriptionFlags(status_snapshot)
 +                       : gesher::SetFileDescriptionFlags(status_snapshot, arg);
-@@ -583,0 +597,66 @@ bool BadVector(int fd, int iovcnt) {
+@@ -615,0 +635,66 @@
 +struct FileVectorTransfer {
 +  gesher::DescriptorSnapshotPtr snapshot;
 +  std::unique_ptr<unsigned char[]> allocated;
@@ -525,12 +568,12 @@ index 6611cb2306..6c46453f93 100644
 +  return true;
 +}
 +
-@@ -601,0 +681,2 @@ ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
+@@ -633,0 +719,2 @@
 +  ssize_t transferred = 0;
 +  if (FileWriteVector(fd, iov, iovcnt, false, 0, &transferred)) return transferred;
-@@ -652,0 +734 @@ ssize_t pwritev(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
+@@ -684,0 +772 @@
 +  if (FileWriteVector(fd, iov, iovcnt, true, offset, &total)) return total;
-@@ -739,0 +822,5 @@ int memfd_create(const char* name, unsigned int flags) {
+@@ -771,0 +860,5 @@
 +  else if (gesher::RegisterOfd(fd, O_RDWR | O_LARGEFILE) < 0) {
 +    int saved = errno;
 +    _close(fd);

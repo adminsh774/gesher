@@ -82,6 +82,9 @@ static DescriptorSnapshotPtr CaptureDescriptor(int fd) {
   if (duplicate < 0) return {};
   return DescriptorSnapshotPtr(new DescriptorSnapshot{duplicate});
 }
+static int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count) {
+  return static_cast<int>(::read(static_cast<int>(snapshot->handle), bytes, count));
+}
 static int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* bytes, unsigned count) {
   int result = static_cast<int>(::write(static_cast<int>(snapshot->handle), bytes, count));
   if (result > 0) {

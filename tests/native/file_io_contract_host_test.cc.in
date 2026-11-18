@@ -35,8 +35,9 @@ static bool HasPollWaiters() { return true; }
 static void WakePollers() { ++poll_wakes; }
 // Declared pipe boundary for this regular-file corpus. The complete pipe
 // implementation is executed separately by test_pipe_io_contracts.py.
-static int TransferPipe(HANDLE handle, void* bytes, unsigned count, bool writing) {
-  return static_cast<int>(writing ? ::write(handle->fd, bytes, count) : ::read(handle->fd, bytes, count));
+static int TransferPipe(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count, bool writing) {
+  return static_cast<int>(writing ? ::write(snapshot->handle->fd, bytes, count)
+                                 : ::read(snapshot->handle->fd, bytes, count));
 }
 }
 

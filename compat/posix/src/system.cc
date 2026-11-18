@@ -38,6 +38,7 @@
 #include "binder_internal.h"
 #include "event_internal.h"
 #include "internal.h"
+#include "pipe_io.h"
 #include "linux_socket.h"
 #include "record_lock_descriptors.h"
 #include "record_lock_duplicate.h"
@@ -335,6 +336,7 @@ int ioctl(int fd, unsigned long request, ...) {
   if (gesher::BinderIoctl(fd, request, argp, &binder_result)) return binder_result;
   gesher::SocketFd state;
   if (gesher::LookupSocket(fd, &state)) {
+    if (!argp && (request == FIONREAD || request == FIONBIO)) return errno = EFAULT, -1;
     if (request == FIONREAD) return gesher::ws::Available(state.socket, argp);
     int result;
     if (gesher::sock::InterfaceIoctl(request, argp, &result)) return result;
@@ -351,15 +353,19 @@ int ioctl(int fd, unsigned long request, ...) {
     }
     return errno = ENOTTY, -1;
   }
-  HANDLE h = gesher::HandleFromFd(fd);
-  if (h == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
+  auto snapshot = gesher::CaptureDescriptor(fd);
+  if (!snapshot) return -1;
+  HANDLE h = snapshot->handle;
+  if (!argp && (request == FIONREAD || request == FIONBIO)) return errno = EFAULT, -1;
+  if (request == FIONBIO && GetFileType(h) == FILE_TYPE_PIPE) {
+    int flags = gesher::FileDescriptionFlags(snapshot);
+    if (flags < 0) return -1;
+    return gesher::SetFileDescriptionFlags(snapshot, *argp ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
+  }
   if (request != FIONREAD) return errno = ENOTTY, -1;
   switch (GetFileType(h)) {
     case FILE_TYPE_PIPE: {
-      DWORD avail = 0;
-      if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) avail = 0;  // writer gone
-      *argp = static_cast<int>(avail > 0x7FFFFFFF ? 0x7FFFFFFF : avail);
-      return 0;
+      return gesher::PipeBytesAvailable(snapshot, argp);
     }
     case FILE_TYPE_DISK: {
       // Bytes from the current position to the end, as Linux reports.
@@ -514,7 +520,39 @@ int flock(int fd, int operation) {
   return 0;
 }
 
-int posix_fadvise(int, off_t, off_t, int) { return 0; }
+int posix_fadvise(int fd, off_t, off_t len, int advice) {
+  if (fd < 0) return EBADF;
+  const int saved_errno = errno;
+  const int result = [&]() -> int {
+    // Keep the CRT descriptor stable while inspecting its Win32 object.
+    gesher::record_locks::DescriptorGuard descriptor_guard;
+    HANDLE handle = gesher::HandleFromFd(fd);
+    // UCRT uses -2 for unbound standard streams. Do not inspect it as a
+    // Win32 handle, where the same value denotes the current thread.
+    if (handle == INVALID_HANDLE_VALUE || handle == reinterpret_cast<HANDLE>(intptr_t{-2})) return EBADF;
+    uint32_t access = 0;
+    const int access_error = gesher::record_locks::HandleAccess(handle, &access);
+    if (access_error) return access_error;
+    // O_PATH requests no data access for every object type, including NUL-backed
+    // character devices. Linux excludes these descriptors before type/range
+    // validation, so do not limit this check to ordinary disk files.
+    if ((access & (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA)) == 0) return EBADF;
+    SetLastError(ERROR_SUCCESS);
+    const DWORD kind = GetFileType(handle);
+    if (kind == FILE_TYPE_UNKNOWN) {
+      const DWORD error = GetLastError();
+      if (error != ERROR_SUCCESS) return gesher::ErrnoFromWin32(error);
+    }
+    if (kind == FILE_TYPE_PIPE) return ESPIPE;
+    if (len < 0 || advice < POSIX_FADV_NORMAL || advice > POSIX_FADV_NOREUSE) return EINVAL;
+    // Linux accepts signed offsets and even ranges whose end would overflow.
+    // Hints are nonbinding. Leave caching to Windows without touching data or
+    // the shared file offset, or issuing blocking I/O for a read-ahead hint.
+    return 0;
+  }();
+  errno = saved_errno;
+  return result;
+}
 
 int posix_fallocate(int fd, off_t offset, off_t len) {
   // Unlike fallocate, POSIX returns the error number and leaves errno alone.

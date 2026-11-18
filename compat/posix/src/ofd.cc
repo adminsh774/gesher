@@ -12,17 +12,37 @@
 #include <fcntl.h>
 #include <io.h>
 #include <winternl.h>
+#include <bcrypt.h>
 
 #include <array>
 #include <cstring>
 #include <new>
+#include <string>
 #include <unordered_map>
 
 namespace gesher {
 
 OpenFileDescription::~OpenFileDescription() {
+  if (pipe_mutex) CloseHandle(pipe_mutex);
   if (Shared* view = shared.load(std::memory_order_relaxed)) UnmapViewOfFile(view);
   if (mapping) CloseHandle(mapping);
+}
+
+bool OpenFileDescription::OwnedPipe() const {
+  auto* view = shared.load(std::memory_order_acquire);
+  return view && view->pipe_gate[0] != 0;
+}
+bool OpenFileDescription::KnownPipeStatus() const {
+  auto* view = shared.load(std::memory_order_acquire);
+  return view && view->pipe_gate[0] != 0 &&
+      InterlockedCompareExchange(&view->pipe_native, 0, 0) == 0 &&
+      InterlockedCompareExchange(&view->pipe_transition, 0, 0) == 0;
+}
+void OpenFileDescription::ExposePipe(bool exposed) {
+  InterlockedExchange(&shared.load(std::memory_order_acquire)->pipe_native, exposed ? 1 : 0);
+}
+void OpenFileDescription::PipeTransition(bool changing) {
+  InterlockedExchange(&shared.load(std::memory_order_acquire)->pipe_transition, changing ? 1 : 0);
 }
 
 int OpenFileDescription::Flags() const {
@@ -54,6 +74,7 @@ HANDLE OpenFileDescription::Share() {
     errno = ErrnoFromWin32(error);
     return nullptr;
   }
+  std::memset(view, 0, sizeof(*view));
   view->magic = ofd_transfer::kMagic;
   view->version = ofd_transfer::kVersion;
   InterlockedExchange(&view->flags, static_cast<LONG>(local_flags.load()));
@@ -71,15 +92,35 @@ bool OpenFileDescription::Adopt(HANDLE inherited) {
     errno = EINVAL;
     return false;
   }
+  HANDLE gate = nullptr;
+  if (view->pipe_gate[0]) {
+    bool valid = view->pipe_gate[32] == 0;
+    std::wstring name = L"Local\\gesher-pipe-";
+    for (unsigned i = 0; i != 32; ++i) {
+      char digit = view->pipe_gate[i];
+      valid = valid && ((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'));
+      name += static_cast<wchar_t>(digit);
+    }
+    if (!valid) { UnmapViewOfFile(view); errno = EINVAL; return false; }
+    gate = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, name.c_str());
+    if (!gate) {
+      DWORD error = GetLastError();
+      UnmapViewOfFile(view);
+      errno = ErrnoFromWin32(error);
+      return false;
+    }
+  }
   // A descendant receives another explicit duplicate. Never allow the private
   // bookkeeping handle to escape through an unrelated native process launch.
   if (!SetHandleInformation(inherited, HANDLE_FLAG_INHERIT, 0)) {
     DWORD error = GetLastError();
+    if (gate) CloseHandle(gate);
     UnmapViewOfFile(view);
     errno = ErrnoFromWin32(error);
     return false;
   }
   mapping = inherited;
+  pipe_mutex = gate;
   shared.store(view, std::memory_order_release);
   initialized.store(true, std::memory_order_release);
   return true;
@@ -141,7 +182,9 @@ int NativeFlags(HANDLE file) {
     if ((mode.Mode & FILE_WRITE_THROUGH) != 0) flags |= O_SYNC;
     if ((mode.Mode & FILE_NO_INTERMEDIATE_BUFFERING) != 0) flags |= O_DIRECT;
   }
-  return type == FILE_TYPE_PIPE ? PipeStatusFlags(file, flags) : flags;
+  // Pipe wait-mode queries serialize behind synchronous I/O. A raw external
+  // handle supplies actual access, but not an assumed O_NONBLOCK policy.
+  return flags;
 }
 
 int InitializeSnapshotFlags(const DescriptorSnapshotPtr& snapshot) {
@@ -545,8 +588,47 @@ int AttachFileDescription(const DescriptorSnapshotPtr& snapshot, bool close_on_e
 }
 int FileDescriptionFlags(const DescriptorSnapshotPtr& snapshot) {
   if (InitializeSnapshotFlags(snapshot) < 0) return -1;
+  if (GetFileType(snapshot->handle) == FILE_TYPE_PIPE && !snapshot->description->KnownPipeStatus())
+    return errno = EOPNOTSUPP, -1;
   const int flags = snapshot->description->Flags();
-  return GetFileType(snapshot->handle) == FILE_TYPE_PIPE ? PipeStatusFlags(snapshot->handle, flags) : flags;
+  if (GetFileType(snapshot->handle) == FILE_TYPE_PIPE && !snapshot->description->KnownPipeStatus())
+    return errno = EOPNOTSUPP, -1;
+  return flags;
+}
+int FileDescriptionIoFlags(const DescriptorSnapshotPtr& snapshot) {
+  return InitializeSnapshotFlags(snapshot) < 0 ? -1 : snapshot->description->Flags();
+}
+int InitializePipeDescription(const DescriptorSnapshotPtr& snapshot, int flags) try {
+  if (!snapshot || !snapshot->description || GetFileType(snapshot->handle) != FILE_TYPE_PIPE)
+    return errno = EINVAL, -1;
+  const int native = NativeFlags(snapshot->handle);
+  if (native < 0) return -1;
+  if (((native ^ flags) & (O_ACCMODE | O_PATH)) != 0) return errno = EINVAL, -1;
+  auto& description = *snapshot->description;
+  std::lock_guard<std::mutex> lock(description.mutex);
+  if (description.OwnedPipe()) return errno = EALREADY, -1;
+  unsigned char nonce[16];
+  if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, nonce, sizeof(nonce), BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+    return errno = EIO, -1;
+  char capability[33]{};
+  constexpr char hex[] = "0123456789abcdef";
+  std::wstring name = L"Local\\gesher-pipe-";
+  for (unsigned i = 0; i != 16; ++i) {
+    capability[2 * i] = hex[nonce[i] >> 4];
+    capability[2 * i + 1] = hex[nonce[i] & 15];
+    name += static_cast<wchar_t>(capability[2 * i]);
+    name += static_cast<wchar_t>(capability[2 * i + 1]);
+  }
+  HANDLE gate = CreateMutexW(nullptr, FALSE, name.c_str());
+  if (!gate) return FailWithLastError();
+  if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(gate); return errno = EEXIST, -1; }
+  if (!description.Share()) { const int error = errno; CloseHandle(gate); return errno = error, -1; }
+  description.SetFlags(flags & kOpenDescriptionFlagsMask);
+  description.pipe_mutex = gate;
+  std::memcpy(description.shared.load()->pipe_gate, capability, sizeof(capability));
+  return 0;
+} catch (const std::bad_alloc&) {
+  return errno = ENOMEM, -1;
 }
 int SetFileDescriptionFlags(const DescriptorSnapshotPtr& snapshot, int arg) {
   if (InitializeSnapshotFlags(snapshot) < 0) return -1;
@@ -556,6 +638,7 @@ int SetFileDescriptionFlags(const DescriptorSnapshotPtr& snapshot, int arg) {
   const int old_flags = description.Flags();
   if ((old_flags & O_PATH) != 0) return errno = EBADF, -1;
   const DWORD type = GetFileType(file);
+  if (type == FILE_TYPE_PIPE && !description.KnownPipeStatus()) return errno = EOPNOTSUPP, -1;
   // A raw native handle can already be unbuffered. Preserve that real mode;
   // this backend cannot change buffering on an existing FILE_OBJECT.
   if (((arg ^ old_flags) & O_DIRECT) != 0) return errno = EINVAL, -1;
@@ -572,23 +655,77 @@ int SetFileDescriptionFlags(const DescriptorSnapshotPtr& snapshot, int arg) {
   int flags = (old_flags & ~kModifiableStatusFlags) | (arg & kModifiableStatusFlags);
   // A normal Linux file has no fasync callback: this bit stays unchanged.
   if (type == FILE_TYPE_DISK) flags = (flags & ~O_ASYNC) | (old_flags & O_ASYNC);
-  if (type == FILE_TYPE_PIPE && SetPipeNonBlocking(file, (flags & O_NONBLOCK) != 0) < 0) return -1;
+  if (type == FILE_TYPE_PIPE && ((flags ^ old_flags) & O_NONBLOCK) != 0) {
+    // Never queue a mode query/change behind a pending synchronous transfer,
+    // including one in another runtime process. NPFS can also reject an idle
+    // transition while bytes remain buffered; retain the old flags on failure.
+    DWORD wait = WaitForSingleObject(description.pipe_mutex, 0);
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+      return wait == WAIT_TIMEOUT ? (errno = EOPNOTSUPP, -1) : FailWithLastError();
+    if (!description.KnownPipeStatus()) {
+      ReleaseMutex(description.pipe_mutex);
+      return errno = EOPNOTSUPP, -1;
+    }
+    description.PipeTransition(true);
+    int result = SetPipeNonBlocking(file, (flags & O_NONBLOCK) != 0);
+    const int error = errno;
+    if (result == 0) description.SetFlags(flags);
+    description.PipeTransition(false);
+    ReleaseMutex(description.pipe_mutex);
+    return result == 0 ? 0 : (errno = error, -1);
+  }
   description.SetFlags(flags);
   return 0;
 }
 int ValidateNativeFileDescription(const DescriptorSnapshotPtr& snapshot) {
-  int flags = FileDescriptionFlags(snapshot);
+  int flags = FileDescriptionIoFlags(snapshot);
   if (flags < 0) return -1;
   if (snapshot->kind != DescriptorKind::kFile) return errno = EOPNOTSUPP, -1;
   int native = NativeFlags(snapshot->handle);
   if (native < 0) return -1;
+  if (GetFileType(snapshot->handle) == FILE_TYPE_PIPE) {
+    if (((flags ^ native) & (O_ACCMODE | O_PATH)) != 0) return errno = EOPNOTSUPP, -1;
+    if (snapshot->description->KnownPipeStatus() && (flags & (O_NONBLOCK | O_ASYNC)) != 0)
+      return errno = EOPNOTSUPP, -1;
+    if (snapshot->description->OwnedPipe()) {
+      auto* shared = snapshot->description->shared.load(std::memory_order_acquire);
+      if (InterlockedCompareExchange(&shared->pipe_transition, 0, 0) != 0) return errno = EOPNOTSUPP, -1;
+    }
+    // An external handle is passed unchanged. No blocking policy or logical
+    // status is synthesized for a handle the runtime did not create.
+    return 0;
+  }
   // The Windows program will use the handle directly. There is no importer
   // to translate logical devices, access metadata or dynamically emulated
   // write/pipe policy on its behalf.
   constexpr int kernel_policy = O_ACCMODE | O_PATH | O_APPEND | O_DIRECT | O_SYNC | O_NOATIME;
   if (((flags ^ native) & kernel_policy) != 0) return errno = EOPNOTSUPP, -1;
-  if (GetFileType(snapshot->handle) == FILE_TYPE_PIPE && (flags & (O_NONBLOCK | O_ASYNC)) != 0)
-    return errno = EOPNOTSUPP, -1;
+  return 0;
+}
+
+NativeFileDescriptionExport::~NativeFileDescriptionExport() {
+  if (!description_) return;
+  if (!committed_) description_->ExposePipe(false);
+  ReleaseMutex(description_->pipe_mutex);
+}
+int NativeFileDescriptionExport::Prepare(const DescriptorSnapshotPtr& snapshot) {
+  if (description_) return errno = EINVAL, -1;
+  if (ValidateNativeFileDescription(snapshot) < 0) return -1;
+  auto& description = *snapshot->description;
+  if (!description.OwnedPipe() || !description.KnownPipeStatus()) return 0;
+  DWORD wait = WaitForSingleObject(description.pipe_mutex, 0);
+  if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+    return wait == WAIT_TIMEOUT ? (errno = EOPNOTSUPP, -1) : FailWithLastError();
+  if (ValidateNativeFileDescription(snapshot) < 0) {
+    ReleaseMutex(description.pipe_mutex);
+    return -1;
+  }
+  if (!description.KnownPipeStatus()) {
+    ReleaseMutex(description.pipe_mutex);
+    return 0;
+  }
+  description_ = snapshot->description;
+  description_->ExposePipe(true);
   return 0;
 }
 int CaptureDescriptors(std::vector<std::pair<int, DescriptorSnapshotPtr>>* out, bool include_close_on_exec) {

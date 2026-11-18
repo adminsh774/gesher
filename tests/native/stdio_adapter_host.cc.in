@@ -129,6 +129,9 @@ DescriptorSnapshotPtr CaptureDescriptor(int fd) try {
 int FileDescriptionFlags(const DescriptorSnapshotPtr& snapshot) {
   return fcntl(HandleFd(snapshot->handle), F_GETFL);
 }
+int FileDescriptionIoFlags(const DescriptorSnapshotPtr& snapshot) {
+  return FileDescriptionFlags(snapshot);
+}
 int SetFileDescriptionFlags(const DescriptorSnapshotPtr& snapshot, int flags) {
   return fcntl(HandleFd(snapshot->handle), F_SETFL, flags);
 }
