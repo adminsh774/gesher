@@ -220,3 +220,29 @@ gates. This increment does not change that PR, a runner allowlist, an approval
 rule or the immutable policy. Independent QA must review the exact integration
 base and implementation tree; a local host or Android pass does not replace the
 candidate's actual Windows ART result.
+
+## Standalone services harness repair (2026-11-18)
+
+The original-head Windows services run reached `WifiInfoContractTest` through
+standalone `dalvikvm` and failed at the unregistered native
+`SystemClock.elapsedRealtime`. The direct `main` entry now loads the production
+`android_runtime` library before invoking the corpus. Its `JNI_OnLoad` registers
+SystemClock and Parcel. Android's oracle entry remains `run(true)`, using the
+normal Android runtime bootstrap. No production implementation changes.
+
+The services job's sparse checkout also omitted the committed Android wire
+reference. The checkout now includes `docs/research`. A fresh sparse checkout
+using the old paths reproduces the absent required JSON; the updated paths
+materialize it. The strict nine-case evidence validator and its required check
+remain unchanged. Authentic Android output passes; six controls (missing case,
+duplicate case, wrong byte count, wrong digest, unknown case, and missing
+reference file) all fail.
+
+Fresh reference and isolated-candidate Android executions each pass **631
+checks**. All nine complete native Parcel case names, byte counts and SHA-256
+digests match each other and the committed reference. The
+[repair execution record](wifi-ci-repair-android-reference-2026-11-18.json)
+binds these observations to the fixture and production source hashes. The
+complete service fixture also compiles and D8 succeeds. These Android and build
+results do not execute the standalone Windows entry; both final-source Windows
+services jobs remain required before claiming the repaired harness passed.

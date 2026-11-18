@@ -378,5 +378,10 @@ public final class WifiInfoContractTest {
         addressesStatesAndMetering();vendorValues(nativeParcel);if(nativeParcel)parcels();
         System.out.println("WifiInfoContractTest all passed: "+checks+" checks; parcel="+nativeParcel);
     }
-    public static void main(String[] args) throws Exception { run(true); }
+    public static void main(String[] args) throws Exception {
+        // Standalone dalvikvm does not perform the normal AndroidRuntime bootstrap.
+        // Load the production registrations before the corpus calls SystemClock or Parcel.
+        System.loadLibrary("android_runtime");
+        run(true);
+    }
 }
