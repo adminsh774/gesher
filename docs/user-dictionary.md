@@ -67,6 +67,11 @@ ordinary ContentProviders/ContentProvider transport. Its database resides at
 This system-owned directory cannot collide with a previously installed APK's
 `data/<package>` directory or its ordinary uninstall cleanup.
 The holder uses the actual prepared framework context and resolver.
+It publishes the provider transport only after initialization completes. If
+`attachInfo` fails after installing a context, later acquisitions keep reporting
+the original initialization cause; that partially initialized instance is not
+reused. Any database helper allocated before the failure is closed. Recreating
+the runtime-owned provider after a system-server restart allows a fresh attempt.
 Before an application is bound, that context initializes the SDK feature cache
 from the available package manager's real feature catalog. Existing application
 feature caches are retained. Missing package service or failed Binder calls

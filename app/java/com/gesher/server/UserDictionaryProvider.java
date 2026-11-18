@@ -64,6 +64,8 @@ final class UserDictionaryProvider extends ContentProvider {
     private final CallerIdentity mCallers;
     private final PackageManagerService mPm;
     private final File mDatabase;
+    private boolean mInitialized;
+    private Throwable mInitializationFailure;
 
     UserDictionaryProvider(PackageManagerService pm, ActivityTaskManagerService atm) {
         this(pm, atm, new File(dataDirectory(), "databases/user_dict.db"));
@@ -153,7 +155,11 @@ final class UserDictionaryProvider extends ContentProvider {
     }
 
     synchronized ContentProviderHolder holder() {
-        if (getContext() == null) {
+        if (mInitializationFailure != null) {
+            throw new IllegalStateException("User dictionary provider initialization failed",
+                    mInitializationFailure);
+        }
+        if (!mInitialized) {
             Context system = android.app.GesherSettingsContext.get();
             // BackupManager obtains its owning package from this context. Database
             // access uses the absolute, device-private path below; the framework's
@@ -162,7 +168,23 @@ final class UserDictionaryProvider extends ContentProvider {
                 @Override public String getPackageName() { return PACKAGE; }
                 @Override public ApplicationInfo getApplicationInfo() { return applicationInfo(); }
             };
-            attachInfo(context, providerInfo());
+            try {
+                attachInfo(context, providerInfo());
+                mInitialized = true;
+            } catch (RuntimeException | Error failure) {
+                // attachInfo installs its context before invoking onCreate. It
+                // cannot initialize this instance again after a partial failure.
+                // Preserve that failure and never publish its unfinished transport.
+                mInitializationFailure = failure;
+                if (mOpenHelper != null) {
+                    try { mOpenHelper.close(); }
+                    catch (RuntimeException | Error cleanup) {
+                        if (cleanup != failure) failure.addSuppressed(cleanup);
+                    }
+                    mOpenHelper = null;
+                }
+                throw failure;
+            }
         }
         ContentProviderHolder holder = new ContentProviderHolder(providerInfo());
         holder.provider = getIContentProvider();

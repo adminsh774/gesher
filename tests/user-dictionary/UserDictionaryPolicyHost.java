@@ -6,6 +6,7 @@ import android.content.AttributionSource;
 import android.content.ContentProvider;
 import android.content.ContentProviderOperation;
 import android.content.ContentValues;
+import android.content.ContextWrapper;
 import android.content.OperationApplicationException;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
@@ -365,6 +366,51 @@ public final class UserDictionaryPolicyHost {
         }
     }
 
+    private static void initializationFailure(File directory) throws Exception {
+        Field context = field(android.app.GesherSettingsContext.class, "sContext");
+        Object previous = context.get(null);
+        File obstruction = new File(directory, "initialization-obstruction");
+        Files.writeString(obstruction.toPath(), "ordinary filesystem failure");
+        context.set(null, new ContextWrapper(null) {
+            @Override public Object getSystemService(String name) { return null; }
+            @Override public String getPackageName() { return "android"; }
+        });
+        try {
+            UserDictionaryProvider provider = new UserDictionaryProvider(null, null,
+                    new File(obstruction, "databases/user_dict.db"));
+            IllegalStateException original;
+            try {
+                provider.holder();
+                throw new AssertionError("Provider published after database-directory failure");
+            } catch (IllegalStateException expected) {
+                check(expected.getMessage().contains("Cannot create user dictionary"),
+                        "Initial acquisition preserves the actual initialization error");
+                original = expected;
+            }
+            check(provider.getContext() != null, "Real attachInfo installed context before onCreate failed");
+            check(field(UserDictionaryProvider.class, "mOpenHelper").get(provider) == null,
+                    "Failed initialization leaves no database helper");
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try {
+                    provider.holder();
+                    throw new AssertionError("Partially attached provider was published on retry");
+                } catch (IllegalStateException expected) {
+                    check(expected.getCause() == original, "Retry preserves the original failure cause");
+                }
+            }
+            Files.delete(obstruction.toPath());
+            try {
+                provider.holder();
+                throw new AssertionError("Removing obstruction reused an irreversibly failed instance");
+            } catch (IllegalStateException expected) {
+                check(expected.getCause() == original, "Failed instance stays unavailable until recreated");
+            }
+        } finally {
+            context.set(null, previous);
+            Files.deleteIfExists(obstruction.toPath());
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         System.load(args[0]);
         unsafe = (Unsafe)field(Unsafe.class, "theUnsafe").get(null);
@@ -393,6 +439,7 @@ public final class UserDictionaryPolicyHost {
             metadata(new PackageManagerService(Collections.emptyList(), false));
             authenticatedCallers(directory);
             manifestAdmission(directory);
+            initializationFailure(directory);
             System.out.println("UserDictionaryPolicyHost all passed: " + checks + " checks");
         } finally { directory.delete(); }
     }
