@@ -752,3 +752,21 @@ tests/dex-services `SettingsIntentsTest` (tests/windows/tracks/95-browser.ps1).
   drive, ADR 0010) are the graphics track's.
 - Local builds: WinLibs g++ warns (`-Warray-bounds` false positives in
   vector inserts) where clang does not; CI uses llvm-mingw.
+
+### Detached native document and chooser overlap
+
+A detached no-result document picker or intent chooser captures the focused task
+even if another native request already covers that task. Focus discovery and
+eligibility to resume are separate: each admitted window owns coverage until its
+real worker completes. The final covering completion alone can resume the source.
+The original caller/process still owns document and intent chooser cancellation;
+retirement does not release a busy reservation before the native call returns.
+
+`DetachedNativeUiContractTest` exercises both document-first and chooser-first
+admission. An attached first request overlaps a detached `NEW_TASK` request;
+closing the first must leave the source paused and the second busy, then the
+last completion resumes once and delivers only the attached result. The same
+new probe fails both orders on published `b03805d8ea701061e73836d45f26549201c0178a`.
+The host runner and Windows track 94 register this regression alongside the
+existing SAF, durable-grant and restart contracts. Host user-input/process
+fixtures do not establish Windows UI, ART or remote Binder behavior.

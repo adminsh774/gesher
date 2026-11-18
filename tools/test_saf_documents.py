@@ -38,7 +38,8 @@ def main():
                    ("DocumentsStorageProvider", "DocumentPicker", "WindowsHost", "ContentProviders",
                     "ActivityManagerService", "ActivityTaskManagerService", "PackageManagerService")]
         sources += [ROOT / "tests/dex-services/gesher/services/SafDocumentsContractTest.java",
-                    ROOT / "tests/saf/SafDocumentsHost.java"]
+                    ROOT / "tests/saf/SafDocumentsHost.java",
+                    ROOT / "tests/dex-services/gesher/services/DetachedNativeUiContractTest.java"]
         subprocess.run([str(args.java_home / "bin/javac"), "-encoding", "UTF-8", "-source", "17",
                         "-target", "17", "-cp", cp, "-d", str(classes), *map(str, sources)], check=True)
         environment = os.environ.copy()
@@ -58,6 +59,8 @@ def main():
                         "-Djava.io.tmpdir=" + str(work),
                         "-cp", str(classes) + os.pathsep + cp, "SafDocumentsHost", str(library)]
         subprocess.run(command, env=environment, check=True, timeout=90)
+        detached = command[:-2] + ["gesher.services.DetachedNativeUiContractTest", str(library)]
+        subprocess.run(detached, env=environment, check=True, timeout=45)
         restart = work / "restart"
         restart.mkdir()
         for phase in ("write", "read", "released"):

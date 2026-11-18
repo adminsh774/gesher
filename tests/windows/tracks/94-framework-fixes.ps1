@@ -361,6 +361,13 @@ try {
     $global:LASTEXITCODE = $safCode
     $safOut
   } @('SafDocumentsContractTest passed:', 'nativeFiles=true')
+  $detachedUiOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+    'DetachedNativeUiContractTest') 45
+  $detachedUiCode = $LASTEXITCODE
+  Check 'services: detached document and chooser retain focused-task coverage' {
+    $global:LASTEXITCODE = $detachedUiCode
+    $detachedUiOut
+  } @('DetachedNativeUiContractTest passed:')
   foreach ($safPhase in @('write', 'read', 'released')) {
     $safRestartOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
       'SafDocumentsContractTest' + $safPhase + (NoDrive $safRestart)) 45
