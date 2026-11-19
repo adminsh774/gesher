@@ -594,7 +594,9 @@ public final class NsdManager {
         Objects.requireNonNull(listener, "listener cannot be null");
         synchronized (mDiscoveries) {
             Discovery discovery = mDiscoveries.get(listener);
-            if (discovery == null || discovery.stopPending) throw new IllegalArgumentException("listener not registered");
+            if (discovery == null) throw new IllegalArgumentException("listener not registered");
+            // Registration remains live until the terminal event is dispatched.
+            if (discovery.stopPending) return;
             discovery.stopPending = true;
             if (discovery.session != null) discovery.session.stop();
         }
@@ -665,7 +667,9 @@ public final class NsdManager {
         Objects.requireNonNull(listener, "listener cannot be null");
         synchronized (mDiscoveries) {
             Resolution resolution = mResolutions.get(listener);
-            if (resolution == null || resolution.stopPending) throw new IllegalArgumentException("listener not registered");
+            if (resolution == null) throw new IllegalArgumentException("listener not registered");
+            // Coalesce cancellation while the listener is still registered.
+            if (resolution.stopPending) return;
             resolution.stopPending = true;
             if (resolution.session != null) resolution.session.stop();
         }

@@ -17,6 +17,7 @@ import struct
 import time
 
 from resolver_peer import asks_owned, name, records, response, rr
+from peer_scope import bind_windows_multicast
 
 INSTANCE = 'Owned.שלום\\😀'
 TYPE = '_grsubscription._tcp'
@@ -54,8 +55,13 @@ def serve(args):
             family, '127.0.0.1' if args.family == 4 else '::1'):
         raise ValueError('host transport is explicitly loopback-only')
     args.control.mkdir(parents=True, exist_ok=False)
-    sock = socket.socket(family, socket.SOCK_DGRAM)
-    tcp = socket.socket(family, socket.SOCK_STREAM)
+    # Own both sockets throughout setup, including a rejected receive guard.
+    with socket.socket(family, socket.SOCK_STREAM) as tcp, \
+            socket.socket(family, socket.SOCK_DGRAM) as sock:
+        run_peer(args, tcp, sock, address, local)
+
+
+def run_peer(args, tcp, sock, address, local):
     tcp.bind(local)
     tcp.listen(1)
     port = tcp.getsockname()[1]
@@ -65,7 +71,7 @@ def serve(args):
     else:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if args.family == 4:
-            sock.bind(('', 5353))
+            bind_windows_multicast(sock, args.family, args.index)
             ip = socket.inet_aton(address)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, ip)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
@@ -75,7 +81,7 @@ def serve(args):
             multicast = ('224.0.0.251', 5353)
         else:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            sock.bind(('::', 5353))
+            bind_windows_multicast(sock, args.family, args.index)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, args.index)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_LOOP, 1)
@@ -128,8 +134,6 @@ def serve(args):
                 sock.sendto(packets[mode], destination)
                 sent += 1
     finally:
-        sock.close()
-        tcp.close()
         (args.control / 'result.json').write_text(json.dumps({**metadata, 'ownedQueries': queries,
                 'sentPackets': sent, 'tcpConnections': connections}, indent=2) + '\n')
 

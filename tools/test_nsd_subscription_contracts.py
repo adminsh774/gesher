@@ -53,7 +53,7 @@ def main():
     fixtures += [ROOT / 'tests/nsd/NsdRegistrationServiceHost.java']
     sources = [p for p in (ROOT / 'app/java').rglob('*.java') if '/com/google/' not in str(p)]
     sources += fixtures + [Path(__file__), ROOT / 'tests/nsd/subscription_peer.py',
-                           ROOT / 'tests/nsd/resolver_peer.py']
+                           ROOT / 'tests/nsd/resolver_peer.py', ROOT / 'tests/nsd/peer_scope.py']
     source_hashes = {str(path): sha(path) for path in sources}
     class_hashes = {str(path): sha(path) for path in args.app_classes.rglob('*.class')}
     (out / 'initial-source-hashes.json').write_text(json.dumps(source_hashes, indent=2) + '\n')
