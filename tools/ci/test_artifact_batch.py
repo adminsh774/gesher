@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -329,11 +330,11 @@ class ArtifactBatch(unittest.TestCase):
 
 
 
-class CommittedBatchManifests(ArtifactBatch):
-    """Every committed CI batch manifest runs through the real batch path."""
     def _complete(self, manifest):
+        """Run a committed CI manifest through the real batch path."""
+        self.doCleanups()
         self.MANIFEST = manifest
-        self.tearDown(); self.doCleanups(); self.setUp()
+        self.setUp()
         self.execute()
         count = len(self.specs)
         # One run + two job pages + one artifact page, twice, plus one zip per member.
@@ -356,27 +357,55 @@ class BatchManifestWiring(unittest.TestCase):
     JOBS = {'test-shards': ('tools/ci/test_shard_artifacts.json', 'ci-suppliers/core'),
             'web3-query-regression': ('tools/ci/web3_query_artifacts.json', 'ci-suppliers/web3'),
             'package': ('tools/ci/package_artifacts.json', 'ci-suppliers/package')}
+    # YAML removes the block indentation of `run: |`.
+    ASSEMBLE = ('  python tools/surface/assemble-artifacts.py --source "{destination}/artifacts/$owner" '
+                '--destination dist --ledger ci-owners.json --owner $owner\n'
+                '  if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}\n')
+
+    def setUp(self):
+        import yaml
+        self.yaml = yaml
+        self.workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'))
+
+    def producer_exists(self, producer):
+        """`job` is a ci job; `caller / job` is a job inside the reusable workflow `caller` calls."""
+        caller, _, inner = producer.partition(' / ')
+        job = self.workflow['jobs'][caller]
+        if not inner:
+            return 'uses' not in job
+        uses = job.get('uses', '')
+        pinned = re.fullmatch(r'gesher-runtime/gesher/(\.github/workflows/[\w.-]+)@([0-9a-f]{40})', uses)
+        if uses.startswith('./.github/workflows/'):
+            text = (ROOT / uses[2:]).read_text(encoding='utf-8')
+        elif pinned:
+            # A reusable workflow pinned to an exact commit of this repository.
+            text = subprocess.check_output(['git', 'show', f'{pinned[2]}:{pinned[1]}'], cwd=ROOT, text=True)
+        else:
+            return False
+        called = self.yaml.safe_load(text)
+        return any(key == inner or value.get('name') == inner for key, value in called['jobs'].items())
 
     def test_jobs_use_their_manifest_and_assemble_every_member_from_the_batch(self):
-        import yaml
-        workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'))
         for job_name, (manifest, destination) in self.JOBS.items():
             with self.subTest(job=job_name):
-                job = workflow['jobs'][job_name]
+                job = self.workflow['jobs'][job_name]
                 runs = chr(10).join(str(step.get('run', '')) for step in job['steps'])
-                raw = (ROOT / manifest).read_text(encoding='utf-8')
-                specs = receipt.batch_manifest(raw)
+                specs = receipt.batch_manifest((ROOT / manifest).read_text(encoding='utf-8'))
                 self.assertIn(f'artifact_receipt.py --batch {manifest} --destination {destination}', runs)
-                needs = set(job['needs'])
                 for spec in specs:
-                    self.assertIn(spec['producer'].split(' / ', 1)[0], needs, spec)
-                if job_name != 'test-shards':
-                    # Single receipts for batch members would repeat the API reads.
-                    for spec in specs:
-                        self.assertNotIn(f"--name {spec['name']} ", runs)
-                    for spec in specs:
-                        self.assertIn(f"'{spec['destination']}'", runs)
-                    self.assertIn(f'--source "{destination}/artifacts/$owner"', runs)
+                    self.assertIn(spec['producer'].split(' / ', 1)[0], set(job['needs']), spec)
+                    self.assertTrue(self.producer_exists(spec['producer']), spec)
+                if job_name == 'test-shards':
+                    continue
+                # Single receipts for batch members would repeat the API reads.
+                for spec in specs:
+                    self.assertNotIn(f"--name {spec['name']} ", runs)
+                # Assembly order decides collisions: it must be the manifest order,
+                # and each iteration must stop on a failed assembly.
+                owners = ', '.join("'" + spec['destination'] + "'" for spec in specs)
+                loop = (f'foreach ($owner in {owners}) {{\n' +
+                        self.ASSEMBLE.format(destination=destination) + '}\n')
+                self.assertIn(loop, runs)
 
 
 if __name__ == '__main__':
