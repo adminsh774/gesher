@@ -2057,36 +2057,29 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-      - name: Verify and assemble windows-x64 for ordinary Binder regression
+      - name: Verify and stage the complete ordinary Binder supplier batch
         shell: pwsh
         run: |
-          python tools/ci/artifact_receipt.py --name windows-x64 --producer "build" --destination ci-suppliers/windows_x64
+          python tools/ci/artifact_receipt.py --batch tools/ci/binder2_sg_artifacts.json --destination ci-suppliers/binder2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/surface/assemble-artifacts.py --source ci-suppliers/windows_x64 --destination dist --ledger binder-full-owners.json --owner windows_x64
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify and assemble framework for ordinary Binder regression
+      - name: Assemble the verified product suppliers for ordinary Binder regression
         shell: pwsh
         run: |
-          python tools/ci/artifact_receipt.py --name framework --producer "framework / framework" --destination ci-suppliers/framework
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/surface/assemble-artifacts.py --source ci-suppliers/framework --destination dist --ledger binder-full-owners.json --owner framework
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify and assemble arm64 for ordinary Binder regression
+          foreach ($owner in 'windows_x64', 'framework', 'arm64') {
+            python tools/surface/assemble-artifacts.py --source "ci-suppliers/binder2/artifacts/$owner" --destination dist --ledger binder-full-owners.json --owner $owner
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      # The isolated suppliers stay outside dist at the paths their verifiers
+      # and the runner read. Each is moved whole from the verified batch.
+      - name: Place the verified isolated host, modes and boot-image suppliers
         shell: pwsh
         run: |
-          python tools/ci/artifact_receipt.py --name arm64 --producer "arm64 / build" --destination ci-suppliers/arm64
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/surface/assemble-artifacts.py --source ci-suppliers/arm64 --destination dist --ledger binder-full-owners.json --owner arm64
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Verify isolated binder2-sg-host ordinary supplier
-        shell: pwsh
-        run: python tools/ci/artifact_receipt.py --name binder2-sg-host --producer "build" --destination ci-suppliers/binder2_sg_host
-      - name: Verify isolated binder2-sg-modes ordinary supplier
-        shell: pwsh
-        run: python tools/ci/artifact_receipt.py --name binder2-sg-modes --producer "binder2-sg-fixtures / modes-build" --destination fixtures
-      - name: Verify isolated boot-image ordinary supplier
-        shell: pwsh
-        run: python tools/ci/artifact_receipt.py --name boot-image --producer "boot-image / compile" --destination boot-image
+          $ErrorActionPreference = 'Stop'
+          foreach ($pair in @(@('binder2_sg_host', 'ci-suppliers/binder2_sg_host'), @('binder2_sg_modes', 'fixtures'),
+                              @('boot_image', 'boot-image'))) {
+            if (Test-Path -LiteralPath $pair[1]) { throw "Isolated supplier destination already exists: $($pair[1])" }
+            Move-Item -LiteralPath "ci-suppliers/binder2/artifacts/$($pair[0])" -Destination $pair[1]
+          }
       - name: Verify isolated ordinary actor role and current production binding
         shell: pwsh
         run: |

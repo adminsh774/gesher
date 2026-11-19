@@ -352,15 +352,24 @@ class ArtifactBatch(unittest.TestCase):
     def test_package_batch_replaces_seven_single_receipts(self):
         self._complete('tools/ci/package_artifacts.json')
 
+    def test_binder2_batch_replaces_six_single_receipts(self):
+        self._complete('tools/ci/binder2_sg_artifacts.json')
+
 
 class BatchManifestWiring(unittest.TestCase):
     """Each batch job downloads exactly its committed manifest from producers it waits for."""
     JOBS = {'test-shards': ('tools/ci/test_shard_artifacts.json', 'ci-suppliers/core'),
             'web3-query-regression': ('tools/ci/web3_query_artifacts.json', 'ci-suppliers/web3'),
-            'package': ('tools/ci/package_artifacts.json', 'ci-suppliers/package')}
+            'package': ('tools/ci/package_artifacts.json', 'ci-suppliers/package'),
+            'binder2-sg-regression': ('tools/ci/binder2_sg_artifacts.json', 'ci-suppliers/binder2')}
+    # How many leading members are assembled into dist, and their ledger.
+    # The remaining members are placed whole at the paths their consumers read.
+    ASSEMBLED = {'binder2-sg-regression': (3, 'binder-full-owners.json')}
+    PLACED = {'binder2-sg-regression': {'binder2_sg_host': 'ci-suppliers/binder2_sg_host',
+                                        'binder2_sg_modes': 'fixtures', 'boot_image': 'boot-image'}}
     # YAML removes the block indentation of `run: |`.
     ASSEMBLE = ('  python tools/surface/assemble-artifacts.py --source "{destination}/artifacts/$owner" '
-                '--destination dist --ledger ci-owners.json --owner $owner\n'
+                '--destination dist --ledger {ledger} --owner $owner\n'
                 '  if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}\n')
 
     def setUp(self):
@@ -403,10 +412,19 @@ class BatchManifestWiring(unittest.TestCase):
                     self.assertNotIn(f"--name {spec['name']} ", runs)
                 # Assembly order decides collisions: it must be the manifest order,
                 # and each iteration must stop on a failed assembly.
-                owners = ', '.join("'" + spec['destination'] + "'" for spec in specs)
+                count, ledger = self.ASSEMBLED.get(job_name, (len(specs), 'ci-owners.json'))
+                owners = ', '.join("'" + spec['destination'] + "'" for spec in specs[:count])
                 loop = (f'foreach ($owner in {owners}) {{\n' +
-                        self.ASSEMBLE.format(destination=destination) + '}\n')
+                        self.ASSEMBLE.format(destination=destination, ledger=ledger) + '}\n')
                 self.assertIn(loop, runs)
+                placed = self.PLACED.get(job_name, {})
+                self.assertEqual(set(placed), {spec['destination'] for spec in specs[count:]})
+                for member, target in placed.items():
+                    self.assertIn(f"@('{member}', '{target}')", runs)
+                if placed:
+                    self.assertIn('Move-Item -LiteralPath "' + destination +
+                                  '/artifacts/$($pair[0])" -Destination $pair[1]', runs)
+                    self.assertIn('if (Test-Path -LiteralPath $pair[1]) { throw', runs)
 
 
 if __name__ == '__main__':
