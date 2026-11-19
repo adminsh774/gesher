@@ -725,7 +725,8 @@ jobs:
       matrix:
         os: [windows-2022, windows-2025]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 8
+    # +15 minutes: a quota-exhausted GitHub read may wait up to 15 minutes for reset.
+    timeout-minutes: 23
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -2254,7 +2255,8 @@ jobs:
   supplier-correlation:
     needs: [source-identity, build, compile]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # +15 minutes: a quota-exhausted GitHub read may wait up to 15 minutes for reset.
+    timeout-minutes: 25
     env:
       GH_TOKEN: ${{ github.token }}
       TCP_SUPPLIER_ROLE: selected-minimum
