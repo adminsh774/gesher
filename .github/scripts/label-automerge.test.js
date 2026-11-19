@@ -972,3 +972,33 @@ test('schedule isolates a failing PR from the rest', async () => {
   assert.ok(w.warnings.some(s => s.startsWith('#8: PR 8 unavailable')));
   assert.equal(lastStatus(w, appStatus.STATUS).state, 'success');
 });
+
+test('a schedule payload without a repository still requires the Gesher App', async () => {
+  const w = world({envRepositoryId: 1426153186}); w.noRepositoryPayload = true;
+  await assert.rejects(w.sweep(), /Gesher GitHub App is required/);
+  assert.deepEqual(w.calls, []);
+});
+
+test('schedule rechecks a failure gate after a transient error and releases a valid PR', async () => {
+  const w = appStatusWorld();
+  w.statuses.unshift({id: w.nextStatusId++, context: appStatus.APP_STATUS, state: 'failure'});
+  await w.sweep();
+  bothStates(w, 'success');
+});
+
+test('schedule keeps an invalid label failed', async () => {
+  const w = world({approved: false}); w.permission = 'read';
+  w.statuses.unshift({id: w.nextStatusId++, context: appStatus.STATUS, state: 'failure'});
+  await w.sweep();
+  assert.equal(lastStatus(w, appStatus.STATUS).state, 'failure');
+  assert.equal(w.did('approve').length, 0);
+});
+
+test('with the App status off the schedule reads the legacy gate with the Actions token', async () => {
+  const w = world(); pendingGate(w);
+  const reads = splitReads(w);
+  w.readGithub.rest.repos.getCombinedStatusForRef = async () => assert.fail('read token has no statuses access');
+  await w.sweep();
+  assert.equal(lastStatus(w, appStatus.STATUS).state, 'success');
+  assert.ok(reads.includes('list'));
+});

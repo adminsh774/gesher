@@ -106,11 +106,14 @@ async function failedCI(github, prGithub, owner, repo, pr, event, run, core, mer
 
 // A labeled PR is stuck when its gate is still pending (or missing) although
 // both registered CI workflows already reached a result for the exact head.
-async function stuck(github, owner, repo, pr, gate) {
-  const values = await p.list(github.rest.repos.getCombinedStatusForRef,
+// A failure gate is also rechecked: in App mode a transient API error during
+// reconciliation revokes to failure although the label and CI remain valid.
+// Reconciliation re-derives everything, so an invalid label stays failed.
+async function stuck(github, statusReader, owner, repo, pr, gate) {
+  const values = await p.list(statusReader.rest.repos.getCombinedStatusForRef,
     {owner, repo, ref: pr.head.sha}, 'statuses');
   const state = values.filter(s => s.context === gate).sort((a, b) => b.id - a.id)[0]?.state;
-  if (state === 'success' || state === 'failure' || state === 'error') return false;
+  if (state === 'success') return false;
   const evidence = await ciEvidence(github, owner, repo, pr);
   return evidence.ready || Boolean(evidence.failed);
 }
@@ -190,11 +193,13 @@ async function reconcile(github, prGithub, owner, repo, number, core, mergeGithu
 // explicitly opt-in. A schedule recovers PRs whose CI finished while a
 // controller run failed (for example on an exhausted API quota).
 module.exports = async ({github: actionsGithub, readGithub, context, core, prGithub,
-  mergeGithub = prGithub ?? actionsGithub, appQaStatus = false, appId, appInstallationId}) => {
+  mergeGithub = prGithub ?? actionsGithub, appQaStatus = false, appId, appInstallationId, repositoryId}) => {
   const github = readGithub ?? actionsGithub;
   const {owner, repo} = context.repo;
   const payload = context.payload;
-  if (!prGithub && payload.repository?.id === 1426153186) {
+  // Schedule payloads have no repository object; the job's repository ID does.
+  const baseRepositoryId = payload.repository?.id ?? repositoryId;
+  if (!prGithub && [payload.repository?.id, repositoryId].includes(1426153186)) {
     throw new Error('The Gesher GitHub App is required for pull request updates');
   }
   let required;
@@ -207,7 +212,7 @@ module.exports = async ({github: actionsGithub, readGithub, context, core, prGit
     if (run.event !== 'pull_request' || !p.SHA.test(run.head_sha) || !run.head_repository?.id) return;
     // Same-repository runs name their PRs in the trusted event; fork runs do not.
     const named = (run.pull_requests || []).filter(x => x.base?.ref === 'main' &&
-      x.base.repo?.id === payload.repository?.id && Number.isSafeInteger(x.number));
+      x.base.repo?.id === baseRepositoryId && Number.isSafeInteger(x.number));
     const prs = named.length ? named :
       await p.list(github.rest.pulls.list, {owner, repo, state: 'open', base: 'main'});
     for (const pr of prs.filter(x => x.head.sha === run.head_sha && x.head.repo?.id === run.head_repository.id)) {
@@ -217,11 +222,13 @@ module.exports = async ({github: actionsGithub, readGithub, context, core, prGit
   }
   if (context.eventName === 'schedule') {
     const gate = appQaStatus ? qaStatuses.APP_STATUS : STATUS;
+    // The read token requests statuses access only while the App status is on.
+    const statusReader = appQaStatus ? github : actionsGithub;
     const prs = await p.list(github.rest.pulls.list, {owner, repo, state: 'open', base: 'main'});
     for (const pr of prs.filter(x => !x.draft && p.hasLabel(x) && p.SHA.test(x.head.sha))) {
       try {
-        if (!await stuck(github, owner, repo, pr, gate)) continue;
-        core.info('#' + pr.number + ': CI finished while the QA gate stayed pending; reconciling');
+        if (!await stuck(github, statusReader, owner, repo, pr, gate)) continue;
+        core.info('#' + pr.number + ': CI finished without a successful QA gate; reconciling');
         await reconcile(github, prGithub, owner, repo, pr.number, core, mergeGithub, statuses);
       } catch (error) { core.warning('#' + pr.number + ': ' + error.message); }
     }

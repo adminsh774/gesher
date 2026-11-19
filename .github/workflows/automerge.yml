@@ -58,6 +58,12 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: .github/scripts
+      # Schedule payloads carry no repository object; derive the name from the
+      # always-present GITHUB_REPOSITORY so App tokens stay scoped to this repo.
+      - name: Resolve this repository's name
+        id: repo
+        shell: bash
+        run: echo "name=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
       - name: Read App QA status feature flag
         id: app-qa-flag
         uses: actions/github-script@v7
@@ -73,7 +79,7 @@ jobs:
           app-id: ${{ vars.GESHER_BOT_APP_ID }}
           private-key: ${{ secrets.GESHER_BOT_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
+          repositories: ${{ steps.repo.outputs.name }}
           permission-contents: write
           permission-pull-requests: write
           permission-workflows: write
@@ -92,12 +98,12 @@ jobs:
           app-id: ${{ vars.GESHER_BOT_APP_ID }}
           private-key: ${{ secrets.GESHER_BOT_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
+          repositories: ${{ steps.repo.outputs.name }}
           permission-actions: read
           permission-checks: read
           permission-metadata: read
           permission-pull-requests: read
-          permission-statuses: read
+          permission-statuses: ${{ steps.app-qa-flag.outputs.enabled == 'true' && 'read' || '' }}
       - uses: actions/github-script@v7
         env:
           GESHER_READ_TOKEN: ${{ steps.gesher-read.outputs.token }}
@@ -128,4 +134,5 @@ jobs:
             await run({github, readGithub, context, core, mergeGithub, prGithub: appToken ? mergeGithub : undefined,
               appQaStatus: process.env.GESHER_APP_QA_STATUS === 'true',
               appId: Number(process.env.GESHER_BOT_APP_ID),
-              appInstallationId: Number(process.env.GESHER_BOT_INSTALLATION_ID)});
+              appInstallationId: Number(process.env.GESHER_BOT_INSTALLATION_ID),
+              repositoryId: Number(process.env.GITHUB_REPOSITORY_ID)});

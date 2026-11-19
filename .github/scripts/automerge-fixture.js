@@ -195,8 +195,10 @@ function world(over = {}) {
     repos: {createCommitStatus: statusWrite(APP_BOT, 'app-status')}}, graphql: github.graphql};};
   const fire = (eventName, payload) => run({github, readGithub: w.readGithub, core, prGithub: w.prGithub, mergeGithub: w.mergeGithub,
     appQaStatus: w.appQaStatus, appId: w.appId, appInstallationId: w.appInstallationId,
+    repositoryId: w.envRepositoryId,
     context: {eventName, repo: {owner: 'o', repo: 'r'},
-      payload: {repository: {default_branch: 'main', id: w.repositoryId}, ...clone(payload)}}});
+      payload: w.noRepositoryPayload ? clone(payload) :
+        {repository: {default_branch: 'main', id: w.repositoryId}, ...clone(payload)}}});
   w.labeled = (snapshot = w.pr) => fire('pull_request_target', {action: 'labeled',
     label: {name: 'automerge'}, sender: {id: 42}, pull_request: snapshot});
   w.pushed = (snapshot = w.pr) => fire('pull_request_target', {action: 'synchronize', pull_request: snapshot});

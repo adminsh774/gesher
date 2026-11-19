@@ -88,11 +88,18 @@ edits do not start the job; base changes still do.
 A controller run that fails after CI completion, for example on an exhausted API
 quota, would otherwise leave a labeled PR pending (or a failed PR labeled) with no
 further event. Every 20 minutes (`7,27,47 * * * *`) the controller lists open
-labeled PRs and reconciles only those whose QA gate is still pending or missing
-while both registered CI workflows already reached a result for the exact head.
+labeled PRs and reconciles only those whose QA gate is not green (pending,
+missing or failure) while both registered CI workflows already reached a result
+for the exact head. A failure gate is included because, with the App status on, a
+transient API error during reconciliation revokes to failure although the label
+and CI remain valid; an invalid label is re-derived and stays failed.
 The gate checked is `qa/gesher-label-approval` while the App status is enabled,
-otherwise `qa/label-approval`. Settled gates, running CI, drafts and unlabeled
-PRs cost one combined-status read at most and are not reconciled. Reconciliation
+otherwise `qa/label-approval` (read with the Actions token, since the App read
+token requests Statuses access only while the App status is on). Green gates,
+running CI, drafts and unlabeled PRs cost one combined-status read at most and are
+not reconciled. Schedule payloads carry no repository object, so the job derives
+the repository name for App token scoping from `GITHUB_REPOSITORY` and the App
+requirement from `GITHUB_REPOSITORY_ID`. Reconciliation
 applies exactly the event path's checks; it never creates an approval. A failure
 for one PR is logged and does not stop the others. Manual recovery remains:
 `gh workflow run automerge.yml -f pull_request_number=<PR>` (or no number for all
@@ -113,6 +120,12 @@ Operational order: complete migration phase 2 step 5 (dual gate), merge this
 change, then remove only the legacy `qa/label-approval` requirement from ruleset
 `27482394`. While both contexts are required, a failed legacy success write still
 holds the PR until the recovery schedule or a dispatch rewrites it.
+
+Rollback: a swallowed legacy revocation can leave `qa/label-approval` green while
+`qa/gesher-label-approval` is failure. That is safe only while the App context is
+required. Before removing the App requirement from the ruleset, dispatch the
+controller for all open PRs with both contexts writable, so every legacy context
+is rewritten from current evidence.
 
 ## Fork pull requests
 
