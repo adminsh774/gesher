@@ -162,12 +162,13 @@ class ArtifactBatch(unittest.TestCase):
         self.assertFalse(list(self.destination.parent.glob('core-stage-*')))
         self.assertNotIn('CI_ARTIFACT_RECEIPT ', self.logs.getvalue())
 
-    def test_complete_real_batch_has_22_api_requests_and_only_publishes_verified_members(self):
+    def test_complete_real_batch_has_20_api_requests_and_only_publishes_verified_members(self):
         self.execute()
-        self.assertEqual(len(self.json_reads), 8)
+        # One run + one 100-row job page + one artifact page, twice.
+        self.assertEqual(len(self.json_reads), 6)
         self.assertEqual(len(self.redirects), 14)
         self.assertEqual(len(self.storage_reads), 14)
-        self.assertEqual(len(self.json_reads) + len(self.redirects), 22)
+        self.assertEqual(len(self.json_reads) + len(self.redirects), 20)
         for spec in self.specs:
             path = self.destination / 'artifacts' / spec['destination'] / 'actual' / (spec['destination'] + '.txt')
             self.assertEqual(path.read_text(), spec['name'])
@@ -179,7 +180,7 @@ class ArtifactBatch(unittest.TestCase):
         self.final_items = copy.deepcopy(self.items) + [dict(id=4000, name='later-unrelated')]
         self.execute()
         self.assertEqual(len(self.items), 103)
-        self.assertEqual(len(self.json_reads), 10)
+        self.assertEqual(len(self.json_reads), 8)
         self.assertEqual(len(self.redirects), 14)
         self.assertEqual(sum('/artifacts?per_page=100&page=2' in p for p in self.json_reads), 2)
         self.assertEqual(len(list((self.destination / 'artifacts').iterdir())), 14)
@@ -337,8 +338,8 @@ class ArtifactBatch(unittest.TestCase):
         self.setUp()
         self.execute()
         count = len(self.specs)
-        # One run + two job pages + one artifact page, twice, plus one zip per member.
-        self.assertEqual(len(self.json_reads), 8)
+        # One run + one 100-row job page + one artifact page, twice, plus one zip per member.
+        self.assertEqual(len(self.json_reads), 6)
         self.assertEqual(len(self.redirects), count)
         for spec in self.specs:
             path = self.destination / 'artifacts' / spec['destination'] / 'actual' / (spec['destination'] + '.txt')

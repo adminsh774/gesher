@@ -26,6 +26,10 @@ class GitHubReadError(RuntimeError):
     """The exact read failed; callers must not accept or consume partial output."""
 
 
+class GitHubTransientError(GitHubReadError):
+    """An observed transient failure that the caller asked not to retry here."""
+
+
 def _reject_json_constant(value):
     # Python accepts these JavaScript extensions by default; GitHub's response
     # contract is JSON, so NaN/Infinity are parse failures rather than metadata.
@@ -128,13 +132,15 @@ def _transient(stderr):
         _STREAM_CANCEL.search(line) for line in stderr.splitlines())
 
 
-def get_json(endpoint):
+def get_json(endpoint, *, retry_transient=True):
     """GET endpoint verbatim, retrying only the observed transient failures.
 
     There are at most four requests. Quota waits require GitHub's message and
     valid headers, fit a 120-second cumulative wait budget, and remain within
     the original 247-second maximum read envelope. JSON parsing and all caller
-    identity/digest predicates are outside the retry decision.
+    identity/digest predicates are outside the retry decision. With
+    retry_transient=False an observed transient failure raises
+    GitHubTransientError at once, so the caller can choose a cheaper fallback.
     """
     if not isinstance(endpoint, str) or not endpoint:
         raise ValueError('An exact GitHub endpoint is required')
@@ -188,6 +194,9 @@ def get_json(endpoint):
             rate_wait += delay
             rate_failures += 1
         elif _transient(stderr):
+            if not retry_transient:
+                raise GitHubTransientError(
+                    f'GitHub GET transient failure (gh exit {result.returncode})')
             delay = _BACKOFF_SECONDS[attempt] if attempt < len(_BACKOFF_SECONDS) else None
         if delay is None or time.monotonic() + delay >= deadline:
             raise GitHubReadError(
