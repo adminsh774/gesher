@@ -55,7 +55,7 @@ jobs:
     outputs:
       runner: ${{ steps.route.outputs.runner }}
     steps:
-      - uses: gesher-runtime/gesher/.github/actions/runner-route@b9510513a538d80669895521d1061b54fbe11aff
+      - uses: gesher-runtime/gesher/.github/actions/runner-route@5d76cae649c2257c376aaf87a5283099c99f111c
         id: route
         with:
           requested: ${{ inputs.local-runner }}
