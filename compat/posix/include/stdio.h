@@ -40,6 +40,13 @@ int ferror_unlocked(FILE* stream);
 int feof_unlocked(FILE* stream);
 void clearerr_unlocked(FILE* stream);
 
+// Internal stream-lifetime bridge. The shared stream owner retires its
+// metadata before releasing the native FILE token. An error before close
+// leaves retired zero; errors after close/reinitialization still set it to one.
+// Callers use this result to retain or reap associated process resources.
+int gesher_fclose_state(FILE* stream, int* retired);
+FILE* gesher_freopen_state(const char* path, const char* mode, FILE* stream, int* retired);
+
 #ifdef __cplusplus
 }
 #endif

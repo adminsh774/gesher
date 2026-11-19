@@ -21,6 +21,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -30,33 +31,45 @@
 #include "event_internal.h"
 #include "internal.h"
 #include "pipe_io.h"
+#include "poll_scratch.h"
 #include "record_lock_descriptors.h"
 #include "socket_internal.h"
 
 namespace gesher {
 namespace {
 
-std::mutex table_mutex;
-std::unordered_map<int, SocketFd> table;
+struct SocketRegistry {
+  std::mutex mutex;
+  std::unordered_map<int, SocketFd> entries;
+};
+SocketRegistry& Sockets() {
+  // C stdio flushes after ordinary application exit handlers and C++ static
+  // destructors. Its write dispatch must still find live socket descriptions.
+  // Fixed process storage avoids both a teardown race and an allocation on
+  // first lookup; explicit close still retires entries and native resources.
+  alignas(SocketRegistry) static unsigned char storage[sizeof(SocketRegistry)];
+  static SocketRegistry* registry = new (storage) SocketRegistry;
+  return *registry;
+}
 // Lets the common case, a process without sockets, skip the lock.
 std::atomic<size_t> socket_count{0};
 
 // Takes the socket out of the table; false if fd is not a socket.
 bool Remove(int fd, SocketFd* state, bool* last) {
   if (socket_count.load(std::memory_order_acquire) == 0) return false;
-  std::lock_guard<std::mutex> lock(table_mutex);
-  auto it = table.find(fd);
-  if (it == table.end()) return false;
+  std::lock_guard<std::mutex> lock(Sockets().mutex);
+  auto it = Sockets().entries.find(fd);
+  if (it == Sockets().entries.end()) return false;
   *state = it->second;
   *last = --state->description->descriptor_refs == 0;
-  table.erase(it);
+  Sockets().entries.erase(it);
   socket_count.fetch_sub(1, std::memory_order_release);
   return true;
 }
 
 void Insert(int fd, const SocketFd& state) {
-  std::lock_guard<std::mutex> lock(table_mutex);
-  if (table.insert_or_assign(fd, state).second) {
+  std::lock_guard<std::mutex> lock(Sockets().mutex);
+  if (Sockets().entries.insert_or_assign(fd, state).second) {
     ++state.description->descriptor_refs;
     socket_count.fetch_add(1, std::memory_order_release);
   }
@@ -66,19 +79,19 @@ void Insert(int fd, const SocketFd& state) {
 // native endpoint remains live until _dup2 has succeeded; a failed CRT call
 // leaves its socket metadata and descriptor references untouched.
 bool ReplaceSocket(int fd, const SocketFd* source, SocketFd* previous, bool* last) {
-  std::lock_guard<std::mutex> lock(table_mutex);
-  auto it = table.find(fd);
-  const bool existed = it != table.end();
+  std::lock_guard<std::mutex> lock(Sockets().mutex);
+  auto it = Sockets().entries.find(fd);
+  const bool existed = it != Sockets().entries.end();
   if (existed) {
     *previous = it->second;
     *last = --previous->description->descriptor_refs == 0;
   }
   if (source) {
     if (existed) it->second = *source;
-    else { table.emplace(fd, *source); socket_count.fetch_add(1, std::memory_order_release); }
+    else { Sockets().entries.emplace(fd, *source); socket_count.fetch_add(1, std::memory_order_release); }
     ++source->description->descriptor_refs;
   } else if (existed) {
-    table.erase(it); socket_count.fetch_sub(1, std::memory_order_release);
+    Sockets().entries.erase(it); socket_count.fetch_sub(1, std::memory_order_release);
   }
   return existed;
 }
@@ -154,9 +167,9 @@ int RegisterSocket(const SocketFd& state) {
 
 bool LookupSocket(int fd, SocketFd* state) {
   if (socket_count.load(std::memory_order_acquire) == 0) return false;
-  std::lock_guard<std::mutex> lock(table_mutex);
-  auto it = table.find(fd);
-  if (it == table.end()) return false;
+  std::lock_guard<std::mutex> lock(Sockets().mutex);
+  auto it = Sockets().entries.find(fd);
+  if (it == Sockets().entries.end()) return false;
   *state = it->second;
   return true;
 }
@@ -608,6 +621,22 @@ namespace {
 constexpr short kIn = POLLIN | POLLRDNORM;
 constexpr short kOut = POLLOUT | POLLWRNORM;
 
+struct FdPollScratch {
+  std::vector<gesher::ws::PollEntry> sockets;
+  std::vector<nfds_t> socket_index;
+  std::vector<std::shared_ptr<gesher::EventFd>> eventfds;
+  std::vector<nfds_t> eventfd_index;
+  std::vector<HANDLE> handles;
+
+  void Reset() {
+    gesher::ClearPollScratch(handles);
+    gesher::ClearPollScratch(eventfd_index);
+    gesher::ClearPollScratch(eventfds);
+    gesher::ClearPollScratch(socket_index);
+    gesher::ClearPollScratch(sockets);
+  }
+};
+
 // Readiness of a non-socket fd: pipes are readable when data is buffered or
 // the writer is gone; files and other devices are always ready. Returns false
 // for a pipe that has nothing yet.
@@ -713,11 +742,13 @@ void WakePollers() {
 static int PollFdsImpl(pollfd* fds, nfds_t nfds, int timeout, HANDLE interrupt, bool* interrupted, PollObserver observer, void* context,
                        ws::NativePollObserver native_observer, void* native_context) {
   ULONGLONG deadline = gesher::DeadlineAfter(timeout);
-  std::vector<ws::PollEntry> sockets;
-  std::vector<nfds_t> socket_index;
+  PollScratchLease<FdPollScratch> lease(nfds <= kPollScratchLimit);
+  auto& scratch = lease.get();
+  auto& sockets = scratch.sockets;
+  auto& socket_index = scratch.socket_index;
   // Held so that their events stay open while waited on.
-  std::vector<std::shared_ptr<EventFd>> eventfds;
-  std::vector<nfds_t> eventfd_index;
+  auto& eventfds = scratch.eventfds;
+  auto& eventfd_index = scratch.eventfd_index;
   bool waiting_files = false;  // a pipe that may become readable
   for (nfds_t i = 0; i < nfds; ++i) {
     pollfd* p = &fds[i];
@@ -767,7 +798,7 @@ static int PollFdsImpl(pollfd* fds, nfds_t nfds, int timeout, HANDLE interrupt, 
   }
   PollWaiter* waiter = registration ? registration->get() : nullptr;
   bool look_first = waiter != nullptr;
-  std::vector<HANDLE> handles;
+  auto& handles = scratch.handles;
   for (;;) {
     int wait_ms = 0;  // with something ready, only collect what the rest has
     if (ready == 0 && !look_first) {

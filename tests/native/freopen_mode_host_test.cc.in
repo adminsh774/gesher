@@ -27,6 +27,7 @@ static int ofd_retirements;
 static int ofd_registrations;
 static bool fail_next_flush;
 static constexpr int INVALID_HANDLE_VALUE = -1;
+static int expected_depth = 1;
 struct StreamLock {
   explicit StreamLock(FILE*) { ++stream_depth; }
   ~StreamLock() { --stream_depth; }
@@ -73,13 +74,13 @@ namespace record_locks {
 class ClosingDescriptor {
  public:
   explicit ClosingDescriptor(int) {
-    check("freopen descriptor transaction starts inside its stream lock", stream_depth == 1);
+    check("freopen descriptor transaction starts inside its stream lock", stream_depth == expected_depth);
     ++transactions;
   }
   int Error() const { return 0; }
   int Finish(bool) {
     check("freopen descriptor transaction completes once inside its stream lock",
-          !finished_ && stream_depth == 1);
+          !finished_ && stream_depth == expected_depth);
     finished_ = true;
     ++completions;
     return 0;
@@ -108,7 +109,7 @@ static int gesher_errno_from_crt(int error) { return error; }
 static bool HasNonDirectoryParent(const std::wstring&) { return false; }
 static FILE* _wfreopen(const wchar_t* path, const wchar_t* mode, FILE* stream) {
   ++crt_calls;
-  check("freopen keeps the CRT reopen inside its stream transaction", stream_depth == 1);
+  check("freopen keeps the CRT reopen inside its stream transaction", stream_depth == expected_depth);
   std::wstring wide_path(path), wide_mode(mode);
   std::string narrow_path(wide_path.begin(), wide_path.end());
   std::string linux_mode(wide_mode.begin(), wide_mode.end());
@@ -128,8 +129,8 @@ namespace guest {
 #define BIONIC_SYSV
 constexpr int kEINVAL = EINVAL;
 static FILE* F(void* stream) { return static_cast<FILE*>(stream); }
-static FILE* HostFreopen(const char* path, const char* mode, FILE* stream) {
-  return host::freopen(path, mode, stream);
+static FILE* HostFreopen(const char* path, const char* mode, FILE* stream, int* retired) {
+  return host::gesher_freopen_state(path, mode, stream, retired);
 }
 @GUEST_FREOPEN@
 }  // namespace guest

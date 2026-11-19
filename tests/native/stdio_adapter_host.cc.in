@@ -19,6 +19,8 @@
 #include <new>
 #include <pthread.h>
 #include <string>
+#include <sys/socket.h>
+#include <unordered_map>
 #include <unistd.h>
 #include <vector>
 
@@ -55,6 +57,58 @@ static int HostSetvbuf(FILE* stream, char* bytes, int mode, size_t count) { retu
 static int _fileno(FILE* stream) { return ::fileno(stream); }
 static int _fclose_nolock(FILE* stream) { return HostFclose(stream); }
 static FILE* _fdopen(int fd, const char* mode) { return HostFdopen(fd, mode); }
+
+namespace socket_boundary {
+// Only native socket representation is a boundary here. Registry construction,
+// insertion, lookup and static lifetime below are the actual production code.
+static std::atomic<int> destroyed{0};
+struct Description {
+  size_t descriptor_refs = 0;
+  ~Description() { ++destroyed; }
+};
+struct SocketFd { int socket; std::shared_ptr<Description> description; };
+@SOCKET_REGISTRY@
+@SOCKET_INSERT@
+@SOCKET_LOOKUP@
+static bool probing, ordinary_destroyed, reported;
+static int socket_fd = -1;
+struct OrdinaryShutdown {
+  ~OrdinaryShutdown() { ordinary_destroyed = true; }
+} ordinary_shutdown;
+static bool Begin() {
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return false;
+  socket_fd = sockets[0];
+  Insert(socket_fd, SocketFd{socket_fd, std::make_shared<Description>()});
+  // Deliberately leave both real descriptors live through process shutdown,
+  // as an application may do. The OS owns final process resource reclamation.
+  probing = true;
+  return true;
+}
+}
+static ssize_t HostDescriptorWrite(int fd, const void* bytes, size_t count) {
+  if (socket_boundary::probing && socket_boundary::ordinary_destroyed) {
+    // A negative control uses the old destructible registry. Diagnose its
+    // destroyed description before invoking undefined access to its dead map.
+    if (socket_boundary::destroyed.load() != 0) {
+      const char message[] = "SOCKET_EXIT_RETIRED before_final_stdio_write=1\n";
+      ::write(STDERR_FILENO, message, sizeof(message) - 1);
+      std::_Exit(87);
+    }
+    socket_boundary::SocketFd observed{};
+    if (!socket_boundary::LookupSocket(socket_boundary::socket_fd, &observed) ||
+        observed.socket != socket_boundary::socket_fd || observed.description->descriptor_refs != 1)
+      std::_Exit(88);
+    if (!socket_boundary::reported) {
+      const char message[] = "SOCKET_EXIT_RETAINED after_ordinary_destructors=1\n";
+      ::write(STDERR_FILENO, message, sizeof(message) - 1);
+      socket_boundary::reported = true;
+    }
+  }
+  socket_boundary::SocketFd unrelated{};
+  if (socket_boundary::LookupSocket(fd, &unrelated)) return errno = ENOSYS, -1;
+  return ::write(fd, bytes, count);
+}
 
 using HANDLE = void*;
 using HMODULE = HANDLE;
@@ -249,16 +303,69 @@ static void TestAllocationOwnership() {
 
 static FILE* exit_stream;
 static void ExitOutput() { adapter_fputs("late", exit_stream); }
+static void TestBionicOwnerLifetime() {
+  char path[] = "stdio-bionic-state-XXXXXX";
+  int fd = mkstemp(path);
+  if (fd < 0) std::abort();
+  FILE* stream = adapter_fdopen(fd, "r+");
+  if (!stream) std::abort();
+  {
+    gesher::stdio::StreamGuard lock(stream);
+    auto* state = gesher::stdio::BionicMetadata(stream);
+    check("Bionic metadata belongs to an actual locked stream", lock && state);
+    state->conversion_error = true;
+    state->pushback = 0x1f642;
+    state->input_state[3] = 0x5a;
+  }
+  check("host error query sees Bionic conversion failure", adapter_ferror(stream) != 0);
+  adapter_clearerr(stream);
+  {
+    gesher::stdio::StreamGuard lock(stream);
+    auto* state = gesher::stdio::BionicMetadata(stream);
+    check("host clearerr clears Bionic error without discarding unread wide state",
+          !state->conversion_error && state->pushback == 0x1f642 && state->input_state[3] == 0x5a);
+  }
+  check("failed seek retains the stream", adapter_fseek(stream, 0, -99) == -1 && errno == EINVAL);
+  {
+    gesher::stdio::StreamGuard lock(stream);
+    auto* state = gesher::stdio::BionicMetadata(stream);
+    check("failed seek preserves pending Bionic input", state->pushback == 0x1f642 && state->input_state[3] == 0x5a);
+  }
+  check("successful seek reaches the real file", adapter_fseek(stream, 0, SEEK_SET) == 0);
+  {
+    gesher::stdio::StreamGuard lock(stream);
+    auto* state = gesher::stdio::BionicMetadata(stream);
+    check("successful seek discards Bionic pushback and partial decoder state",
+          state->pushback == 0xffffffffu && state->input_state == std::array<uint8_t, 8>{});
+    state->conversion_error = true;
+    state->pushback = 'Q';
+    state->input_state[0] = 0x7f;
+  }
+  check("reinitializing the actual owner succeeds", gesher::stdio::Register(stream, O_RDWR) == 0);
+  {
+    gesher::stdio::StreamGuard lock(stream);
+    auto* state = gesher::stdio::BionicMetadata(stream);
+    check("reinitialization retires every old Bionic metadata field",
+          !state->conversion_error && state->pushback == 0xffffffffu && state->input_state == std::array<uint8_t, 8>{});
+  }
+  check("host fclose releases its real descriptor", adapter_fclose(stream) == 0 && fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+  check("host fclose leaves no Bionic metadata for a recycled token",
+        gesher::stdio::BionicMetadata(stream, false) == nullptr);
+  unlink(path);
+}
 int main(int argc, char** argv) {
-  if (argc == 3 && std::strcmp(argv[1], "--exit-output") == 0) {
+  if (argc == 3 && (std::strcmp(argv[1], "--exit-output") == 0 ||
+                    std::strcmp(argv[1], "--exit-socket") == 0)) {
     // This is deliberately registered before the first application stdio use.
     std::atexit(ExitOutput);
+    if (std::strcmp(argv[1], "--exit-socket") == 0 && !socket_boundary::Begin()) return 3;
     exit_stream = adapter_fopen(argv[2], "w");
     if (!exit_stream || adapter_fputs("early", exit_stream) < 0) return 2;
     return 0;
   }
   test_stdio_ofd_contracts();
   TestAllocationOwnership();
+  TestBionicOwnerLifetime();
   test_stdio_cancel_contracts();
   char summary[128];
   int count = snprintf(summary, sizeof(summary), "stdio production adapter: %d checks, %d failures\n", checks, failures);

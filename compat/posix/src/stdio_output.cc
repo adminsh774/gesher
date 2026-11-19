@@ -57,6 +57,7 @@ struct State {
   int fd = -1;
   bool live = true;
   std::atomic<bool> line_output{false};
+  BionicState bionic;
   mbstate_t input_conversion{};
   mbstate_t output_conversion{};
 };
@@ -122,6 +123,7 @@ int ConfigureDefaults(State& state, FILE* stream, int fd, int flags, bool standa
   state.fd = fd;
   state.live = true;
   state.line_output.store(false, std::memory_order_relaxed);
+  state.bionic = {};
   state.input_conversion = {};
   state.output_conversion = {};
   const int saved = errno;
@@ -263,6 +265,7 @@ int FlushLocal(FILE* stream) {
   return state->buffer.FlushOutput(Writer(state->fd));
 }
 size_t WriteLocal(const void* bytes, size_t size, size_t count, FILE* stream, bool unlocked) {
+  if (size == 0 || count == 0) return 0;
   if (formatting_stream && formatting_stream->stream == stream) {
     return formatting_stream->buffer.Write(bytes, size, count, Writer(formatting_stream->fd));
   }
@@ -271,6 +274,7 @@ size_t WriteLocal(const void* bytes, size_t size, size_t count, FILE* stream, bo
   return state->buffer.Write(bytes, size, count, Writer(state->fd));
 }
 size_t ReadLocal(void* bytes, size_t size, size_t count, FILE* stream, bool unlocked) {
+  if (size == 0 || count == 0) return 0;
   AccessStream state(stream, unlocked);
   if (!state) return 0;
   state->line_output.store(false, std::memory_order_release);
@@ -333,12 +337,12 @@ int WalkFlush(bool line_only, State* skip) {
 }
 int FlushAllLocal() { return WalkFlush(false); }
 int FlagLocal(FILE* stream, bool error, bool unlocked) {
-  AccessStream state(stream, unlocked);
-  return state ? (error ? state->buffer.Error() : state->buffer.Eof()) : error;
+  AccessStream state(stream, unlocked, false);
+  return state ? (error ? state->buffer.Error() || state->bionic.conversion_error : state->buffer.Eof()) : 0;
 }
 void ClearLocal(FILE* stream, bool unlocked) {
-  AccessStream state(stream, unlocked);
-  if (state) state->buffer.Clear();
+  AccessStream state(stream, unlocked, false);
+  if (state) { state->buffer.Clear(); state->bionic.conversion_error = false; }
 }
 void ErrorLocal(FILE* stream, int error) {
   AccessStream state(stream, false);
@@ -352,15 +356,24 @@ int BufferLocal(FILE* stream, char* buffer, int mode, size_t size) {
   auto buffering = mode == _IONBF ? StreamBuffer::Mode::kNone :
       mode == _IOLBF ? StreamBuffer::Mode::kLine : StreamBuffer::Mode::kFull;
   int result = state->buffer.Configure(buffering, buffer, size, Writer(state->fd));
-  state->input_conversion = {};
-  state->output_conversion = {};
+  if (result == 0) {
+    state->input_conversion = {};
+    state->output_conversion = {};
+    state->bionic.input_state = {};
+    state->bionic.pushback = 0xffffffffu;
+  }
   return result;
 }
 int64_t SeekLocal(FILE* stream, int64_t offset, int whence) {
   AccessStream state(stream, false);
   if (!state) return -1;
   int result = state->buffer.Seek(offset, whence, Writer(state->fd), Seeker(state->fd));
-  if (result == 0) { state->input_conversion = {}; state->output_conversion = {}; }
+  if (result == 0) {
+    state->input_conversion = {};
+    state->output_conversion = {};
+    state->bionic.input_state = {};
+    state->bionic.pushback = 0xffffffffu;
+  }
   return result;
 }
 int64_t TellLocal(FILE* stream) {
@@ -368,7 +381,7 @@ int64_t TellLocal(FILE* stream) {
   return state ? state->buffer.Tell(Writer(state->fd), Seeker(state->fd)) : -1;
 }
 int OrientLocal(FILE* stream, int mode) {
-  AccessStream state(stream, false);
+  AccessStream state(stream, false, mode != 0);
   return state ? state->buffer.Orient(mode) : 0;
 }
 wint_t PutWideLocal(wchar_t value, FILE* stream) {
@@ -448,6 +461,11 @@ int ScanWideLocal(FILE* stream, const wchar_t* format, va_list arguments) {
   state->buffer.Orient(1);
   return __real___mingw_vfwscanf(stream, format, arguments);
 }
+BionicState* BionicMetadataLocal(FILE* stream, bool create) {
+  auto state = Find(stream, create);
+  if (!state || !state->live) return nullptr;
+  return &state->bionic;
+}
 struct Api {
   std::shared_ptr<void> (*acquire)(FILE*);
   void (*release)(const std::shared_ptr<void>&);
@@ -477,6 +495,7 @@ struct Api {
   int (*print_wide)(FILE*, const wchar_t*, va_list);
   int (*scan)(FILE*, const char*, va_list);
   int (*scan_wide)(FILE*, const wchar_t*, va_list);
+  BionicState* (*bionic_metadata)(FILE*, bool);
 };
 const Api* Owner() {
   using Factory = const Api* (*)();
@@ -493,7 +512,7 @@ extern "C" __declspec(dllexport) const Api* gesher_stdio_output_owner_v1() {
       OpenDescriptorLocal, RegisterLocal, ForgetLocal, FlushLocal, WriteLocal, ReadLocal,
       LineLocal, UngetLocal, FflushLocal, FlagLocal, ClearLocal, ErrorLocal, BufferLocal,
       SeekLocal, TellLocal, OrientLocal, PutWideLocal, GetWideLocal, UngetWideLocal,
-      PrintLocal, PrintWideLocal, ScanLocal, ScanWideLocal};
+      PrintLocal, PrintWideLocal, ScanLocal, ScanWideLocal, BionicMetadataLocal};
   return &api;
 }
 namespace {
@@ -512,6 +531,7 @@ StreamGuard::StreamGuard(FILE* stream)
     : token_(Owner()->acquire(stream)), cleanup_([](void* raw) { static_cast<StreamGuard*>(raw)->Release(); }, this) {}
 StreamGuard::~StreamGuard() = default;
 void StreamGuard::Release() { Owner()->release(token_); token_.reset(); }
+BionicState* BionicMetadata(FILE* stream, bool create) { return Owner()->bionic_metadata(stream, create); }
 void Lock(FILE* stream) { Owner()->lock(stream); }
 void Unlock(FILE* stream) { Owner()->unlock(stream); }
 int TryLock(FILE* stream) { return Owner()->try_lock(stream); }
