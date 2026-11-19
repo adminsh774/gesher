@@ -39,12 +39,14 @@ def zip_bytes(entries):
 
 
 class ArtifactBatch(unittest.TestCase):
+    MANIFEST = 'tools/ci/test_shard_artifacts.json'
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.manifest = self.root / 'manifest.json'
-        self.specs = json.loads((ROOT / 'tools/ci/test_shard_artifacts.json').read_text())
+        self.specs = json.loads((ROOT / self.MANIFEST).read_text())
         self.manifest.write_text(json.dumps(self.specs))
         self.committed_manifest = self.manifest.read_bytes()
         self.destination = self.root / 'suppliers' / 'core'
@@ -324,6 +326,57 @@ class ArtifactBatch(unittest.TestCase):
         self.execute()
         self.assertEqual(len(self.redirects), 14)
         self.assertTrue((self.destination / 'artifacts').is_dir())
+
+
+
+class CommittedBatchManifests(ArtifactBatch):
+    """Every committed CI batch manifest runs through the real batch path."""
+    def _complete(self, manifest):
+        self.MANIFEST = manifest
+        self.tearDown(); self.doCleanups(); self.setUp()
+        self.execute()
+        count = len(self.specs)
+        # One run + two job pages + one artifact page, twice, plus one zip per member.
+        self.assertEqual(len(self.json_reads), 8)
+        self.assertEqual(len(self.redirects), count)
+        for spec in self.specs:
+            path = self.destination / 'artifacts' / spec['destination'] / 'actual' / (spec['destination'] + '.txt')
+            self.assertEqual(path.read_text(), spec['name'])
+        self.assertEqual(self.logs.getvalue().count('CI_ARTIFACT_RECEIPT '), count)
+
+    def test_web3_query_batch_replaces_eleven_single_receipts(self):
+        self._complete('tools/ci/web3_query_artifacts.json')
+
+    def test_package_batch_replaces_seven_single_receipts(self):
+        self._complete('tools/ci/package_artifacts.json')
+
+
+class BatchManifestWiring(unittest.TestCase):
+    """Each batch job downloads exactly its committed manifest from producers it waits for."""
+    JOBS = {'test-shards': ('tools/ci/test_shard_artifacts.json', 'ci-suppliers/core'),
+            'web3-query-regression': ('tools/ci/web3_query_artifacts.json', 'ci-suppliers/web3'),
+            'package': ('tools/ci/package_artifacts.json', 'ci-suppliers/package')}
+
+    def test_jobs_use_their_manifest_and_assemble_every_member_from_the_batch(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'))
+        for job_name, (manifest, destination) in self.JOBS.items():
+            with self.subTest(job=job_name):
+                job = workflow['jobs'][job_name]
+                runs = chr(10).join(str(step.get('run', '')) for step in job['steps'])
+                raw = (ROOT / manifest).read_text(encoding='utf-8')
+                specs = receipt.batch_manifest(raw)
+                self.assertIn(f'artifact_receipt.py --batch {manifest} --destination {destination}', runs)
+                needs = set(job['needs'])
+                for spec in specs:
+                    self.assertIn(spec['producer'].split(' / ', 1)[0], needs, spec)
+                if job_name != 'test-shards':
+                    # Single receipts for batch members would repeat the API reads.
+                    for spec in specs:
+                        self.assertNotIn(f"--name {spec['name']} ", runs)
+                    for spec in specs:
+                        self.assertIn(f"'{spec['destination']}'", runs)
+                    self.assertIn(f'--source "{destination}/artifacts/$owner"', runs)
 
 
 if __name__ == '__main__':
