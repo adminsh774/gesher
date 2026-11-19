@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const controller = require('./label-automerge.js');
-const {world, authorWorld, HEAD, OTHER, T} = require('./automerge-fixture.js');
+const {world, authorWorld, HEAD, OTHER, T, APP_BOT} = require('./automerge-fixture.js');
 
 test('label captures approval and arms native waiting even before CI starts', async () => {
   const w = world({approved: false, runs: [], checks: []});
@@ -14,6 +14,50 @@ test('label captures approval and arms native waiting even before CI starts', as
   for (const action of ['merge', 'dispatch']) assert.equal(w.did(action).length, 0);
 });
 
+test('the deployed repository requires the Gesher App before PR or status writes', async () => {
+  const w = world({approved: false, repositoryId: 1426153186});
+  await assert.rejects(w.labeled(), /Gesher GitHub App is required/);
+  assert.deepEqual(w.calls, []);
+});
+
+test('the App writes the receipt and GitHub Actions writes the verified status', async () => {
+  const w = world({approved: false, repositoryId: 1426153186});
+  w.useApp();
+  await w.labeled();
+  assert.equal(w.did('app-approve').length, 1);
+  assert.equal(w.did('approve').length, 0);
+  assert.equal(w.did('nativeWait').length, 1);
+  assert.deepEqual(w.reviews[0].user, APP_BOT);
+  assert.equal(w.did('status').at(-1)[1].state, 'success');
+});
+
+test('the App dismisses stale receipts from either trusted bot on a new head', async () => {
+  const w = world();
+  w.useApp();
+  w.seedApproval();
+  w.reviews[1].user = {...APP_BOT};
+  w.pr.head.sha = OTHER;
+  await w.pushed();
+  assert.equal(w.did('app-dismiss').length, 2);
+  assert.equal(w.did('app-removeLabel').length, 1);
+  assert.equal(w.did('dismiss').length, 0);
+  assert.equal(w.did('removeLabel').length, 0);
+  assert.equal(w.did('status').at(-1)[1].state, 'failure');
+});
+
+test('CI failure removes the label and posts the explanation as the App', async () => {
+  const w = world();
+  w.useApp();
+  Object.assign(w.runs[0], {status: 'completed', conclusion: 'failure'});
+  await w.ciDone();
+  assert.equal(w.did('app-removeLabel').length, 1);
+  assert.equal(w.did('app-comment').length, 1);
+  assert.equal(w.did('removeLabel').length, 0);
+  assert.equal(w.did('comment').length, 0);
+  assert.deepEqual(w.comments.at(-1).user, APP_BOT);
+  assert.equal(w.did('status').at(-1)[1].state, 'failure');
+});
+
 for (const [name, change] of Object.entries({
   'missing label': w => {w.pr.labels = [];},
   draft: w => {w.pr.draft = true;},
@@ -23,6 +67,8 @@ for (const [name, change] of Object.entries({
   'wrong account identity': w => {w.permissionUserId = 999;},
   'dismissed receipt': w => {w.reviews[0].state = 'DISMISSED';},
   'edited receipt': w => {w.approvalNodeOverride = {lastEditedAt: T(40)};},
+  'foreign bot receipt': w => {w.reviews[0].user = {...APP_BOT, id: 888};},
+  'non-bot receipt': w => {w.reviews[0].user = {...APP_BOT, type: 'User'};},
   'missing receipt': w => {w.reviews = [];},
   'creation-time label': w => {w.events[0].created_at = T(0);},
   'reopened PR': w => {w.events.push({id: 60, event: 'reopened', created_at: T(40)});},
@@ -190,7 +236,81 @@ function forkWorld() {
   return w;
 }
 
-for (const conclusion of ['failure', 'timed_out', 'action_required', 'startup_failure']) {
+for (const index of [0, 1]) {
+  test('fork workflow awaiting approval preserves label and resumes after CI: ' + index, async () => {
+    const w = forkWorld();
+    Object.assign(w.runs[index], {status: 'completed', conclusion: 'action_required'});
+    w.checks = [];
+    await w.ciDone();
+    assert.equal(w.did('removeLabel').length, 0);
+    assert.equal(w.did('comment').length, 0);
+    assert.equal(w.did('status').at(-1)[1].state, 'pending');
+    assert.equal(w.nativeAutoMethod, 'SQUASH');
+    Object.assign(w.runs[index], {run_attempt: 2, conclusion: 'success'});
+    w.checks = world().checks;
+    await w.ciDone();
+    assert.equal(w.did('status').at(-1)[1].state, 'success');
+    assert.equal(w.did('removeLabel').length, 0);
+    assert.equal(w.did('approve').length, 0);
+  });
+}
+
+test('workflow-capable credential only enables and disables native waiting', async () => {
+  const w = world({approved: false});
+  const botGraphql = w.github.graphql;
+  const mutations = [];
+  w.github.graphql = async (query, args) => {
+    assert.doesNotMatch(query, /mutation/);
+    return botGraphql(query, args);
+  };
+  w.mergeGithub = {graphql: async (query, args) => {
+    assert.match(query, /mutation/);
+    assert.match(query, /enablePullRequestAutoMerge|disablePullRequestAutoMerge/);
+    mutations.push(query);
+    return botGraphql(query, args);
+  }};
+  await w.labeled();
+  assert.equal(w.did('approve').length, 1);
+  assert.equal(w.did('status').at(-1)[1].state, 'success');
+  assert.deepEqual(w.did('nativeWait')[0][1], {id: 'PR_7', head: HEAD});
+  w.pr.labels = [];
+  await w.fire('pull_request_target', {action: 'unlabeled', label: {name: 'automerge'}, pull_request: w.pr});
+  assert.equal(w.did('status').at(-1)[1].state, 'failure');
+  assert.equal(w.nativeAutoMethod, null);
+  assert.equal(mutations.length, 2);
+});
+
+test('a rejected workflow-capable credential cannot release the QA gate', async () => {
+  const w = world();
+  w.mergeGithub = {graphql: async () => { throw new Error('workflows permission required'); }};
+  await assert.rejects(w.ciDone(), /workflows permission required/);
+  assert.equal(w.did('status').at(-1)[1].state, 'pending');
+  assert.equal(w.nativeAutoMethod, null);
+});
+
+test('maintainer-enabled squash waiting survives without another privileged mutation', async () => {
+  const w = world({nativeAutoMethod: 'SQUASH'});
+  w.mergeGithub = {graphql: async () => { assert.fail('existing squash waiting needs no mutation'); }};
+  w.runs[0].status = 'in_progress'; w.runs[0].conclusion = null;
+  await w.ciDone();
+  assert.equal(w.did('status').at(-1)[1].state, 'pending');
+  Object.assign(w.runs[0], {status: 'completed', conclusion: 'success'});
+  await w.ciDone();
+  assert.equal(w.did('status').at(-1)[1].state, 'success');
+  assert.equal(w.nativeAutoMethod, 'SQUASH');
+  assert.equal(w.did('nativeWait').length, 0);
+  assert.equal(w.did('nativeCancel').length, 0);
+});
+
+test('a workflow-capable credential cannot authorize an unapproved head', async () => {
+  const w = world(); w.pr.head.sha = OTHER;
+  w.mergeGithub = {graphql: async () => { assert.fail('unapproved head must not enable waiting'); }};
+  await w.ciDone(OTHER);
+  assert.equal(w.did('status').at(-1)[1].state, 'failure');
+  assert.equal(w.did('nativeWait').length, 0);
+});
+
+for (const conclusion of ['failure', 'timed_out', 'startup_failure']) {
   test(conclusion + ' revokes the label and native waiting with one short bot comment', async () => {
     const w = world({nativeAutoMethod: 'SQUASH'});
     w.runs[0].conclusion = conclusion;
