@@ -86,13 +86,24 @@ static bool Begin() {
   return true;
 }
 }
+static void WriteShutdownDiagnostic(const char* bytes, size_t count) {
+  // Use real descriptor I/O: stdio ownership may already be tearing down.
+  // A missing or partial diagnostic must not be reported as a successful probe.
+  while (count != 0) {
+    const ssize_t written = ::write(STDERR_FILENO, bytes, count);
+    if (written < 0 && errno == EINTR) continue;
+    if (written <= 0) std::_Exit(89);
+    bytes += written;
+    count -= static_cast<size_t>(written);
+  }
+}
 static ssize_t HostDescriptorWrite(int fd, const void* bytes, size_t count) {
   if (socket_boundary::probing && socket_boundary::ordinary_destroyed) {
     // A negative control uses the old destructible registry. Diagnose its
     // destroyed description before invoking undefined access to its dead map.
     if (socket_boundary::destroyed.load() != 0) {
       const char message[] = "SOCKET_EXIT_RETIRED before_final_stdio_write=1\n";
-      ::write(STDERR_FILENO, message, sizeof(message) - 1);
+      WriteShutdownDiagnostic(message, sizeof(message) - 1);
       std::_Exit(87);
     }
     socket_boundary::SocketFd observed{};
@@ -101,7 +112,7 @@ static ssize_t HostDescriptorWrite(int fd, const void* bytes, size_t count) {
       std::_Exit(88);
     if (!socket_boundary::reported) {
       const char message[] = "SOCKET_EXIT_RETAINED after_ordinary_destructors=1\n";
-      ::write(STDERR_FILENO, message, sizeof(message) - 1);
+      WriteShutdownDiagnostic(message, sizeof(message) - 1);
       socket_boundary::reported = true;
     }
   }

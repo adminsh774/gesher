@@ -105,6 +105,19 @@ def main() -> int:
                 if completed.returncode or socket_destination.read_bytes() != b"earlylate" or \
                         "SOCKET_EXIT_RETAINED after_ordinary_destructors=1" not in completed.stderr:
                     raise AssertionError("late stdio lost the live socket registry: " + completed.stderr)
+                # Keep stderr occupied by a real read-only descriptor so socket
+                # creation cannot reuse it. A failed diagnostic write must fail
+                # the probe instead of silently claiming success.
+                with open(os.devnull, "rb") as readonly_stderr:
+                    unreported = subprocess.run(
+                        [str(executable), "--exit-socket", str(folder / "unreported-socket.txt")],
+                        cwd=folder, stdout=subprocess.PIPE, stderr=readonly_stderr,
+                        text=True, timeout=45)
+                if unreported.returncode != 89:
+                    raise AssertionError(
+                        "socket shutdown diagnostic I/O failure was not rejected: exit " +
+                        str(unreported.returncode))
+                print("stdio shutdown diagnostic I/O failure: rejected", flush=True)
                 # Only the registry's lifetime changes in this negative. The
                 # actual late stdio flush, map insertion/lookup and real files
                 # remain identical; diagnose retirement before undefined access.
