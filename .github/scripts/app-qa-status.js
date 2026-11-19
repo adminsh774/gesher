@@ -9,7 +9,12 @@ const BOT_ID = 358279050;
 
 // During migration the Actions context remains required. Never release it
 // before the independently authenticated App status has been read back.
-module.exports = ({github, appGithub, owner, repo, enabled = false, appId, installationId}) => {
+// appRequired() resolves true only when the live branch ruleset requires the App
+// context from the App integration. It is consulted only after a legacy write
+// fails: then the legacy Actions context is redundant and its write is
+// best-effort, so an exhausted GITHUB_TOKEN quota cannot block the gate.
+module.exports = ({github, readGithub = github, appGithub, owner, repo, enabled = false, appId,
+  installationId, appRequired = async () => false, core}) => {
   if (typeof enabled !== 'boolean') throw new Error('App QA status requires an explicit boolean flag');
   if (enabled && (!appGithub || appGithub === github || appId !== APP_ID ||
       installationId !== INSTALLATION_ID ||
@@ -20,7 +25,14 @@ module.exports = ({github, appGithub, owner, repo, enabled = false, appId, insta
     state: ok === null ? 'pending' : ok ? 'success' : 'failure', description: ok === null ?
       'Authorized label recorded; waiting for required PR CI' : ok ?
       'Authorized exact-head label, QA and PR CI verified' : 'Fresh authorized automerge label/QA required'});
-  const legacy = (sha, ok) => github.rest.repos.createCommitStatus(args(sha, ok, STATUS));
+  const legacy = async (sha, ok) => {
+    try { return await github.rest.repos.createCommitStatus(args(sha, ok, STATUS)); }
+    catch (error) {
+      if (!enabled || !await appRequired()) throw error;
+      core?.warning(`Legacy ${STATUS} write failed; ${APP_STATUS} is the required gate: ${error.message}`);
+      return null;
+    }
+  };
   const valid = (value, sha, state) => {
     return Number.isSafeInteger(value?.id) && value.id > 0 &&
       value.context === APP_STATUS && value.state === state &&
@@ -32,7 +44,7 @@ module.exports = ({github, appGithub, owner, repo, enabled = false, appId, insta
     // Combined status returns the current row per context, avoiding a growing
     // full history scan on every controller event. Still paginate contexts.
     const values = await list(async args => {
-      const response = await github.rest.repos.getCombinedStatusForRef(args);
+      const response = await readGithub.rest.repos.getCombinedStatusForRef(args);
       if (response.data.sha !== sha) throw new Error('Gesher App QA status readback head mismatch');
       return response;
     }, {owner, repo, ref: sha}, 'statuses');
@@ -70,4 +82,11 @@ module.exports = ({github, appGithub, owner, repo, enabled = false, appId, insta
     },
   };
 };
-Object.assign(module.exports, {STATUS, APP_STATUS, APP_ID, INSTALLATION_ID});
+// Read the active rules for main; only an App-bound required context counts.
+async function appRequiredByRuleset(github, owner, repo) {
+  const rules = await list(github.rest.repos.getBranchRules, {owner, repo, branch: 'main'});
+  return rules.some(rule => rule?.type === 'required_status_checks' &&
+    (rule.parameters?.required_status_checks || []).some(check =>
+      check?.context === APP_STATUS && check.integration_id === APP_ID));
+}
+Object.assign(module.exports, {STATUS, APP_STATUS, APP_ID, INSTALLATION_ID, appRequiredByRuleset});

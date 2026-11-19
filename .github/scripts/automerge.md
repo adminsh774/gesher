@@ -3,7 +3,8 @@
 Apply `automerge` after reviewing the current PR head. GitHub performs a native
 SQUASH auto-merge after the required PR CI and exact-head QA gate succeed.
 There is no merge queue and no second full merge-group CI run. The controller
-never calls the merge API, starts another CI build, or uses scheduled polling.
+never calls the merge API or starts another CI build. Its only schedule is the
+recovery described under API quota.
 
 ## Label authorization and QA
 
@@ -82,8 +83,36 @@ auto-merge cancellation reads its state from the REST pull request it already
 fetched. Registered workflow identities are read once per job. Title or body
 edits do not start the job; base changes still do.
 
-If the gate is stuck pending after CI because a controller run failed, rerun it:
-`gh workflow run automerge.yml -f pull_request_number=<PR>`.
+### Recovery schedule
+
+A controller run that fails after CI completion, for example on an exhausted API
+quota, would otherwise leave a labeled PR pending (or a failed PR labeled) with no
+further event. Every 20 minutes (`7,27,47 * * * *`) the controller lists open
+labeled PRs and reconciles only those whose QA gate is still pending or missing
+while both registered CI workflows already reached a result for the exact head.
+The gate checked is `qa/gesher-label-approval` while the App status is enabled,
+otherwise `qa/label-approval`. Settled gates, running CI, drafts and unlabeled
+PRs cost one combined-status read at most and are not reconciled. Reconciliation
+applies exactly the event path's checks; it never creates an approval. A failure
+for one PR is logged and does not stop the others. Manual recovery remains:
+`gh workflow run automerge.yml -f pull_request_number=<PR>` (or no number for all
+open PRs).
+
+### Phase 3: required App gate
+
+The legacy `qa/label-approval` write must use `GITHUB_TOKEN`, so an exhausted
+repository quota can still block it. When a legacy write fails while the App
+status is enabled, the controller reads the active rules for `main` once. Only if
+they require `qa/gesher-label-approval` bound to App integration `5816428` does
+the failure become a warning; the App status, written and read back with the App
+credentials, is then the gate. Otherwise, including an unreadable ruleset or the
+context bound to another integration, the failure stays fatal exactly as before.
+The ruleset is never read while legacy writes succeed.
+
+Operational order: complete migration phase 2 step 5 (dual gate), merge this
+change, then remove only the legacy `qa/label-approval` requirement from ruleset
+`27482394`. While both contexts are required, a failed legacy success write still
+holds the PR until the recovery schedule or a dispatch rewrites it.
 
 ## Fork pull requests
 
@@ -205,7 +234,7 @@ Deployment evidence must be collected in this order:
    Read the rule back and prove the live dual gate. Do not remove the old gate
    as part of this phase.
 
-Phase 3 requires its own reviewed change, live dual-gate proof and drainage of
+Phase 3 (see API quota) requires its own reviewed change, live dual-gate proof and drainage of
 old runs before removing only the legacy QA requirement. Keep this flag enabled
 while the App context is required; disabling it is not a migration procedure.
 

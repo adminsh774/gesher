@@ -104,6 +104,17 @@ async function failedCI(github, prGithub, owner, repo, pr, event, run, core, mer
     body: 'CI failed; removed `automerge`. Fix/rerun CI, then reapply the label. [Run](' + link + ').\n\n' + marker});
 }
 
+// A labeled PR is stuck when its gate is still pending (or missing) although
+// both registered CI workflows already reached a result for the exact head.
+async function stuck(github, owner, repo, pr, gate) {
+  const values = await p.list(github.rest.repos.getCombinedStatusForRef,
+    {owner, repo, ref: pr.head.sha}, 'statuses');
+  const state = values.filter(s => s.context === gate).sort((a, b) => b.id - a.id)[0]?.state;
+  if (state === 'success' || state === 'failure' || state === 'error') return false;
+  const evidence = await ciEvidence(github, owner, repo, pr);
+  return evidence.ready || Boolean(evidence.failed);
+}
+
 async function reconcile(github, prGithub, owner, repo, number, core, mergeGithub, statuses) {
   const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: number});
   if (pr.state !== 'open') return;
@@ -175,8 +186,9 @@ async function reconcile(github, prGithub, owner, repo, number, core, mergeGithu
 
 // PR writes use the installed App. Evidence reads use a read-only App token
 // when available, so they do not exhaust the repository's GITHUB_TOKEN quota.
-// The existing required status and its readback retain the Actions token; the
-// App status is explicitly opt-in.
+// The legacy required status stays on the Actions token; the App status is
+// explicitly opt-in. A schedule recovers PRs whose CI finished while a
+// controller run failed (for example on an exhausted API quota).
 module.exports = async ({github: actionsGithub, readGithub, context, core, prGithub,
   mergeGithub = prGithub ?? actionsGithub, appQaStatus = false, appId, appInstallationId}) => {
   const github = readGithub ?? actionsGithub;
@@ -185,8 +197,10 @@ module.exports = async ({github: actionsGithub, readGithub, context, core, prGit
   if (!prGithub && payload.repository?.id === 1426153186) {
     throw new Error('The Gesher GitHub App is required for pull request updates');
   }
-  const statuses = qaStatuses({github: actionsGithub, appGithub: prGithub, owner, repo,
-    enabled: appQaStatus, appId, installationId: appInstallationId});
+  let required;
+  const appRequired = () => required ??= qaStatuses.appRequiredByRuleset(github, owner, repo);
+  const statuses = qaStatuses({github: actionsGithub, readGithub: github, appGithub: prGithub, owner, repo,
+    enabled: appQaStatus, appId, installationId: appInstallationId, appRequired, core});
   prGithub ??= github;
   if (context.eventName === 'workflow_run') {
     const run = payload.workflow_run;
@@ -198,6 +212,18 @@ module.exports = async ({github: actionsGithub, readGithub, context, core, prGit
       await p.list(github.rest.pulls.list, {owner, repo, state: 'open', base: 'main'});
     for (const pr of prs.filter(x => x.head.sha === run.head_sha && x.head.repo?.id === run.head_repository.id)) {
       await reconcile(github, prGithub, owner, repo, pr.number, core, mergeGithub, statuses);
+    }
+    return;
+  }
+  if (context.eventName === 'schedule') {
+    const gate = appQaStatus ? qaStatuses.APP_STATUS : STATUS;
+    const prs = await p.list(github.rest.pulls.list, {owner, repo, state: 'open', base: 'main'});
+    for (const pr of prs.filter(x => !x.draft && p.hasLabel(x) && p.SHA.test(x.head.sha))) {
+      try {
+        if (!await stuck(github, owner, repo, pr, gate)) continue;
+        core.info('#' + pr.number + ': CI finished while the QA gate stayed pending; reconciling');
+        await reconcile(github, prGithub, owner, repo, pr.number, core, mergeGithub, statuses);
+      } catch (error) { core.warning('#' + pr.number + ': ' + error.message); }
     }
     return;
   }

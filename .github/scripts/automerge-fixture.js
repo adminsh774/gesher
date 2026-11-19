@@ -140,6 +140,10 @@ function world(over = {}) {
     },
     checks: {listForRef: page('checks', () => w.checks, 'check_runs')},
     repos: {createCommitStatus: statusWrite(ACTIONS_BOT, 'status'),
+      getBranchRules: page('rules', () => {
+        if (w.rulesError) throw w.rulesError;
+        return w.rules ?? [];
+      }),
       getCollaboratorPermissionLevel: rec('permission', () => {
         if (w.permissionError) throw w.permissionError;
         return {permission: w.permission, user: {id: w.permissionUserId ?? 42}};

@@ -850,3 +850,125 @@ test('registered workflow identity is read once per controller invocation', asyn
   bothStates(w, 'success');
   assert.equal(w.did('workflow').length, 2);
 });
+
+const APP_RULE = {type: 'required_status_checks', parameters: {required_status_checks: [
+  {context: 'ci-required', integration_id: 15368},
+  {context: appStatus.APP_STATUS, integration_id: appStatus.APP_ID}]}};
+const quotaError = () => Object.assign(new Error('API rate limit exceeded for installation'), {status: 403});
+
+test('a required App gate makes legacy status writes best-effort', async () => {
+  const w = appStatusWorld({rules: [APP_RULE]});
+  w.statusErrors = {status: quotaError()};
+  await w.ciDone();
+  assert.equal(lastStatus(w, appStatus.APP_STATUS).state, 'success');
+  assert.equal(lastStatus(w, appStatus.STATUS), undefined);
+  assert.ok(w.warnings.some(s => s.includes('rate limit') && s.includes(appStatus.APP_STATUS)));
+  // The ruleset is read once, and only because a legacy write failed.
+  assert.equal(w.did('rules').length, 1);
+});
+
+test('the ruleset is not read while legacy status writes succeed', async () => {
+  const w = appStatusWorld({rules: [APP_RULE]});
+  await w.ciDone();
+  bothStates(w, 'success');
+  assert.equal(w.did('rules').length, 0);
+});
+
+for (const [name, rules] of Object.entries({
+  'no App rule': [],
+  'App context from another integration': [{type: 'required_status_checks', parameters: {
+    required_status_checks: [{context: appStatus.APP_STATUS, integration_id: 15368}]}}],
+  'another rule type': [{type: 'pull_request', parameters: {required_status_checks: [
+    {context: appStatus.APP_STATUS, integration_id: appStatus.APP_ID}]}}],
+})) {
+  test(`legacy write failures stay fatal with ${name}`, async () => {
+    const w = appStatusWorld({rules, nativeAutoMethod: 'SQUASH'});
+    w.statusErrors = {status: quotaError()};
+    await assert.rejects(w.ciDone(), /rate limit/);
+    assert.notEqual(lastStatus(w, appStatus.APP_STATUS)?.state, 'success');
+    assert.equal(w.nativeAutoMethod, null);
+  });
+}
+
+test('legacy write failures stay fatal while the App status is off', async () => {
+  const w = world({rules: [APP_RULE]});
+  w.statusErrors = {status: quotaError()};
+  await assert.rejects(w.ciDone(), /rate limit/);
+  assert.equal(w.did('rules').length, 0);
+});
+
+test('an unreadable ruleset keeps a legacy failure fatal', async () => {
+  const w = appStatusWorld({rules: [APP_RULE], nativeAutoMethod: 'SQUASH'});
+  w.statusErrors = {status: quotaError()};
+  w.rulesError = new Error('rules unavailable');
+  await assert.rejects(w.ciDone(), /rules unavailable|rate limit/);
+  assert.notEqual(lastStatus(w, appStatus.APP_STATUS)?.state, 'success');
+});
+
+test('the App status readback uses the read client', async () => {
+  const w = appStatusWorld();
+  const reads = [];
+  const combined = w.github.rest.repos.getCombinedStatusForRef;
+  w.readGithub = {rest: {...w.github.rest, repos: {...w.github.rest.repos,
+    getCombinedStatusForRef: async args => { reads.push(args.ref); return combined(args); }}},
+    graphql: w.github.graphql};
+  w.github.rest.repos.getCombinedStatusForRef = async () => assert.fail('readback used GITHUB_TOKEN');
+  await w.ciDone();
+  bothStates(w, 'success');
+  assert.ok(reads.length > 0);
+});
+
+function pendingGate(w, context = appStatus.STATUS) {
+  w.statuses.unshift({id: w.nextStatusId++, context, state: 'pending',
+    creator: {login: 'github-actions[bot]', id: 41898282, type: 'Bot'}});
+}
+
+test('schedule reconciles a labeled PR whose CI finished while its gate stayed pending', async () => {
+  const w = world(); pendingGate(w);
+  await w.sweep();
+  assert.equal(lastStatus(w, appStatus.STATUS).state, 'success');
+});
+
+test('schedule reconciles a stuck PR after failed CI and removes its label', async () => {
+  const w = world({nativeAutoMethod: 'SQUASH'}); pendingGate(w);
+  w.runs[0].conclusion = 'failure';
+  await w.sweep();
+  assert.equal(w.did('removeLabel').length, 1);
+  assert.equal(w.nativeAutoMethod, null);
+});
+
+test('schedule checks the App context when the App status is enabled', async () => {
+  const w = appStatusWorld(); pendingGate(w, appStatus.APP_STATUS);
+  await w.sweep();
+  bothStates(w, 'success');
+});
+
+for (const [name, setup] of Object.entries({
+  'a settled gate': w => { w.statuses.unshift({id: w.nextStatusId++, context: appStatus.STATUS, state: 'success'}); },
+  'CI still running': w => { pendingGate(w); w.runs[0].status = 'in_progress'; w.runs[0].conclusion = null; },
+  'no automerge label': w => { pendingGate(w); w.pr.labels = []; },
+  'a draft PR': w => { pendingGate(w); w.pr.draft = true; },
+})) {
+  test(`schedule leaves ${name} alone`, async () => {
+    const w = world(); setup(w);
+    await w.sweep();
+    assert.equal(w.did('getPR').length, 0);
+    assert.equal(w.did('status').length, 0);
+  });
+}
+
+test('schedule isolates a failing PR from the rest', async () => {
+  const w = world(); pendingGate(w);
+  const other = structuredClone(w.pr); other.number = 8; other.node_id = 'PR_8';
+  const list = w.github.rest.pulls.list;
+  w.github.rest.pulls.list = async args => {
+    const res = await list(args); res.data = [other, ...res.data]; return res;
+  };
+  const getPR = w.github.rest.pulls.get;
+  w.github.rest.pulls.get = async args => {
+    if (args.pull_number === 8) throw new Error('PR 8 unavailable'); return getPR(args);
+  };
+  await w.sweep();
+  assert.ok(w.warnings.some(s => s.startsWith('#8: PR 8 unavailable')));
+  assert.equal(lastStatus(w, appStatus.STATUS).state, 'success');
+});

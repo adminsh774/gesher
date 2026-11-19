@@ -11,6 +11,10 @@ on:
   workflow_run:
     workflows: [ci, arm64-windows]
     types: [completed]
+  # Recovery only: reconcile labeled PRs whose CI finished while the QA gate
+  # stayed pending, for example after a controller run hit an API quota.
+  schedule:
+    - cron: '7,27,47 * * * *'
   workflow_dispatch:
     inputs:
       pull_request_number:
@@ -93,6 +97,7 @@ jobs:
           permission-checks: read
           permission-metadata: read
           permission-pull-requests: read
+          permission-statuses: read
       - uses: actions/github-script@v7
         env:
           GESHER_READ_TOKEN: ${{ steps.gesher-read.outputs.token }}

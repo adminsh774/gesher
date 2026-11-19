@@ -69,7 +69,8 @@ class QueueWorkflows(unittest.TestCase):
 
     def test_no_controller_polling_or_direct_merging(self):
         doc = yaml.safe_load((ROOT / '.github/workflows/automerge.yml').read_text())
-        self.assertNotIn('schedule', doc[True])
+        # The only schedule is recovery of labeled PRs stuck after finished CI.
+        self.assertEqual(doc[True]['schedule'], [{'cron': '7,27,47 * * * *'}])
         self.assertIn('workflow_run', doc[True])
         self.assertNotIn('merge_group', doc[True])
         self.assertIn('unlabeled', doc[True]['pull_request_target']['types'])
@@ -140,7 +141,7 @@ class QueueWorkflows(unittest.TestCase):
                           if key.startswith('permission-')},
                          {'permission-actions': 'read', 'permission-checks': 'read',
                           'permission-metadata': 'read',
-                          'permission-pull-requests': 'read'})
+                          'permission-pull-requests': 'read', 'permission-statuses': 'read'})
         for key in ['app-id', 'private-key', 'owner', 'repositories']:
             self.assertEqual(reader['with'][key], token['with'][key])
         self.assertEqual(controller['env']['GESHER_READ_TOKEN'], '${{ steps.gesher-read.outputs.token }}')
