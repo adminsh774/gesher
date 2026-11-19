@@ -103,6 +103,17 @@ class QuotaReads(unittest.TestCase):
         self.assertIn('action=wait', self.logs.getvalue())
         self.assertEqual(self.run.call_count, 2)
 
+    def test_fifteen_minute_budget_boundary(self):
+        # delay = reset - server date + 1: 899 waits exactly 900 seconds, 900 fails at once.
+        self.run.side_effect = [reply(403, PRIMARY, headers(899)), reply()]
+        self.assertEqual(reader.get_json(ENDPOINT), {'id': 7})
+        self.assertEqual(sum(c.args[0] for c in self.sleep.call_args_list), 900)
+        self.run.reset_mock(); self.sleep.reset_mock()
+        self.run.side_effect = [reply(403, PRIMARY, headers(900))]
+        with self.assertRaisesRegex(reader.GitHubReadError, 'bounded'):
+            reader.get_json(ENDPOINT)
+        self.sleep.assert_not_called()
+
     def test_rate_wait_does_not_consume_the_247_second_transport_envelope(self):
         responses = [reply(502), reply(503), reply(403, PRIMARY, headers(69)), reply()]
         def invoke(*args, **kwargs):
