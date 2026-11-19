@@ -1,8 +1,8 @@
 name: ci
 
 on:
-  # Temporarily pause CI on main pushes; add branches: [main] under push to resume.
   push:
+    branches: [main]
     # Canonical tag pushes build and test a release. The protected default
     # branch publisher is separate from this read-only workflow.
     tags: ['v[0-9]*.[0-9]*.[0-9]*']
