@@ -16,6 +16,8 @@ import socket
 import struct
 import time
 
+from peer_scope import bind_windows_multicast
+
 INSTANCE = 'Owned.שלום\\😀'
 TYPE = '_grcontract._tcp'
 HOST = ['fixture', 'local']
@@ -160,12 +162,18 @@ def serve(args):
         raise ValueError('owned random service type required')
     args.control.mkdir(parents=True, exist_ok=True)
     family = socket.AF_INET if args.family == 4 else socket.AF_INET6
+    # Own both sockets before setup, including a rejected bind/option/readback.
+    with socket.socket(family, socket.SOCK_STREAM) as tcp, \
+            socket.socket(family, socket.SOCK_DGRAM) as sock:
+        run_peer(args, tcp, sock)
+
+
+def run_peer(args, tcp, sock):
+    family = socket.AF_INET if args.family == 4 else socket.AF_INET6
     address = args.address.split('%')[0]
     local = (address, 0) if args.family == 4 else (address, 0, 0, args.index)
-    tcp = socket.socket(family, socket.SOCK_STREAM)
     tcp.bind(local); tcp.listen(1)
     port = tcp.getsockname()[1]
-    sock = socket.socket(family, socket.SOCK_DGRAM)
     if args.loopback:
         if not socket.inet_pton(family, address) in (socket.inet_pton(socket.AF_INET, '127.0.0.1'),
                                                     socket.inet_pton(socket.AF_INET6, '::1')):
@@ -175,7 +183,7 @@ def serve(args):
     else:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if args.family == 4:
-            sock.bind(('', 5353))
+            bind_windows_multicast(sock, args.family, args.index)
             ip = socket.inet_aton(address)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, ip)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
@@ -185,7 +193,7 @@ def serve(args):
             destination = ('224.0.0.251', 5353)
         else:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            sock.bind(('::', 5353))
+            bind_windows_multicast(sock, args.family, args.index)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, args.index)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_LOOP, 1)
@@ -237,7 +245,6 @@ def serve(args):
                 sock.sendto(wire, sender if destination is None else destination)
                 answers += 1
     finally:
-        sock.close(); tcp.close()
         (args.control / 'result.json').write_text(json.dumps({**metadata,
                 'ownedQueries': requests, 'answers': answers}, indent=2) + '\n')
 

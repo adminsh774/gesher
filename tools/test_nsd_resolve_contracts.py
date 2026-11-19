@@ -90,7 +90,8 @@ def main():
             if peer.returncode:
                 raise RuntimeError('Peer exit ' + str(peer.returncode))
     inputs = {str(value.relative_to(ROOT)): hashlib.sha256(value.read_bytes()).hexdigest()
-              for value in sources + [ROOT / 'tests/nsd/resolver_peer.py', ROOT / 'tests/nsd/framework_host.c', Path(__file__)]}
+              for value in sources + [ROOT / 'tests/nsd/resolver_peer.py', ROOT / 'tests/nsd/peer_scope.py',
+                                       ROOT / 'tests/nsd/framework_host.c', Path(__file__)]}
     included = [Path(value).resolve() for value in shlex.split(
         dependency_file.read_text().replace('\\\n', '').partition(':')[2])]
     native_inputs = {str(value): hashlib.sha256(value.read_bytes()).hexdigest() for value in included}
