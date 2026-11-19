@@ -481,8 +481,12 @@ class JobsTest(unittest.TestCase):
 
     def test_one_hundred_row_page_fails_closed_without_fallback(self):
         duplicate = inventory(73, size=73); duplicate['jobs'][1]['id'] = 1
+        malformed = inventory(73, size=73); malformed['jobs'][5]['id'] = True
+        negative = inventory(73, size=73); negative['jobs'][5]['id'] = -6
+        nonobject = inventory(73, size=73); nonobject['jobs'][5] = None
         for page in (inventory(101, size=100), inventory(73, size=72), inventory(73, size=101),
-                     inventory(1, size=2), duplicate, {'total_count': 0}, None):
+                     inventory(1, size=2), duplicate, malformed, negative, nonobject,
+                     {'total_count': 0}, None):
             with self.subTest(page=page):
                 with patch('github_jobs.get_json', side_effect=[copy.deepcopy(page)]) as read:
                     with self.assertRaises(GitHubReadError): get_jobs(JOBS_ENDPOINT)
