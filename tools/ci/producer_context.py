@@ -74,6 +74,8 @@ def authenticate(path, consumer, role):
     require(payload.get('role') == role, 'Producer role mismatch')
     header = payload if nested is None else payload[nested]
     require(set(consumer) == set(CONTEXT_KEYS), 'Incomplete consumer context')
+    if nested is not None:
+        require(set(header) == set(CONTEXT_KEYS), 'Producer context keyset mismatch')
     original = {key: header[key] for key in CONTEXT_KEYS}
     require(all(original[key] == consumer[key] for key in CONTEXT_KEYS if key != 'attempt'),
             'Producer source/checkout/run/repository/event mismatch')

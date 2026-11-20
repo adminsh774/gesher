@@ -1,9 +1,14 @@
 """Metadata/transport controls; synthetic payloads are not runtime evidence."""
 import copy
+from contextlib import redirect_stdout
+import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -108,6 +113,18 @@ class RetainedProducer(unittest.TestCase):
         self.assertEqual(self.downloads, [])
         self.assertEqual(self.run_reads, [])
 
+    def test_nested_context_rejects_extra_keys_on_both_attempt_paths(self):
+        for role in ('native3-common-host-fixture', 'native3-linux-reference'):
+            for attempt in ('1', '2'):
+                with self.subTest(role=role, attempt=attempt):
+                    self.write_role(role)
+                    payload = json.loads(self.raw)
+                    payload['context']['unexpected'] = 'not an execution identity field'
+                    self.path.write_text(json.dumps(payload))
+                    self.consumer['attempt'] = attempt
+                    self.rejected()
+        self.assertEqual(self.downloads, [])
+
     def test_every_nonattempt_identity_field_is_still_exact(self):
         for key in proof.CONTEXT_KEYS:
             if key == 'attempt':
@@ -203,6 +220,95 @@ class RetainedProducer(unittest.TestCase):
     def test_local_role_cannot_change_after_its_archive_was_verified(self):
         self.download_mutation = lambda: self.path.write_bytes(b'changed')
         self.rejected()
+
+
+class NativeRoleBranches(unittest.TestCase):
+    """Run the actual producer/consumer branches with declared TEXT build inputs."""
+    def setUp(self):
+        root = Path(__file__).resolve().parents[2]
+        spec = importlib.util.spec_from_file_location('native_role_branch_under_test',
+            root / 'tools/native3-locks/union_payload.py')
+        self.native = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.native)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.host = self.root / 'host'; self.host.mkdir()
+        self.reference = self.root / 'reference'; self.reference.mkdir()
+        (self.root / 'dist').mkdir(); (self.root / 'out').mkdir()
+        self.info = dict(source='1' * 40, supplier_head='2' * 40, repository='owner/repo',
+                         repository_id='7', head_repository_id='8', run='9',
+                         attempt='1', event='pull_request')
+        self.compiler = dict(configured_driver='/SYNTHETIC/cxx', launcher=None,
+                             sha256='3' * 64, metadata_sha256='4' * 64)
+        runtime = b'SYNTHETIC_TEXT_NOT_PE production'
+        (self.root / 'dist/dalvikvm.exe').write_bytes(runtime)
+        self.production = dict(self.info, role='production', test_hook_compiled=False,
+                               compiler=self.compiler, executable_sha256=hashlib.sha256(runtime).hexdigest(),
+                               shared_sources={})
+        (self.root / 'dist/web3-production-role.json').write_text(json.dumps(self.production))
+        for name in self.native.TARGETS:
+            (self.host / (name + '.exe')).write_text('SYNTHETIC_TEXT_NOT_PE ' + name)
+            (self.host / (name + '.imports.txt')).write_text('Name: KERNEL32.dll\n')
+        (self.reference / 'linux-reference.json').write_text('{"metadata_fixture":true}\n')
+        commands = {('SYNTHETIC', str(self.root / 'tests/native3-locks' / name), name):
+                    ['/SYNTHETIC/cxx', '-Werror', name]
+                    for name in ('command_worker.cc', 'duplicate_windows_test.cc')}
+        for obj, name, value in (
+                (self.native, 'ROOT', self.root),
+                (self.native, 'source_inventory', lambda: {}),
+                (self.native.host_roles, 'context', lambda: dict(self.info)),
+                (self.native.host_roles, 'compiler', lambda _: self.compiler),
+                (self.native.host_roles, 'cache', lambda _: {'GESHER_WEB3_QUERY_TESTS': 'OFF'}),
+                (self.native.host_roles, 'commands', lambda _: commands),
+                (self.native.host_roles, 'sources', lambda: {})):
+            mocked = patch.object(obj, name, value); mocked.start(); self.addCleanup(mocked.stop)
+
+    def main(self, mode):
+        with patch.object(sys, 'argv', ['union_payload.py', mode, '--host', str(self.host),
+                          '--reference', str(self.reference), '--destination', str(self.root / 'merged')]), \
+             redirect_stdout(io.StringIO()):
+            self.native.main()
+
+    def test_fresh_producer_seals_its_actual_current_context(self):
+        self.main('host')
+        manifest = json.loads((self.host / 'provenance.json').read_text())
+        self.assertEqual(manifest['context'], self.info)
+        self.assertEqual(manifest['production_role'], self.production)
+        self.assertEqual(set(manifest['outputs']), self.native.HOST_FILES)
+
+    def test_native_manifest_rejects_extra_context_keys(self):
+        self.main('host')
+        path = self.host / 'provenance.json'
+        manifest = json.loads(path.read_text())
+        manifest['context']['unexpected'] = 'not allowed'
+        path.write_text(json.dumps(manifest))
+        with self.assertRaises(AssertionError):
+            self.native.check_manifest(self.host, 'native3-common-host-fixture',
+                                       self.native.HOST_FILES, self.info, {})
+
+    def test_consumer_compares_embedded_production_to_authenticated_host(self):
+        self.main('host')
+        host = json.loads((self.host / 'provenance.json').read_text())
+        reference = dict(compiler=dict(sha256='5' * 64, version='SYNTHETIC'), command=['SYNTHETIC'],
+                         outputs={'linux-reference.json': self.native.host_roles.sha(self.reference / 'linux-reference.json')})
+        self.info['attempt'] = '2'
+        # Authentication itself is covered above with real selector predicates
+        # and separately with the captured real ZIP. This boundary supplies its
+        # accepted old producer to the actual remaining consumer/assembly body.
+        with patch.object(self.native, 'check_manifest', side_effect=[host, reference]):
+            self.main('verify')
+        self.assertEqual((self.root / 'merged/native3_lock_command_worker.exe').read_bytes(),
+                         (self.host / 'native3_lock_command_worker.exe').read_bytes())
+
+    def test_consumer_rejects_production_from_a_different_execution(self):
+        self.main('host')
+        host = json.loads((self.host / 'provenance.json').read_text())
+        host['production_role']['attempt'] = '2'
+        self.info['attempt'] = '2'
+        with patch.object(self.native, 'check_manifest', side_effect=[host, {}]):
+            with self.assertRaises(AssertionError):
+                self.main('verify')
 
 
 if __name__ == '__main__':
