@@ -74,6 +74,37 @@ bool ReadChildIdentity(const std::string& report, DWORD* pid, unsigned long long
   return true;
 }
 
+void InitializeProcessCreation() {
+  // Windows initializes process-global handles on its first CreateProcessW.
+  // Initialize only that OS path: the FIRST RestartWithUid remains inside the
+  // strict before/after resource comparison, so none of its own leaks is hidden.
+  auto executable = gesher::zygote::ExePath();
+  Check(!executable.empty(), "process creation initialization executable");
+  std::wstring command = L"\"" + std::wstring(executable.begin(), executable.end())
+      + L"\" --initialize-process-creation";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION child{};
+  Check(CreateProcessW(reinterpret_cast<const wchar_t*>(executable.c_str()), command.data(),
+      nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &startup, &child) != FALSE,
+      "initialize ordinary Windows process creation");
+  DWORD resumed = ResumeThread(child.hThread);
+  DWORD waited = resumed == static_cast<DWORD>(-1) ? WAIT_FAILED
+      : WaitForSingleObject(child.hProcess, 5000);
+  DWORD code = 0;
+  BOOL queried = waited == WAIT_OBJECT_0 ? GetExitCodeProcess(child.hProcess, &code) : FALSE;
+  if (waited != WAIT_OBJECT_0) {
+    TerminateProcess(child.hProcess, 1);
+    WaitForSingleObject(child.hProcess, 5000);
+  }
+  BOOL thread_closed = CloseHandle(child.hThread);
+  BOOL process_closed = CloseHandle(child.hProcess);
+  Check(thread_closed != FALSE && process_closed != FALSE,
+      "process creation initialization releases both owned handles");
+  Check(waited == WAIT_OBJECT_0, "process creation initialization child completed");
+  Check(queried != FALSE && code == 0, "process creation initialization exact child exit");
+}
+
 void Worker(uint32_t expected, const wchar_t* payload) {
   Check(std::wcscmp(payload, L"argument with spaces \u05d0") == 0, "same Unicode arguments");
   wchar_t restarted[2]{};
@@ -96,6 +127,7 @@ void Worker(uint32_t expected, const wchar_t* payload) {
     if (expected == 99) Sleep(INFINITE);  // Parent-death test owns this process and its job.
     ExitProcess(expected);
   }
+  InitializeProcessCreation();
   DWORD before = 0, after = 0;
   Check(GetProcessHandleCount(GetCurrentProcess(), &before) != FALSE, "initial handle count");
   std::printf("supervisor before restart\n"); std::fflush(stdout);
@@ -206,6 +238,7 @@ void Run(uint32_t expected) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  if (argc == 2 && std::wcscmp(argv[1], L"--initialize-process-creation") == 0) return 0;
   if (argc == 4 && std::wcscmp(argv[1], L"--worker") == 0) {
     Worker(static_cast<uint32_t>(std::wcstoull(argv[2], nullptr, 10)), argv[3]);
   }
