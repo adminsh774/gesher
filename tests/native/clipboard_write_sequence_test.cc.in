@@ -188,11 +188,16 @@ static void SameOwnerReplacement() {
   Check(replaced != 0 && replaced == GetClipboardSequenceNumber(), "competing same-HWND receipt is current");
   Check(GetClipboardOwner() == g_window, "competing write retains identical owner HWND");
 }
-struct ForeignState { HANDLE ready{}, stop{}, process{}; DWORD pid{}; };
+struct ForeignObservation { LONG opened, published; DWORD error; };
+struct ForeignState { HANDLE ready{}, stop{}, process{}, mapping{}; ForeignObservation* observation{}; DWORD pid{}; };
 static ForeignState foreign;
 static bool clone_receipt;
+static bool borrow_original_owner;
+static bool raw_opened;
 static bool RawWrite(HWND owner, const GUID* cloned) {
+  raw_opened = false;
   if (!OpenClipboard(owner)) return false;
+  raw_opened = true;
   bool ok = EmptyClipboard() != 0;
   const wchar_t text[] = L"external foreign writer";
   HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, sizeof(text));
@@ -220,9 +225,14 @@ static void StartForeignReplacement() {
   std::wstring suffix = std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64());
   std::wstring ready_name = L"Local\\GesherClipboardReady_" + suffix;
   std::wstring stop_name = L"Local\\GesherClipboardStop_" + suffix;
+  std::wstring map_name = L"Local\\GesherClipboardObservation_" + suffix;
   foreign.ready = CreateEventW(nullptr, TRUE, FALSE, ready_name.c_str());
   foreign.stop = CreateEventW(nullptr, TRUE, FALSE, stop_name.c_str());
+  foreign.mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(ForeignObservation), map_name.c_str());
+  foreign.observation = foreign.mapping ? static_cast<ForeignObservation*>(MapViewOfFile(foreign.mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ForeignObservation))) : nullptr;
   Check(foreign.ready && foreign.stop, "owned child synchronization handles");
+  Check(foreign.observation != nullptr, "owned child observation mapping");
+  if (foreign.observation) *foreign.observation = {-1, -1, 0};
   std::wstring token = L"none";
   if (clone_receipt) {
     Check(OpenClipboard(nullptr) != 0, "read original token for foreign-owner negative");
@@ -233,7 +243,8 @@ static void StartForeignReplacement() {
       for (int i = 0; i < 16; ++i) { token += hex[bytes[i] >> 4]; token += hex[bytes[i] & 15]; } GlobalUnlock(memory); }
     Check(CloseClipboard() != 0, "original token read close");
   }
-  std::wstring command = L"\"" + std::wstring(executable) + L"\" --foreign " + ready_name + L" " + stop_name + L" " + token;
+  std::wstring command = L"\"" + std::wstring(executable) + L"\" --foreign " + ready_name + L" " + stop_name + L" " + token
+      + L" " + map_name + L" " + std::to_wstring(borrow_original_owner ? reinterpret_cast<uintptr_t>(g_window) : 0);
   STARTUPINFOW startup{}; startup.cb = sizeof(startup); PROCESS_INFORMATION process{};
   bool started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process) != 0;
   Check(started, "real external writer process creation");
@@ -242,10 +253,19 @@ static void StartForeignReplacement() {
   Check(CloseHandle(process.hThread) != 0, "child thread handle retired");
   Check(WaitForSingleObject(foreign.ready, 10000) == WAIT_OBJECT_0, "external writer completed before receipt reopen");
   DWORD owner_pid = 0; HWND owner = GetClipboardOwner(); GetWindowThreadProcessId(owner, &owner_pid);
-  Check(owner && owner != g_window && owner_pid == foreign.pid && owner_pid != GetCurrentProcessId(), "actual foreign owner PID and HWND");
+  Check(foreign.observation && foreign.observation->opened >= 0 && foreign.observation->published >= 0, "actual foreign OpenClipboard and publication outcomes");
+  if (!borrow_original_owner) {
+    Check(foreign.observation && foreign.observation->opened == 1 && foreign.observation->published == 1, "ordinary foreign writer actually published");
+    Check(owner && owner != g_window && owner_pid == foreign.pid && owner_pid != GetCurrentProcessId(), "actual foreign owner PID and HWND");
+  } else {
+    Check(foreign.observation && (foreign.observation->opened == 0 || foreign.observation->published == 1), "borrowed-HWND probe either rejected at OpenClipboard or actually published");
+  }
   FILETIME created, exited, kernel, user;
   Check(GetProcessTimes(foreign.process, &created, &exited, &kernel, &user) != 0, "external writer native creation identity");
-  std::printf("CLIP_SEQUENCE foreign pid=%lu created=%08lx%08lx hwnd=%p cloned=%d\n", foreign.pid, created.dwHighDateTime, created.dwLowDateTime, (void*)owner, clone_receipt);
+  std::printf("CLIP_SEQUENCE foreign pid=%lu created=%08lx%08lx hwnd=%p cloned=%d borrowed=%d opened=%ld published=%ld error=%lu\n",
+      foreign.pid, created.dwHighDateTime, created.dwLowDateTime, (void*)owner, clone_receipt, borrow_original_owner,
+      foreign.observation ? foreign.observation->opened : -1L, foreign.observation ? foreign.observation->published : -1L,
+      foreign.observation ? foreign.observation->error : 0);
 }
 static void StopForeign() {
   if (foreign.process) {
@@ -258,11 +278,15 @@ static void StopForeign() {
   }
   if (foreign.ready) Check(CloseHandle(foreign.ready) != 0, "owned ready event closed");
   if (foreign.stop) Check(CloseHandle(foreign.stop) != 0, "owned stop event closed");
+  if (foreign.observation) Check(UnmapViewOfFile(foreign.observation) != 0, "owned observation view closed");
+  if (foreign.mapping) Check(CloseHandle(foreign.mapping) != 0, "owned observation mapping closed");
   foreign = {};
 }
-static int Child(const char* ready_name, const char* stop_name, const char* token) {
+static int Child(const char* ready_name, const char* stop_name, const char* token, const char* map_name, const char* borrowed_owner) {
   HANDLE ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, ready_name), stop = OpenEventA(SYNCHRONIZE, FALSE, stop_name);
-  if (!ready || !stop) return 20;
+  HANDLE mapping = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, map_name);
+  auto* observation = mapping ? static_cast<ForeignObservation*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ForeignObservation))) : nullptr;
+  if (!ready || !stop || !observation) return 20;
   GUID copied{}; GUID* clone = nullptr;
   if (std::strlen(token) == 32) {
     auto* bytes = reinterpret_cast<unsigned char*>(&copied);
@@ -270,18 +294,42 @@ static int Child(const char* ready_name, const char* stop_name, const char* toke
     clone = &copied;
   }
   HWND owner = CreateWindowExW(0, L"STATIC", L"Owned external clipboard control", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
-  bool ok = owner && RawWrite(owner, clone) && SetEvent(ready);
+  HWND borrowed = reinterpret_cast<HWND>(static_cast<uintptr_t>(std::strtoull(borrowed_owner, nullptr, 10)));
+  SetLastError(ERROR_SUCCESS);
+  bool wrote = owner && RawWrite(borrowed ? borrowed : owner, clone);
+  DWORD error = GetLastError();
+  *observation = {raw_opened ? 1L : 0L, wrote ? 1L : 0L, error};
+  bool ok = owner && (wrote || (borrowed && !raw_opened)) && SetEvent(ready);
   if (ok) ok = WaitForSingleObject(stop, 30000) == WAIT_OBJECT_0;
   if (owner) ok = DestroyWindow(owner) && ok;
   ok = CloseHandle(ready) && ok; ok = CloseHandle(stop) && ok;
+  ok = UnmapViewOfFile(observation) && ok; ok = CloseHandle(mapping) && ok;
   return ok ? 0 : 21;
 }
 int main(int argc, char** argv) {
   receipt_format = RegisterClipboardFormatW(L"Gesher.Clipboard.WriteReceipt.v1");
-  if (argc == 5 && std::strcmp(argv[1], "--foreign") == 0) return Child(argv[2], argv[3], argv[4]);
+  if (argc == 7 && std::strcmp(argv[1], "--foreign") == 0) return Child(argv[2], argv[3], argv[4], argv[5], argv[6]);
   bool old = argc == 2 && std::strcmp(argv[1], "--old-control") == 0;
-  g_window = CreateWindowExW(0, L"STATIC", L"Owned production clipboard contract", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
-  if (!g_window || !receipt_format) return 10;
+  HANDLE window_ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE owner_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!window_ready || !owner_done || !receipt_format) return 10;
+  DWORD owner_thread_id = 0; std::atomic<bool> owner_retired{false};
+  // Production owns this HWND on its independently pumped event thread. A
+  // foreign EmptyClipboard can synchronously notify it while the writer waits.
+  std::thread owner_thread([&] {
+    owner_thread_id = GetCurrentThreadId();
+    HWND owner = CreateWindowExW(0, L"STATIC", L"Owned production clipboard contract", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    g_window = owner; SetEvent(window_ready);
+    if (owner) {
+      MSG message;
+      while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
+      owner_retired = DestroyWindow(owner) != 0 && !IsWindow(owner);
+    }
+    SetEvent(owner_done);
+  });
+  Check(WaitForSingleObject(window_ready, 10000) == WAIT_OBJECT_0, "real owner event thread created its window");
+  Check(CloseHandle(window_ready) != 0, "owner startup event closed");
+  if (!g_window) { owner_thread.join(); CloseHandle(owner_done); return 10; }
   for (int kind = 0; kind < 3; ++kind) {
     ResetControl(); uint32_t sequence = 0;
     bool ok = Write(kind, &sequence);
@@ -303,11 +351,18 @@ int main(int argc, char** argv) {
       Check(sequence == 0, "same HWND replacement must not inherit original Android source");
       std::u16string text; Check(gesher::devsvc::ClipboardText(&text) && text == u"same owner replacement", "same-owner actual replacement remains readable");
       CheckResources();
-      for (bool clone : {false, true}) {
-        ResetControl(); clone_receipt = clone; race_after_close = StartForeignReplacement; sequence = 99;
+      for (int foreign_case : {0, 1, 2}) {
+        ResetControl(); clone_receipt = foreign_case != 0; borrow_original_owner = foreign_case == 2;
+        race_after_close = StartForeignReplacement; sequence = 99;
         Check(Write(kind, &sequence), "original write completed before foreign race");
-        Check(sequence == 0, "foreign writer must not inherit original Android source");
-        Check(gesher::devsvc::ClipboardText(&text) && text == u"external foreign writer", "actual external contents remain readable");
+        bool rejected_open = foreign.observation && borrow_original_owner && foreign.observation->opened == 0;
+        if (rejected_open) {
+          Check(sequence != 0 && sequence == GetClipboardSequenceNumber(), "OS-rejected borrowed HWND preserves original publication");
+          Check(gesher::devsvc::ClipboardText(&text) && text == u"own text", "OS-rejected borrowed HWND leaves original content intact");
+        } else {
+          Check(sequence == 0, "foreign writer must not inherit original Android source");
+          Check(gesher::devsvc::ClipboardText(&text) && text == u"external foreign writer", "actual external contents remain readable");
+        }
         StopForeign(); CheckResources();
       }
       for (Fault failure : {Fault::Guid, Fault::Format, Fault::Allocate, Fault::LockWrite, Fault::Set, Fault::Reopen, Fault::LockRead, Fault::MissingRead}) {
@@ -338,7 +393,14 @@ int main(int argc, char** argv) {
           && !gesher::windows::ReadClipboardImage(&image), "clear preserves absent text HTML and image");
     CheckResources();
   }
-  Check(DestroyWindow(g_window) != 0 && !IsWindow(g_window), "owned publication window retired");
+  Check(PostThreadMessageW(owner_thread_id, WM_QUIT, 0, 0) != 0, "owned event thread retirement posted");
+  if (WaitForSingleObject(owner_done, 5000) != WAIT_OBJECT_0) {
+    std::printf("FAIL CLIP_SEQUENCE owner event thread exceeded retirement deadline\n");
+    std::fflush(stdout); ExitProcess(12);
+  }
+  owner_thread.join();
+  Check(CloseHandle(owner_done) != 0, "owner retirement event closed");
+  Check(owner_retired && !IsWindow(g_window), "owned publication window and event thread retired");
   std::printf("CLIP_SEQUENCE completed checks=%d failures=%d unique_receipts=%zu old=%d\n", checks, failures, tokens.size(), old);
   return failures || duplicate_tokens ? 1 : 0;
 }
