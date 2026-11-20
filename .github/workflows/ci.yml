@@ -1927,6 +1927,8 @@ jobs:
           exit $LASTEXITCODE
 
       - name: Run tests
+        env:
+          GESHER_TRACE_TOAST_IDENTITY: ${{ matrix.shard == 'services' && '1' || '0' }}
         shell: pwsh
         run: |
           pwsh -NoProfile -File tests/windows/run-tests.ps1 dist -Shard ${{ matrix.shard }} -Web3Observer dist/web3_process_waits.exe | Tee-Object -FilePath results.txt
@@ -1987,6 +1989,8 @@ jobs:
             results.txt
             ci-owners.json
             dist/realtime-signals-evidence/**/*.json
+            ${{ runner.temp }}/gesher-root/devsvc-toast-*-projection.jsonl
+            ${{ runner.temp }}/gesher-root/logs/system_server.log
           if-no-files-found: error
 
   test:
