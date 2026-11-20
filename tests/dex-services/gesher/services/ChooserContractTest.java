@@ -882,6 +882,11 @@ public final class ChooserContractTest {
     }
     public static void main(String[] args) throws Exception {
         System.loadLibrary("android_runtime");
+        // This isolated service fixture does not run SystemServer's bootstrap.
+        // Component retirement invalidates the real package-info nonce, so own
+        // the same writable native region before constructing any services.
+        com.android.internal.os.ApplicationSharedMemory.setInstance(
+                com.android.internal.os.ApplicationSharedMemory.create());
         android.content.res.AssetManager.createSystemAssetsInZygoteLocked(false, System.getenv("ANDROID_ROOT") + "/framework/framework-res.apk");
         System.out.println("ChooserContractTest all passed: " + run(true) + " checks (actual AIDL/Parcel, production launches and grants; scripted user-input boundary)");
     }
