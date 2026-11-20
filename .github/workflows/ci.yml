@@ -213,6 +213,7 @@ jobs:
           python3 -m unittest discover -s .github/actions/local-build-cache -p test_cache.py
           python3 -m unittest discover -s tools/ci -p 'test_github*.py'
           python3 -m unittest discover -s tools/ci -p test_artifact_batch.py
+          python3 -m unittest discover -s tools/ci -p test_producer_context.py
           python3 -m unittest discover -s tools/ci -p test_wait_for_job.py
           python3 -m unittest discover -s tools/media_capture -p 'test_*.py'
           python3 tools/toolchain/test_coherent_tcp_context.py
@@ -1755,6 +1756,8 @@ jobs:
           pwsh -NoProfile -File tests/e2e/test-apks.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pwsh -NoProfile -File tests/e2e/test-evidence.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File tests/e2e/render-readiness.test.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/e2e/test_coverage.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
