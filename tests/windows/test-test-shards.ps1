@@ -15,7 +15,7 @@ foreach ($track in $tracks) {
   }, $false)) { $functions[$definition.Name] = $track.Name }
 }
 $covered = @()
-foreach ($shard in 'native', 'desktop', 'services', 'compilation') {
+foreach ($shard in 'native', 'desktop', 'services', 'media', 'compilation') {
   $plan = & $planner -Shard $shard
   $listed = @(& (Join-Path $PSHOME 'pwsh') -NoProfile -File "$PSScriptRoot/run-tests.ps1" unused -Shard $shard -ListTracks)
   if ($LASTEXITCODE -ne 0 -or (Compare-Object $listed $plan.Tracks.Name)) { throw "Runner selection differs for $shard" }
