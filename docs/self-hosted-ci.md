@@ -40,9 +40,12 @@ expected. Windows-only execution tests continue on GitHub-hosted Windows.
 The CI caller pins the combined `framework.yml` recipe at
 `jobs.framework.uses` in `.github/workflows/ci.yml`. That workflow pins the
 runner-route action to `5d76cae649c2257c376aaf87a5283099c99f111c`; its
-local-cache actions remain pinned to `b9510513a538d80669895521d1061b54fbe11aff`.
+local-cache actions pin to `e5eb64d95271bc83c4eb40c9a069a2a45acac11c`.
+Hosted cache saves are limited to `main`; branch and PR restores retain the
+same keys, inputs and behavior.
 The recipe retains the current notification, SoftAP and Wi-Fi Direct contracts
-and adds the suggestion/Passpoint value and geolocation lifetime contracts.
+and adds the suggestion/Passpoint value, network specifier and geolocation
+lifetime contracts.
 Changes to PR workflow files cannot change the policy authorized by the runner
 group. Publishing a replacement requires reviewing/pinning a new immutable
 policy and explicitly updating the group allowlist before enabling local use.
