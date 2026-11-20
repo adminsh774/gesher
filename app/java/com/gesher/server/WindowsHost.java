@@ -173,17 +173,34 @@ public final class WindowsHost {
         try {
             return nativeSetClipboardRich(text, html, imageBytes);
         } catch (Throwable t) {
-            return setClipboard(text, html);
+            return false;
         }
     }
 
-    /** Sequence captured during this write while Windows' clipboard is open; zero means unavailable. */
+    /** Exact private publication and complete native buffers bind this one write's sequence.
+     * Zero means unavailable or raced completion; a later sequence always invalidates the receipt. */
     static int setClipboardSequence(String text, String html, byte[] image) {
         if (!available()) return 0;
         try {
             return image == null ? nativeSetClipboardSequence(text, html)
                     : nativeSetClipboardRichSequence(text, html, image);
         } catch (UnsatisfiedLinkError unavailable) { return 0; }
+    }
+
+    static int clearClipboardSequence() {
+        if (!available()) return 0;
+        try { return nativeClearClipboardSequence(); }
+        catch (UnsatisfiedLinkError unavailable) { return 0; }
+    }
+
+    static boolean retainClipboardPublisher() {
+        if (!available()) return false;
+        try { return nativeRetainClipboardPublisher(); }
+        catch (UnsatisfiedLinkError unavailable) { return false; }
+    }
+
+    static void releaseClipboardPublisher() {
+        nativeReleaseClipboardPublisher();
     }
 
     public static int clipboardSequence() {
@@ -444,6 +461,9 @@ public final class WindowsHost {
             byte[] imageBytes);
     private static native int nativeSetClipboardSequence(String text, String html);
     private static native int nativeSetClipboardRichSequence(String text, String html, byte[] image);
+    private static native int nativeClearClipboardSequence();
+    private static native boolean nativeRetainClipboardPublisher();
+    private static native void nativeReleaseClipboardPublisher();
     private static native int nativeClipboardSequence();
     private static native long[] nativeForegroundProcess();
     private static native int nativeSessionLockState();

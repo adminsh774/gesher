@@ -47,10 +47,10 @@ bool ClipboardText(std::u16string* text);
 // The fragment of the "HTML Format" (CF_HTML) data, as UTF-16; false if none.
 bool ClipboardHtml(std::u16string* html);
 // Replaces the clipboard's contents with `text` (CF_UNICODETEXT) and, when not
-// empty, `html` as CF_HTML; the event window is the owner. Empty text and html
-// just empty the clipboard.
+// empty, `html` as CF_HTML on the shared owned OLE STA. Text presence is
+// explicit: absent text plus absent HTML clears; present empty text remains text.
 bool SetClipboard(const std::u16string& text, const std::u16string& html,
-                  uint32_t* written_sequence = nullptr);
+                  uint32_t* written_sequence = nullptr, bool has_text = true);
 // GetClipboardSequenceNumber.
 uint32_t ClipboardSequence();
 // Stable foreground process identity (native creation FILETIME), false if unknown.

@@ -14,6 +14,8 @@
 
 #include "core_jni_helpers.h"
 #include "devsvc_win32.h"
+#include "../windows/clipboard_publication.h"
+#include <new>
 
 extern "C" void __stdcall Sleep(unsigned long dwMilliseconds);
 
@@ -133,7 +135,9 @@ std::u16string Str(JNIEnv* env, jstring s) {
   if (s == nullptr) return std::u16string();
   const jchar* chars = env->GetStringChars(s, nullptr);
   if (chars == nullptr) return std::u16string();
-  std::u16string result(reinterpret_cast<const char16_t*>(chars), env->GetStringLength(s));
+  std::u16string result;
+  try { result.assign(reinterpret_cast<const char16_t*>(chars), env->GetStringLength(s)); }
+  catch (...) { env->ReleaseStringChars(s, chars); throw; }
   env->ReleaseStringChars(s, chars);
   return result;
 }
@@ -177,12 +181,37 @@ jstring WindowsHost_clipboardHtml(JNIEnv* env, jclass) {
 }
 
 jboolean WindowsHost_setClipboard(JNIEnv* env, jclass, jstring text, jstring html) {
-  return dev::SetClipboard(Str(env, text), Str(env, html)) ? JNI_TRUE : JNI_FALSE;
+  try {
+    const auto native_text = Str(env, text);
+    if (env->ExceptionCheck()) return JNI_FALSE;
+    const auto native_html = Str(env, html);
+    if (env->ExceptionCheck()) return JNI_FALSE;
+    return dev::SetClipboard(native_text, native_html, nullptr, text != nullptr) ? JNI_TRUE : JNI_FALSE;
+  } catch (const std::bad_alloc&) { return JNI_FALSE; }
 }
 
 jint WindowsHost_setClipboardSequence(JNIEnv* env, jclass, jstring text, jstring html) {
+  try {
+    const auto native_text = Str(env, text);
+    if (env->ExceptionCheck()) return 0;
+    const auto native_html = Str(env, html);
+    if (env->ExceptionCheck()) return 0;
+    uint32_t sequence = 0;
+    return dev::SetClipboard(native_text, native_html, &sequence, text != nullptr) ? static_cast<jint>(sequence) : 0;
+  } catch (const std::bad_alloc&) { return 0; }
+}
+
+jint WindowsHost_clearClipboardSequence(JNIEnv*, jclass) {
   uint32_t sequence = 0;
-  return dev::SetClipboard(Str(env, text), Str(env, html), &sequence) ? static_cast<jint>(sequence) : 0;
+  return gesher::windows::ClearClipboardPublication(&sequence) ? static_cast<jint>(sequence) : 0;
+}
+
+jboolean WindowsHost_retainClipboardPublisher(JNIEnv*, jclass) {
+  return gesher::windows::RetainClipboardPublisher() ? JNI_TRUE : JNI_FALSE;
+}
+
+void WindowsHost_releaseClipboardPublisher(JNIEnv*, jclass) {
+  gesher::windows::ReleaseClipboardPublisher();
 }
 
 jint WindowsHost_clipboardSequence(JNIEnv*, jclass) {
@@ -411,6 +440,9 @@ const JNINativeMethod gWindowsHostMethods[] = {
      GESHER_JNI(WindowsHost_setClipboardSequence)},
     {"nativeSetClipboardRichSequence", "(" DEVSVC_STRING DEVSVC_STRING "[B)I",
      GESHER_JNI_SYSV(Java_com_gesher_server_WindowsHost_nativeSetClipboardRichSequence)},
+    {"nativeClearClipboardSequence", "()I", GESHER_JNI(WindowsHost_clearClipboardSequence)},
+    {"nativeRetainClipboardPublisher", "()Z", GESHER_JNI(WindowsHost_retainClipboardPublisher)},
+    {"nativeReleaseClipboardPublisher", "()V", GESHER_JNI(WindowsHost_releaseClipboardPublisher)},
     {"nativeClipboardSequence", "()I", GESHER_JNI(WindowsHost_clipboardSequence)},
     {"nativeForegroundProcess", "()[J", GESHER_JNI(WindowsHost_foregroundProcess)},
     {"nativeSessionLockState", "()I", GESHER_JNI(WindowsHost_sessionLockState)},

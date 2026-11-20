@@ -156,6 +156,35 @@ public final class ClipboardSecurityContractTest {
             check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null,
                     "An external sequence never inherits the preceding Android writer's provenance");
         });
+        h.write("last real native data");
+        h.nativeState.rejectWrite = true;
+        try {
+            h.asOwner(() -> h.api.setPrimaryClip(ClipData.newRawUri("unpublished private URI",
+                    Uri.parse("content://fixture.provider/not-published")), OWNER, null, 0, 0));
+        } finally { h.nativeState.rejectWrite = false; }
+        h.as(h.privileged, () -> {
+            ClipData actual = h.api.getPrimaryClip(PRIVILEGED, null, 0, 0);
+            check(actual != null && actual.getItemAt(0).getText() != null
+                    && "last real native data".contentEquals(actual.getItemAt(0).getText())
+                    && actual.getItemAt(0).getUri() == null,
+                    "A failed unbound write cannot retain private URI data over an unchanged old native generation");
+            check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null,
+                    "An unavailable receipt never invents Android source ownership");
+        });
+        Uri privateUri = Uri.parse("content://fixture.provider/same-looking-projection");
+        h.asOwner(() -> h.api.setPrimaryClip(ClipData.newRawUri("private", privateUri), OWNER, null, 0, 0));
+        h.as(h.privileged, () -> check(privateUri.equals(h.api.getPrimaryClip(PRIVILEGED, null, 0, 0).getItemAt(0).getUri()),
+                "A completed own publication retains its original typed URI"));
+        h.nativeState.external(privateUri.toString(), null);
+        h.as(h.privileged, () -> {
+            ClipData actual = h.api.getPrimaryClip(PRIVILEGED, null, 0, 0);
+            check(actual != null && actual.getItemAt(0).getText() != null
+                    && privateUri.toString().contentEquals(actual.getItemAt(0).getText())
+                    && actual.getItemAt(0).getUri() == null,
+                    "A later same-looking native generation cannot revive stale typed URI data");
+            check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null,
+                    "Equal native text never re-adopts the earlier Android source");
+        });
         h.nativeState.external("external", null);
         h.as(h.privileged, () -> check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null, "Windows content retires Android source attribution"));
         h.nativeState.external(null, new byte[]{'B', 'M', 0, 1});

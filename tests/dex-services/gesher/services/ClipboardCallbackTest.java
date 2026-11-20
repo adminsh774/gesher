@@ -2,6 +2,17 @@
 package gesher.services;
 
 import android.content.ClipData;
+import android.content.ClipDescription;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.PersistableBundle;
+import com.gesher.server.ClipboardService;
+import com.gesher.server.PackageManagerService;
+import java.io.File;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.util.List;
 import android.os.Binder;
 import android.os.RemoteCallbackList;
 import com.gesher.server.WindowsHost;
@@ -73,6 +84,113 @@ public final class ClipboardCallbackTest {
         }
         return checks;
     }
+    private static void typedNativeClipboard(ClipboardFixture h, String nonce) throws Exception {
+        check(WindowsHost.sessionLockState() == 0,
+                "An actual unlocked Windows session is required to exercise typed clipboard reads");
+        Uri uri = Uri.parse("content://fixture.provider/private/" + nonce);
+        Intent intent = new Intent(Intent.ACTION_VIEW, uri).putExtra("private-token", nonce);
+        ClipDescription description = new ClipDescription("private Android description",
+                new String[]{"text/html", "text/uri-list", "text/vnd.android.intent"});
+        PersistableBundle extras = new PersistableBundle(); extras.putString("private-token", nonce);
+        description.setExtras(extras);
+        ClipData typed = new ClipData(description, new ClipData.Item(nonce, "<b>" + nonce + "</b>", intent, uri));
+        typed.addItem(new ClipData.Item(new Intent(Intent.ACTION_SEND).putExtra("second-token", nonce)));
+        h.as(h.privileged, () -> h.api.setPrimaryClip(typed, PRIVILEGED, null, 0, 0));
+        String nativeText = WindowsHost.clipboardText(), nativeHtml = WindowsHost.clipboardHtml();
+        check(nativeText != null && nativeHtml != null, "Typed Android write publishes its real text/HTML projection");
+        h.as(h.privileged, () -> {
+            ClipData own = h.api.getPrimaryClip(PRIVILEGED, null, 0, 0);
+            check(own != null && own.getItemCount() == 2 && uri.equals(own.getItemAt(0).getUri())
+                    && nonce.equals(own.getItemAt(0).getIntent().getStringExtra("private-token"))
+                    && nonce.equals(own.getItemAt(1).getIntent().getStringExtra("second-token")),
+                    "Read-only native consumption retains every original URI/Intent item of the accepted Android publication");
+            check(nonce.equals(own.getDescription().getExtras().getString("private-token"))
+                    && PRIVILEGED.equals(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0)),
+                    "Private description metadata and authenticated source survive own publication");
+        });
+        check(WindowsHost.setClipboard(nativeText, nativeHtml), "Actual later native writer publishes the same visible projection");
+        h.as(h.privileged, () -> {
+            ClipData external = h.api.getPrimaryClip(PRIVILEGED, null, 0, 0);
+            check(external != null && external.getItemCount() == 1
+                    && external.getItemAt(0).getUri() == null && external.getItemAt(0).getIntent() == null
+                    && nativeText.contentEquals(external.getItemAt(0).getText()),
+                    "A new equal-looking native generation retires stale private Android URI/Intent data");
+            check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null,
+                    "A later equal-looking Windows clip never re-adopts the preceding Android source");
+        });
+        File image = File.createTempFile("clipboard-native-typed-", ".bmp");
+        try {
+            ByteBuffer bmp = ByteBuffer.allocate(62).order(ByteOrder.LITTLE_ENDIAN);
+            bmp.putShort((short)0x4d42).putInt(62).putInt(0).putInt(54);
+            bmp.putInt(40).putInt(2).putInt(1).putShort((short)1).putShort((short)32);
+            bmp.putInt(0).putInt(8).putInt(3780).putInt(3780).putInt(0).putInt(0);
+            bmp.putInt(0x00735231).putInt(0x00dbb997);
+            Files.write(image.toPath(), bmp.array());
+            Uri imageUri = Uri.fromFile(image);
+            ClipData rich = new ClipData(new ClipDescription("original BMP", new String[]{"image/bmp"}),
+                    new ClipData.Item(nonce, null, intent, imageUri));
+            h.as(h.privileged, () -> h.api.setPrimaryClip(rich, PRIVILEGED, null, 0, 0));
+            byte[] nativeImage = WindowsHost.clipboardImage();
+            check(nativeImage != null && nativeImage.length > 54, "Actual native preferred image reader receives the requested BMP");
+            h.as(h.privileged, () -> {
+                ClipData own = h.api.getPrimaryClip(PRIVILEGED, null, 0, 0);
+                check(own != null && imageUri.equals(own.getItemAt(0).getUri())
+                        && nonce.equals(own.getItemAt(0).getIntent().getStringExtra("private-token"))
+                        && PRIVILEGED.equals(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0)),
+                        "Native rich publication retains its original typed image URI, Intent and source");
+            });
+            check(!WindowsHost.setClipboardRich("partial text is not the requested image", null, new byte[]{1, 2, 3}),
+                    "Invalid rich input reports failure instead of fabricating text-only success");
+            check(nonce.equals(WindowsHost.clipboardText()), "Failed rich input preserves the actual accepted native content");
+            check(WindowsHost.setClipboardRich(WindowsHost.clipboardText(), null, nativeImage),
+                    "Actual native replacement replays the complete visible image projection");
+            h.as(h.privileged, () -> {
+                ClipData external = h.api.getPrimaryClip(PRIVILEGED, null, 0, 0);
+                check(external != null && external.getItemAt(0).getUri() != null
+                        && !imageUri.equals(external.getItemAt(0).getUri()) && external.getItemAt(0).getIntent() == null,
+                        "A later native image is imported into owned storage without reviving the old typed URI or Intent");
+                check(h.api.getPrimaryClipSource(PRIVILEGED, null, 0, 0) == null,
+                        "Replayed native image data does not inherit Android source attribution");
+                h.api.clearPrimaryClip(PRIVILEGED, null, 0, 0);
+            });
+        } finally { Files.deleteIfExists(image.toPath()); }
+        h.as(h.privileged, () -> h.api.setPrimaryClip(ClipData.newPlainText("empty", ""), PRIVILEGED, null, 0, 0));
+        check("".equals(WindowsHost.clipboardText()), "An empty Android text clip remains a present native text value");
+        h.as(h.privileged, () -> {
+            check(h.api.hasPrimaryClip(PRIVILEGED, null, 0, 0), "Empty text remains an Android primary clip");
+            h.api.clearPrimaryClip(PRIVILEGED, null, 0, 0);
+            check(!h.api.hasPrimaryClip(PRIVILEGED, null, 0, 0), "True clear removes the primary clip");
+        });
+        check(WindowsHost.clipboardText() == null && WindowsHost.clipboardHtml() == null
+                && !WindowsHost.hasClipboardImage(), "True clear removes native formats after typed image/text use");
+    }
+
+    private static int nativeSubscriptions() throws Exception {
+        var listeners = WindowsHost.class.getDeclaredField("sListeners"); listeners.setAccessible(true);
+        return ((List<?>)listeners.get(null)).size();
+    }
+    private static void overlappingNativeLifetimes(ClipboardFixture h, String nonce) throws Exception {
+        int initial = nativeSubscriptions();
+        ClipboardService second = (ClipboardService) make(ClipboardService.class,
+                new Class<?>[]{h.atm.getClass(), PackageManagerService.class}, h.atm, h.pm);
+        try {
+            h.as(h.privileged, () -> second.setPrimaryClip(ClipData.newPlainText("second", nonce), PRIVILEGED, null, 0, 0));
+            check(nativeSubscriptions() == initial + 1, "Second live service owns a distinct native subscription");
+            h.service.close();
+            check(nativeSubscriptions() == initial, "Closing the first service releases only its own subscription");
+            h.as(h.privileged, () -> {
+                second.setPrimaryClip(ClipData.newPlainText("still live", nonce + "-live"), PRIVILEGED, null, 0, 0);
+                ClipData own = second.getPrimaryClip(PRIVILEGED, null, 0, 0);
+                check(own != null && (nonce + "-live").contentEquals(own.getItemAt(0).getText())
+                        && PRIVILEGED.equals(second.getPrimaryClipSource(PRIVILEGED, null, 0, 0)),
+                        "Closing one service does not stop the other service's real native publication");
+            });
+        } finally { second.close(); }
+        check(nativeSubscriptions() == initial - 1, "Last service releases its native subscription");
+        check((nonce + "-live").equals(WindowsHost.clipboardText()),
+                "Last service retirement preserves its accepted Windows content");
+    }
+
     /** Separate Windows/ART gate uses the public production constructor and actual native event delivery. */
     private static void windowsClipboard() throws Exception {
         check(WindowsHost.available(), "Windows clipboard backend unavailable");
@@ -101,6 +219,8 @@ public final class ClipboardCallbackTest {
             check(WindowsHost.clipboardText() == null && WindowsHost.clipboardHtml() == null && !WindowsHost.hasClipboardImage(),
                     "Clear must empty the native clipboard, including the text format");
             h.remove(h.privileged, listener);
+            typedNativeClipboard(h, text);
+            overlappingNativeLifetimes(h, text);
         } finally {
             check(originalImage == null ? WindowsHost.setClipboard(originalText, originalHtml)
                     : WindowsHost.setClipboardRich(originalText, originalHtml, originalImage), "Native clipboard restoration failed");
