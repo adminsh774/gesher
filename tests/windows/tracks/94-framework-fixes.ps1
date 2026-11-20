@@ -96,6 +96,14 @@ Check 'services: concurrent clipboard callbacks and native Windows clipboard upd
   $clipboardCallbacksOut
 } @('ClipboardCallbackTest all passed:')
 
+$clipboardSecurityOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'ClipboardSecurityContractTest') 90
+$clipboardSecurityCode = $LASTEXITCODE
+Check 'services: clipboard security caller focus check and default IME contract' {
+  $global:LASTEXITCODE = $clipboardSecurityCode
+  $clipboardSecurityOut
+} @('ClipboardSecurityContractTest all passed:')
+
 $receiverExportOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'ReceiverExportContractTest') 90
 $receiverExportCode = $LASTEXITCODE
@@ -391,6 +399,23 @@ Check 'services: AppOps defaults, authority, attributed delivery, foreground lif
   $global:LASTEXITCODE = $appOpsCode
   $appOpsOut
 } @('AppOpsContractTest all passed: 482 checks; binder=true')
+
+$uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'PackageUidIsolationContractTest' +
+  (NoDrive (Join-Path $PSScriptRoot '../../dex-services/fixtures/v2only.apk'))) 90
+$uidIsolationCode = $LASTEXITCODE
+Check 'services: per-package identity, distinct UID allocation, sharedUserId and isolation' {
+  $global:LASTEXITCODE = $uidIsolationCode
+  $uidIsolationOut
+} @('PackageUidIsolationContractTest passed:')
+
+$appOpsOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'AppOpsContractTest') 90
+$appOpsCode = $LASTEXITCODE
+Check 'services: AppOps defaults, authority, attributed delivery, foreground lifecycle and signed persistence' {
+  $global:LASTEXITCODE = $appOpsCode
+  $appOpsOut
+} @('AppOpsContractTest all passed: 71 checks; binder=true')
 
 $uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'PackageUidIsolationContractTest' +
