@@ -100,8 +100,21 @@ void Worker(uint32_t expected, const wchar_t* payload) {
   Check(GetProcessHandleCount(GetCurrentProcess(), &before) != FALSE, "initial handle count");
   std::printf("supervisor before restart\n"); std::fflush(stdout);
   uint32_t result = 0;
-  Check(gesher::zygote::RestartWithUid(10037, &result) == 0, "native restart");
-  Check(GetProcessHandleCount(GetCurrentProcess(), &after) != FALSE && before == after,
+  uint32_t restart_error = gesher::zygote::RestartWithUid(10037, &result);
+  if (restart_error != 0) {
+    std::fprintf(stderr, "restart returned Win32 error %u (expected child exit %u)\n",
+        restart_error, expected);
+    std::fflush(stderr);
+  }
+  Check(restart_error == 0, "native restart");
+  BOOL counted = GetProcessHandleCount(GetCurrentProcess(), &after);
+  if (!counted || before != after) {
+    DWORD error = counted ? ERROR_SUCCESS : GetLastError();
+    std::fprintf(stderr, "restart handles before=%lu after=%lu counted=%d error=%lu child-exit=%u\n",
+        before, after, counted, error, result);
+    std::fflush(stderr);
+  }
+  Check(counted != FALSE && before == after,
       "restart releases process, thread, job, stdio and attribute resources");
   std::printf("supervisor observed exact exit %u and released handles\n", result);
   std::fflush(stdout);
@@ -109,6 +122,8 @@ void Worker(uint32_t expected, const wchar_t* payload) {
 }
 
 void Run(uint32_t expected) {
+  std::printf("Restart case expected=%u (0x%08x)\n", expected, expected);
+  std::fflush(stdout);
   File input, output, error;
   Handle in, out, err, job, process, thread;
   in.value = input.Open(GENERIC_READ | GENERIC_WRITE);
@@ -163,7 +178,21 @@ void Run(uint32_t expected) {
   } else {
     Check(WaitForSingleObject(process.value, 15000) == WAIT_OBJECT_0, "restart completed");
     DWORD code = 0;
-    Check(GetExitCodeProcess(process.value, &code) != FALSE && code == expected,
+    BOOL queried = GetExitCodeProcess(process.value, &code);
+    DWORD query_error = queried ? ERROR_SUCCESS : GetLastError();
+    if (!queried || code != expected) {
+      std::string child_output = output.Read(), child_error = error.Read();
+      std::fprintf(stderr,
+          "restart exit expected=%u (0x%08x) observed=%lu (0x%08lx) queried=%d error=%lu supervisor=%lu\n",
+          expected, expected, code, code, queried, query_error, child.dwProcessId);
+      std::fprintf(stderr, "captured stdout (%zu bytes):\n", child_output.size());
+      std::fwrite(child_output.data(), 1, child_output.size(), stderr);
+      std::fprintf(stderr, "\ncaptured stderr (%zu bytes):\n", child_error.size());
+      std::fwrite(child_error.data(), 1, child_error.size(), stderr);
+      std::fprintf(stderr, "\n");
+      std::fflush(stderr);
+    }
+    Check(queried != FALSE && code == expected,
         "exact native exit status (including high bit and 259)");
     std::string stdout_text = output.Read(), stderr_text = error.Read();
     Check(stdout_text.find("input=original input") != std::string::npos,
