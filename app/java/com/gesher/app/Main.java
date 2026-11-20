@@ -206,6 +206,25 @@ public final class Main {
             }
             log("package " + packageName + " from the system server's package manager: "
                     + appInfo.sourceDir);
+            // Stable package UIDs are assigned by the server, and need not be the
+            // runtime's default 10000. Re-enter before attachApplication or any APK
+            // code: changing only the environment of a live VM leaves its native
+            // and Binder identities cached under the old UID. The child queries the
+            // server again, so an environment value never substitutes for admission.
+            if (appInfo.uid < android.os.Process.FIRST_APPLICATION_UID) {
+                throw new SecurityException("The installed package has no application UID");
+            }
+            String binderUid = System.getenv("GESHER_BINDER_UID");
+            if (android.os.Process.myUid() != appInfo.uid
+                    || android.os.Binder.getCallingUid() != appInfo.uid
+                    || android.os.Binder.getCallingPid() != android.os.Process.myPid()
+                    || binderUid != null && !binderUid.equals(Integer.toString(appInfo.uid))) {
+                if ("1".equals(System.getenv("GESHER_STANDALONE_RESTARTED"))) {
+                    throw new SecurityException("App VM identity does not match the installed package");
+                }
+                log("restarting app VM for installed UID " + appInfo.uid);
+                return com.gesher.server.Zygote.restartWithUid(appInfo.uid);
+            }
             if (dataDir != null) {
                 log("--data-dir ignored: the system server's package manager sets the data"
                         + " directory");
