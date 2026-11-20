@@ -143,6 +143,10 @@ add_executable(filesystem_metadata_host_test tests/native/filesystem_metadata_ho
 target_compile_options(filesystem_metadata_host_test PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(filesystem_metadata_host_test PRIVATE gesher_posix)
 
+add_executable(xattr_fd_host_test tests/native/xattr_fd_host_test.cc)
+target_compile_options(xattr_fd_host_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(xattr_fd_host_test PRIVATE gesher_posix advapi32)
+
 add_executable(sqlite_path_test tests/native/sqlite_path_test.cc)
 target_compile_options(sqlite_path_test PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(sqlite_path_test PRIVATE sqlite)
@@ -290,6 +294,14 @@ target_link_libraries(traversal_test PRIVATE gesher_posix)
 add_executable(futex_test tests/native/futex_test.cc)
 target_compile_options(futex_test PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(futex_test PRIVATE gesher_posix)
+
+add_executable(realtime_signals_test tests/native/realtime_signals_test.cc)
+target_compile_options(realtime_signals_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(realtime_signals_test PRIVATE gesher_posix)
+
+add_executable(realtime_signal_contract_test tests/exec/realtime_signals_contract.c)
+target_compile_options(realtime_signal_contract_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(realtime_signal_contract_test PRIVATE gesher_posix)
 
 add_library(futex_test_module SHARED tests/native/futex_test_module.cc)
 set_target_properties(futex_test_module PROPERTIES PREFIX "")

@@ -1,5 +1,45 @@
 # PR 73: current-main integration and runtime repair
 
+## Event-loop fixture continuation, 2026-11-20
+
+This continuation preserves published PR73 head
+`8525b6001b739db477eb9aa161ec73cd3cda03e2` and composes it additively with
+PR199 head `72feb34c5f6dce3e9b42bffcb34458b7a7181c99`, which contains actual
+main `7a45c2468c270bfe68ee5f854aa9d4feaf2208b3`. These are integration inputs,
+not a declaration that PR199 or PR73 has merged or passed every runtime gate.
+
+The required event-loop host must execute production `PollFile`, retaining the
+actual pipe object across descriptor replacement and reporting native readiness
+errors. Its generated scratch translation unit instead lacked the snapshot,
+descriptor guard and pipe-readiness dependencies now used by that body. The
+current head reproduces the original compilation failure before its assertions
+can execute; replacing those operations with successful stubs would not test the
+requested behavior.
+
+The host now extracts the unchanged production `DescriptorGuard`, `PipeAdmission`
+and `PollPipeHandle` bodies. Its declared OS boundary uses a real recursive
+transaction, an owned Linux descriptor duplicate, and actual Linux pipe queue,
+capacity and peer state. The existing poll/epoll, recursion, lifetime, deadline
+and allocation assertions are unchanged. Added cases exercise queued bytes,
+empty pipes, write readiness, final-writer EOF, actual numeric descriptor reuse,
+duplicate closure, and failure propagation. They verify that capture holds the
+descriptor transaction and that the native query executes after it is released.
+
+This boundary does not implement or certify Windows OFD publication, named-pipe
+scheduling or the Windows ABI. The separate existing OFD and Windows contracts
+retain those responsibilities. Local ASan/UBSan execution disables LeakSanitizer
+only because it is unavailable under the traced executor; checked-in CI retains
+its sanitizer command and all original assertions.
+
+The integration repins exactly three dependency hashes in the OFD qualification:
+`unistd.cc` retains main's real `RLIMIT_SIGPENDING` limit, `posix.cmake` retains
+the xattr source, and `process_bionic.cc` retains interrupted-wait error
+propagation. The qualification records both composition heads. The fd/system
+transition patch, socket/native-poll preservation comparisons and negative
+controls are unchanged. No other production change is introduced here.
+
+## Earlier reviewed composition
+
 The integration preserves the approved file-status/open-file-description change
 at `d329e86f2f77dba4e7a52a76c33b16fb8663568a` and composes it with actual main
 `ea1a8feba9e3ec14755789b774fbd135fa8b4432`. Contributor commits remain ancestors.
