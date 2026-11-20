@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Generated with unchanged production bodies by test_bionic_signal_masks.py.
 // This host fixture does not register Windows threads or call guest handlers.
+// Translator code classification and handler invocation are explicit boundaries;
+// accepting native SA_SIGINFO here does not qualify its Windows ucontext frame.
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +38,14 @@ static bool self_available = true;
 State& S() { return shared_state; }
 ThreadState* Self() { return self_available ? &state : nullptr; }
 
+static constexpr uintptr_t kNativeHandler = 2;
+static constexpr uintptr_t kTranslatedHandler = 3;
+namespace gesher::arm64 {
+bool IsGuestCode(const void* address) {
+  return reinterpret_cast<uintptr_t>(address) == kTranslatedHandler;
+}
+}  // namespace gesher::arm64
+
 @ACTION_HELPERS@
 
 struct Delivery {
@@ -53,6 +63,7 @@ static int deliveries, change_before_delivery, change_after_dispatch;
 static void ChangeAction(int& sig) {
   if (sig == 0) return;
   std::lock_guard<std::mutex> lock(S().mutex);
+  S().actions[sig].handler = kTranslatedHandler;
   S().actions[sig].sa_flags |= kSaSiginfo;
   sig = 0;
 }
@@ -98,7 +109,7 @@ static void Reset(uint64_t mask) {
   state.any_pending = false;
   state.alt_stack = {nullptr, 2, 0};
   g_process_pending = false;
-  for (auto& action : S().actions) action = {0, 0, 2, 0, 0};
+  for (auto& action : S().actions) action = {0, 0, kNativeHandler, 0, 0};
   self_available = true;
   deliveries = change_before_delivery = change_after_dispatch = 0;
   dispatched.clear();
@@ -176,6 +187,7 @@ static void NonmutatingCalls() {
     // Queries and invalid operations must not inspect or deliver that record.
     Queue(false, 10, 201);
     Queue(true, 64, 202);
+    S().actions[10].handler = kTranslatedHandler;
     S().actions[10].sa_flags = kSaSiginfo;
     uint64_t input = low_bit, old = sentinel;
     uint64_t* output = mode == 1 ? nullptr : mode == 3 ? &input : &old;
@@ -195,6 +207,7 @@ static void NonmutatingCalls() {
     check("query or invalid operation preserves pending flags, records and actions",
           state.pending.Mask() == low_bit && S().process_pending.Mask() == high_bit &&
           state.any_pending && g_process_pending && queued_records == 2 &&
+          S().actions[10].handler == kTranslatedHandler &&
           S().actions[10].sa_flags == kSaSiginfo);
     CheckRetained(false, 10, 201);
     CheckRetained(true, 64, 202);
@@ -236,6 +249,7 @@ static void PendingDelivery() {
     Queue(true, 10, 304);
     Queue(true, 64, 305);
     Queue(true, 42, 306);
+    S().actions[42].handler = kTranslatedHandler;
     S().actions[42].sa_flags = kSaSiginfo;
     uint64_t input = low_bit | high_bit, old = sentinel;
     errno = ERANGE;
@@ -272,7 +286,10 @@ static void UnsupportedPreflight() {
     Queue(process_queue, sig, 402);
     if (sig == 64) Queue(process_queue, sig, 403);
     auto& action = S().actions[sig];
-    if (kind == 0) action.sa_flags = kSaSiginfo;
+    if (kind == 0) {
+      action.handler = kTranslatedHandler;
+      action.sa_flags = kSaSiginfo;
+    }
     if (kind == 1) { action.sa_flags = kSaOnstack; state.alt_stack.ss_flags = 0; }
     if (kind == 2) action.handler = kSigDfl;
     action.sa_flags |= static_cast<int32_t>(kSaResethand);
@@ -299,7 +316,7 @@ static void UnsupportedPreflight() {
 
 static void SupportedActions() {
   phase = "supported action boundaries";
-  for (int kind = 0; kind < 3; ++kind) {
+  for (int kind = 0; kind < 5; ++kind) {
     variation = kind;
     Reset(timer_bit | high_bit);
     Queue(false, 64, 501);
@@ -307,6 +324,8 @@ static void SupportedActions() {
     if (kind == 0) action.sa_flags = kSaOnstack;  // The alternate stack is disabled.
     if (kind == 1) { action.handler = kSigIgn; action.sa_flags = kSaSiginfo | kSaOnstack; }
     if (kind == 2) action.sa_flags = static_cast<int32_t>(kSaResethand);
+    if (kind == 3) action.sa_flags = kSaSiginfo;
+    if (kind == 4) action.sa_flags = static_cast<int32_t>(kSaSiginfo | kSaResethand);
     const auto saved_action = action;
     uint64_t input = high_bit;
     errno = ERANGE;
@@ -322,8 +341,8 @@ static void SupportedActions() {
             dispatched[0].action.sa_flags == saved_action.sa_flags);
     }
     check("only a supported one-shot handler resets its disposition",
-          action.handler == (kind == 2 ? kSigDfl : saved_action.handler) &&
-          action.sa_flags == (kind == 2 ? 0 : saved_action.sa_flags));
+          action.handler == (kind == 2 || kind == 4 ? kSigDfl : saved_action.handler) &&
+          action.sa_flags == (kind == 2 || kind == 4 ? 0 : saved_action.sa_flags));
     check("successful consumption clears pending indicators",
           state.pending.Mask() == 0 && !state.any_pending && !g_process_pending);
   }
@@ -352,7 +371,7 @@ static void DeliveryFailures() {
           deliveries == 1 && dispatched.empty() && queued_records == 1 &&
           state.pending.Mask() == (process_queue ? 0 : high_bit) &&
           S().process_pending.Mask() == (process_queue ? high_bit : 0) &&
-          S().actions[64].handler == 2 &&
+          S().actions[64].handler == kTranslatedHandler &&
           static_cast<uint32_t>(S().actions[64].sa_flags) == (kSaResethand | kSaSiginfo));
     CheckRetained(process_queue, 64, 601);
   }

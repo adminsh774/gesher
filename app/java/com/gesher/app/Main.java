@@ -77,6 +77,17 @@ public final class Main {
         }
     }
 
+    /** Ends the main Looper's loop once a pending activity relaunch has run. */
+    private static void endLoop(Handler main) {
+        main.post(() -> {
+            if (GesherAppDriver.relaunchPending()) {
+                endLoop(main);
+                return;
+            }
+            throw new EndLoop();
+        });
+    }
+
     /** Prints a line on stdout, prefixed {@code gesher-app: }. */
     public static void log(String message) {
         System.out.println(TAG + ": " + message);
@@ -255,7 +266,9 @@ public final class Main {
         // 7. The app and its Activity, on the main Looper. The main Looper may not
         //    quit (Looper.prepareMainLooper), so the launch ends the loop the way
         //    quitSafely would: a message posted after it, once the messages it left
-        //    behind have run, throws EndLoop out of Looper.loop().
+        //    behind have run, throws EndLoop out of Looper.loop(). A relaunch those
+        //    messages asked for (a configuration change the activity does not handle,
+        //    e.g. LocaleManager.setApplicationLocales) runs first.
         final ApplicationInfo app = appInfo;
         final ActivityInfo target = launch;
         final Throwable[] failure = new Throwable[1];
@@ -275,11 +288,7 @@ public final class Main {
                 failure[0] = t;
                 ended = true;
             } finally {
-                if (ended) {
-                    main.post(() -> {
-                        throw new EndLoop();
-                    });
-                }
+                if (ended) endLoop(main);
             }
         });
         try {

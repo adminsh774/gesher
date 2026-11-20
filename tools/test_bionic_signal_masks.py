@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Check unchanged production mask entry points against Android mask contracts.
 
-Self, guest Dispatch and queue accounting are explicit host fixture boundaries.
+Self, guest-code classification, Dispatch and queue accounting are explicit host
+fixture boundaries.
 The actual pending container and extracted action/claim/delivery helpers execute
 alongside the mask entry points. This tests mask arithmetic, preflight, pending
 records and error/output rules, not Windows thread registration or guest handler
