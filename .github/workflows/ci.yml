@@ -59,6 +59,8 @@ jobs:
             .github/scripts
             .github/workflows
             .github/actions/runner-route
+            .github/actions/local-build-cache
+            .github/actions/setup-build
             tools/ci
       - uses: actions/setup-node@v4
         with:
@@ -72,6 +74,7 @@ jobs:
           python3 -m pip install PyYAML==6.0.3
           python3 .github/scripts/test_automerge_workflows.py
           python3 tools/ci/test_release_workflows.py
+          python3 -m unittest discover -s tools/ci -p test_cache_policy.py
   api37-report-tests:
     needs: [source-identity]
     strategy:
@@ -421,8 +424,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Only main saves; other refs restore main's entry (see .github/actions/setup-build).
       - name: Cache AOSP sources
+        if: github.ref == 'refs/heads/main'
         uses: actions/cache@v4
+        with:
+          path: third_party/aosp
+          key: aosp-${{ hashFiles('aosp.lock', 'patches/**') }}
+          restore-keys: aosp-
+
+      - name: Restore AOSP sources
+        if: github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@v4
         with:
           path: third_party/aosp
           key: aosp-${{ hashFiles('aosp.lock', 'patches/**') }}
@@ -875,8 +888,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Only main saves; other refs restore main's entry (see .github/actions/setup-build).
       - name: Cache AOSP sources
+        if: github.ref == 'refs/heads/main'
         uses: actions/cache@v4
+        with:
+          path: third_party/aosp
+          key: aosp-${{ hashFiles('aosp.lock', 'patches/**') }}
+          restore-keys: aosp-
+
+      - name: Restore AOSP sources
+        if: github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@v4
         with:
           path: third_party/aosp
           key: aosp-${{ hashFiles('aosp.lock', 'patches/**') }}
@@ -2262,7 +2285,7 @@ jobs:
           python3 tools/host-pthread-authority/minimum_receipt.py selftest
       - uses: ./.github/actions/setup-build
         with:
-          ccache-key: runtime
+          ccache-key: selected-minimum
       - name: Cache dynarmic, fmt and Boost headers
         id: deps
         uses: actions/cache@v4
