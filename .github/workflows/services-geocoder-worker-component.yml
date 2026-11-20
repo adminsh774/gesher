@@ -39,7 +39,7 @@ jobs:
             'tests/windows/helpers/run-geocoder-winrt-component.ps1' = '1277bcc858c9c52eb8b24476831aadb286831418'
             # The reviewed shared track includes sensor flush and real permission/
             # UID setup; its geocoder implementation and the other nine pins are unchanged.
-            'tests/windows/tracks/58-devices.ps1' = 'c879618a1ad800ee115e055728a296a76e78e38f'
+            'tests/windows/tracks/58-devices.ps1' = 'b3f3f90ccd1c4c4cc849def7bcdceac03b83be4e'
           }
           foreach ($path in $expected.Keys) {
             $actual = git hash-object $path
