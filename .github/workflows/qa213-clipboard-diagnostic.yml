@@ -1,0 +1,121 @@
+name: qa213-clipboard-diagnostic
+on:
+  push:
+    branches: ['qa/diagnostic-pr213-clipboard-20261120']
+    paths:
+      - '.github/workflows/qa213-clipboard-diagnostic.yml'
+      - 'tools/qa213-clipboard-diagnostic/**'
+      - 'tests/dex-services/gesher/services/ClipboardSourceDiagnostic.java'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: qa213-clipboard-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  compile-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Verify source and fetch exact old compiler inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -z "$(git diff --name-only 1071a0ea72120bdb5afe602517e3ff2676e9f3b9 HEAD -- app compat tests/dex-services/gesher/services/ClipboardFixture.java tests/dex-services/gesher/services/ClipboardCallbackTest.java)"
+          python3 tools/qa213-clipboard-diagnostic/fetch_old.py --out old-inputs framework-classes
+          mkdir -p old-inputs/framework-classes/classes old-inputs/framework-classes/coremod
+          unzip -q old-inputs/framework-classes/framework-classes.zip -d old-inputs/framework-classes/classes
+          unzip -q old-inputs/framework-classes/coremod.zip -d old-inputs/framework-classes/coremod
+          curl --fail --location --max-time 180 https://dl.google.com/android/maven2/com/android/tools/r8/9.5.26/r8-9.5.26.jar -o old-inputs/r8.jar
+          printf '%s  %s\n' 3502f087388ce95bbf5254555927f09385dc2636873964d0bd53f3eaf4fb49ad old-inputs/r8.jar | sha256sum --check --strict
+          curl --fail --location --max-time 180 https://dl.google.com/android/maven2/com/android/tools/build/apksig/8.13.0/apksig-8.13.0.jar -o old-inputs/apksig.jar
+          printf '%s  %s\n' c070ed1394629d74641aa0906f60b2ffa1ee77e6366a1f93437f59717b1aeb89 old-inputs/apksig.jar | sha256sum --check --strict
+      - name: Compile current diagnostic only, retain exact107 runtime separately
+        run: |
+          set -euo pipefail
+          export R8_JAR="$PWD/old-inputs/r8.jar" APKSIG_JAR="$PWD/old-inputs/apksig.jar"
+          app/build.sh compile-app --framework-classes old-inputs/framework-classes/classes --core-classes old-inputs/framework-classes/coremod
+          tests/dex-services/build.sh clipboard-fixture --framework-classes old-inputs/framework-classes/classes --core-classes old-inputs/framework-classes/coremod --app-classes compile-app/gesher-app-classes.jar
+          python3 tools/qa213-clipboard-diagnostic/probe.py clipboard-fixture
+          cp old-inputs/framework-classes-receipt.json clipboard-fixture/
+          git rev-parse HEAD > clipboard-fixture/diagnostic-head.txt
+          sha256sum tests/dex-services/gesher/services/ClipboardFixture.java tests/dex-services/gesher/services/ClipboardCallbackTest.java tests/dex-services/gesher/services/ClipboardSourceDiagnostic.java > clipboard-fixture/fixture-sources.sha256
+          (cd clipboard-fixture && sha256sum services-tests.dex clipboard-sequence.cc native-source-receipt.json > outputs.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qa213-clipboard-${{ github.sha }}-a${{ github.run_attempt }}
+          path: clipboard-fixture/
+          if-no-files-found: error
+          retention-days: 7
+  windows:
+    needs: compile-diagnostic
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Bind current probe producer and exact107 runtime suppliers
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tools/ci/artifact_receipt.py --name "qa213-clipboard-$env:GITHUB_SHA-a$env:GITHUB_RUN_ATTEMPT" --producer compile-diagnostic --destination clipboard-fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Current diagnostic producer verification failed' }
+          if ((Get-Content clipboard-fixture/diagnostic-head.txt -Raw).Trim() -cne $env:GITHUB_SHA) { throw 'Diagnostic checkout mismatch' }
+          foreach ($line in Get-Content clipboard-fixture/outputs.sha256) {
+            $parts = $line -split '\s+', 2
+            if ((Get-FileHash (Join-Path clipboard-fixture $parts[1]) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $parts[0]) { throw 'Diagnostic output digest mismatch' }
+          }
+          foreach ($line in Get-Content clipboard-fixture/fixture-sources.sha256) {
+            $parts = $line -split '\s+', 2
+            if ((Get-FileHash $parts[1] -Algorithm SHA256).Hash.ToLowerInvariant() -cne $parts[0]) { throw 'Diagnostic fixture source mismatch' }
+          }
+          $suppliers = Get-Content tools/ci/test_shard_artifacts.json -Raw | ConvertFrom-Json
+          python tools/qa213-clipboard-diagnostic/fetch_old.py --out old-runtime @($suppliers.name)
+          if ($LASTEXITCODE -ne 0) { throw 'Exact107 negative suppliers failed verification' }
+          foreach ($supplier in $suppliers) {
+            $extra = @()
+            if ($supplier.name -in @('libs-tests','art-gtests','native2')) { $extra = @('--prefix', $supplier.name) }
+            python tools/surface/assemble-artifacts.py --source "old-runtime/$($supplier.name)" --destination dist --ledger old107-owners.json --owner $supplier.destination @extra
+            if ($LASTEXITCODE -ne 0) { throw 'Exact107 supplier assembly failed' }
+          }
+      - name: Compile extracted actual production clipboard body
+        shell: cmd
+        run: cl /nologo /std:c++17 /EHsc /W4 /WX /D_WIN32_WINNT=0x0A00 clipboard-fixture\clipboard-sequence.cc /Fe:clipboard-sequence.exe user32.lib
+      - name: Measure CloseClipboard and unchanged ART admission/source state
+        shell: pwsh
+        run: |
+          Get-FileHash clipboard-sequence.exe -Algorithm SHA256 | Format-List
+          & ./clipboard-sequence.exe | Tee-Object clipboard-native.txt
+          $native = $LASTEXITCODE
+          & tools/qa213-clipboard-diagnostic/run.ps1
+          if ($native -ne 0) { throw 'Actual native clipboard probe failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa213-clipboard-results-${{ matrix.os }}-${{ github.sha }}-a${{ github.run_attempt }}
+          path: |
+            clipboard-native.txt
+            clipboard-art.txt
+            clipboard-fixture/
+            old-runtime/*-receipt.json
+            old107-owners.json
+          if-no-files-found: error
+          retention-days: 7
