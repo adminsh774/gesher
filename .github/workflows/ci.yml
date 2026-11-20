@@ -606,7 +606,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 tools/ci/wait_for_job.py --job build-framework-assets --timeout 3600
+          python3 tools/ci/wait_for_job.py --job build-framework-assets --timeout 1800
           python3 tools/ci/artifact_receipt.py --name framework-assets --producer build-framework-assets --destination dist
 
       - name: Collect artifacts

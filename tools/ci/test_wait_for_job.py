@@ -2,7 +2,7 @@
 import unittest
 
 from github_read import GitHubReadError
-from wait_for_job import READ_FAILURES, current_endpoint, wait
+from wait_for_job import MISSING_READS, READ_FAILURES, Missing, current_endpoint, wait
 
 
 def inventory(*rows):
@@ -40,13 +40,12 @@ class WaitForJobTest(unittest.TestCase):
     def test_waits_until_success(self):
         other = dict(name='producer-2', status='completed', conclusion='failure')
         job, clock = self.run_wait([
-            inventory(other),
             inventory(other, dict(name='producer', status='queued', conclusion=None)),
             inventory(other, dict(name='producer', status='in_progress', conclusion=None)),
             inventory(other, dict(name='producer', status='completed', conclusion='success')),
         ])
         self.assertEqual(job['name'], 'producer')
-        self.assertEqual(clock.sleeps, [10, 10, 10])
+        self.assertEqual(clock.sleeps, [10, 10])
 
     def test_immediate_success_does_not_sleep(self):
         _, clock = self.run_wait([inventory(dict(name='producer', status='completed', conclusion='success'))])
@@ -63,10 +62,19 @@ class WaitForJobTest(unittest.TestCase):
             self.run_wait([inventory(row, row)])
 
     def test_suffix_or_prefix_is_not_the_job(self):
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(Missing):
             self.run_wait([inventory(dict(name='x / producer', status='completed', conclusion='success'),
-                                     dict(name='producer (windows)', status='completed', conclusion='success'))] * 20,
-                          timeout=30)
+                                     dict(name='producer (windows)', status='completed', conclusion='success'))] * 20)
+
+    def test_absent_producer_fails_fast(self):
+        # A partial rerun can leave the producer out of the current attempt.
+        with self.assertRaises(Missing):
+            self.run_wait([inventory()] * MISSING_READS, timeout=3600)
+
+    def test_briefly_absent_producer_is_still_awaited(self):
+        success = inventory(dict(name='producer', status='completed', conclusion='success'))
+        job, _ = self.run_wait([inventory()] * (MISSING_READS - 1) + [success])
+        self.assertEqual(job['name'], 'producer')
 
     def test_times_out(self):
         pending = inventory(dict(name='producer', status='in_progress', conclusion=None))

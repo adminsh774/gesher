@@ -16,6 +16,8 @@ from github_read import GitHubReadError
 
 # Consecutive failed inventory reads tolerated before giving up.
 READ_FAILURES = 5
+# Consecutive inventories without the job before it is treated as absent.
+MISSING_READS = 3
 
 
 def current_endpoint(environ=os.environ):
@@ -25,12 +27,18 @@ def current_endpoint(environ=os.environ):
             f"/attempts/{environ['GITHUB_RUN_ATTEMPT']}/jobs")
 
 
+class Missing(RuntimeError):
+    """The job is not in this run attempt's inventory."""
+
+
 def state(jobs, name):
     """None while the job is not finished; the job once it has succeeded."""
     rows = [row for row in jobs['jobs'] if row.get('name') == name]
     if len(rows) > 1:
         raise RuntimeError(f'Ambiguous job name: {name}')
-    if not rows or rows[0].get('status') != 'completed':
+    if not rows:
+        raise Missing(f'Job {name} is not in this run attempt')
+    if rows[0].get('status') != 'completed':
         return None
     if rows[0].get('conclusion') != 'success':
         raise RuntimeError(f"Job {name} finished with {rows[0].get('conclusion')}")
@@ -40,10 +48,18 @@ def state(jobs, name):
 def wait(read, name, *, timeout, interval, sleep=time.sleep, clock=time.monotonic, log=print):
     deadline = clock() + timeout
     failures = 0
+    missing = 0
     while True:
         try:
             job = state(read(), name)
-            failures = 0
+            failures = missing = 0
+        except Missing:
+            # Jobs of one attempt are listed from its start. A producer that
+            # stays absent (for example a partial rerun) never arrives here.
+            missing += 1
+            if missing >= MISSING_READS:
+                raise
+            job = None
         except GitHubReadError as error:
             failures += 1
             if failures >= READ_FAILURES:
