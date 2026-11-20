@@ -1,0 +1,80 @@
+name: qa213-native-diagnostic
+on:
+  push:
+    branches: ['qa/diagnostic-pr213-native-20261120']
+    paths:
+      - '.github/workflows/qa213-native-diagnostic.yml'
+      - 'tools/qa213-diagnostic/**'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: qa213-native-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  LLVM_MINGW_NAME: llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64
+  LLVM_MINGW_SHA256: 5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch and verify the exact production compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/qa213-toolchain"
+          curl --fail --location --connect-timeout 20 --max-time 180 \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/$LLVM_MINGW_NAME.tar.xz" \
+            -o "$RUNNER_TEMP/qa213-toolchain/compiler.tar.xz"
+          printf '%s  %s\n' "$LLVM_MINGW_SHA256" "$RUNNER_TEMP/qa213-toolchain/compiler.tar.xz" | sha256sum --check --strict
+          tar -xJf "$RUNNER_TEMP/qa213-toolchain/compiler.tar.xz" -C "$RUNNER_TEMP/qa213-toolchain"
+      - name: Compile exact production sources and qualified negative controls
+        run: >-
+          python3 tools/qa213-diagnostic/diagnostic.py build
+          --toolchain "$RUNNER_TEMP/qa213-toolchain/$LLVM_MINGW_NAME"
+          --archive "$RUNNER_TEMP/qa213-toolchain/compiler.tar.xz"
+          --out "$RUNNER_TEMP/qa213-native-fixture"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qa213-native-controls-${{ github.sha }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qa213-native-fixture/
+          if-no-files-found: error
+          retention-days: 7
+  windows:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify actual producer, current source and archive digest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tools/ci/artifact_receipt.py --name "qa213-native-controls-$env:GITHUB_SHA-a$env:GITHUB_RUN_ATTEMPT" --producer build --destination qa213-native-fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Producer/archive verification failed' }
+          python tools/qa213-diagnostic/diagnostic.py verify --out qa213-native-fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Source/output verification failed' }
+      - name: Real old/fixed CRT and deterministic held-writer controls
+        shell: pwsh
+        run: tools/qa213-diagnostic/run.ps1 -Dir qa213-native-fixture
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa213-native-results-${{ matrix.os }}-${{ github.sha }}-a${{ github.run_attempt }}
+          path: qa213-native-fixture/results/
+          if-no-files-found: error
+          retention-days: 7
