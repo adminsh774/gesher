@@ -129,7 +129,7 @@ class FormatEnumerator final : public IEnumFORMATETC {
   }
   HRESULT STDMETHODCALLTYPE Skip(ULONG count) override {
     size_t left = formats_.size() - position_;
-    size_t n = std::min(static_cast<size_t>(count), left);
+    size_t n = (std::min)(static_cast<size_t>(count), left);
     position_ += n;
     return n == count ? S_OK : S_FALSE;
   }
