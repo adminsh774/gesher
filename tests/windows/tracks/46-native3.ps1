@@ -47,7 +47,7 @@ Check 'native3: concurrent binary128 parsing preserves values, errno and thread 
 } @('Binary128 concurrent parsing:', '80000 calls', '0 failures')
 Check 'native3: the numeric scope maps guest rounding and actual flags and restores the complete native environment' {
   N2Run "$n2Dir/arm64_numeric_fenv_test.exe" @()
-} @('NUMERIC_FENV_DONE checks=192 failures=0')
+} @('NUMERIC_FENV_DONE checks=192 failures=0', 'NUMERIC_FENV_RESTORE_DONE checks=384 failures=0')
 Check 'native3: ARM64 public parsers return all 128 bits and preserve scalar returns and native fenv through the production loader' {
   N2Run "$n2Dir/arm64_numeric_return_host.exe" @("$n2/arm64-v8a/arm64_numeric_return.so")
 } @('NUMERIC_RETURN_DONE conversions=256 checks=1292 failures=0', 'NUMERIC_HOST_DONE runs=4 failures=0')
