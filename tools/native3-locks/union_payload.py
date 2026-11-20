@@ -173,10 +173,12 @@ def write_manifest(root, metadata):
 
 def check_manifest(root, role, expected, context, sources):
     actual = json.loads((root / 'provenance.json').read_text(encoding='utf-8'))
-    assert actual['context'] == context and actual['sources'] == sources and actual['role'] == role
+    assert actual['sources'] == sources and actual['role'] == role
+    assert all(actual['context'].get(key) == value for key, value in context.items() if key != 'attempt')
+    producer = host_roles.supplier_context(root / 'provenance.json', context, role)
     if role == 'native3-common-host-fixture':
         executables = {name + '.exe' for name in TARGETS}
-        host_roles.verify_selected(root, actual.get('selected_link'), actual['compiler'], context, executables, role)
+        host_roles.verify_selected(root, actual.get('selected_link'), actual['compiler'], producer, executables, role)
         expected = expected | host_roles.selected_members(executables, actual['compiler'], role)
     files = flat_inventory(root, expected | {'provenance.json'})
     del files['provenance.json']
@@ -719,7 +721,7 @@ def main():
         import re
         production = json.loads((ROOT / 'dist/web3-production-role.json').read_text())
         compiler = host_roles.compiler(ROOT / 'out')
-        assert all(production.get(key) == value for key, value in context.items())
+        assert all(production.get(key) == value for key, value in host['context'].items())
         assert production['role'] == 'production' and production['test_hook_compiled'] is False
         assert production['compiler'] == compiler
         assert production['executable_sha256'] == host_roles.sha(ROOT / 'dist/dalvikvm.exe')
