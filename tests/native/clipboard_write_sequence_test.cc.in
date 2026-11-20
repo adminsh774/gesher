@@ -1,0 +1,344 @@
+// Copyright (C) 2026 The Gesher Authors; SPDX-License-Identifier: Apache-2.0
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <objbase.h>
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
+#include <cstdint>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+static HWND g_window;
+static int checks, failures;
+static std::mutex allocations_lock;
+static std::set<HGLOBAL> allocations;
+static std::set<std::array<unsigned char, 16>> tokens;
+static std::atomic<int> duplicate_tokens{0};
+enum class Fault { None, Guid, Format, Allocate, LockWrite, Set, Reopen, LockRead, MissingRead };
+static thread_local Fault fault = Fault::None;
+static thread_local HGLOBAL receipt_memory;
+static thread_local HGLOBAL read_receipt_memory;
+static thread_local bool allocating_receipt, published_receipt, publication_closed;
+static thread_local bool verify_read_close = true;
+static thread_local int open_depth;
+static thread_local void (*race_after_close)();
+static UINT receipt_format;
+
+static void Check(bool value, const char* name) {
+  ++checks;
+  if (!value) { ++failures; std::printf("FAIL CLIP_SEQUENCE %s error=%lu\n", name, GetLastError()); }
+}
+static void ResetControl(Fault mode = Fault::None) {
+  fault = mode; receipt_memory = nullptr; read_receipt_memory = nullptr; allocating_receipt = false;
+  published_receipt = false; publication_closed = false; race_after_close = nullptr;
+  Check(open_depth == 0, "previous writer released clipboard lock");
+}
+[[maybe_unused]] static HRESULT ObservedGuid(GUID* guid) {
+  return fault == Fault::Guid ? E_FAIL : CoCreateGuid(guid);
+}
+static UINT ObservedFormat(LPCWSTR name) {
+  if (std::wcscmp(name, L"Gesher.Clipboard.WriteReceipt.v1") == 0) {
+    allocating_receipt = true;
+    return fault == Fault::Format ? 0 : RegisterClipboardFormatW(name);
+  }
+  return RegisterClipboardFormatW(name);
+}
+static HGLOBAL ObservedAlloc(UINT flags, SIZE_T size) {
+  bool metadata = allocating_receipt && size == 16;
+  allocating_receipt = false;
+  if (metadata && fault == Fault::Allocate) return nullptr;
+  HGLOBAL memory = GlobalAlloc(flags, size);
+  if (memory) { std::lock_guard<std::mutex> guard(allocations_lock); allocations.insert(memory); }
+  if (metadata) receipt_memory = memory;
+  return memory;
+}
+static LPVOID ObservedLock(HGLOBAL memory) {
+  if (memory == receipt_memory && fault == Fault::LockWrite && !published_receipt) return nullptr;
+  if (memory == read_receipt_memory && fault == Fault::LockRead && published_receipt) return nullptr;
+  return GlobalLock(memory);
+}
+static HGLOBAL ObservedFree(HGLOBAL memory) {
+  HGLOBAL remaining = GlobalFree(memory);
+  if (!remaining) { std::lock_guard<std::mutex> guard(allocations_lock); allocations.erase(memory); }
+  return remaining;
+}
+static HANDLE ObservedSet(UINT format, HANDLE memory) {
+  if (format == receipt_format && fault == Fault::Set) return nullptr;
+  HANDLE result = SetClipboardData(format, memory);
+  if (result) {
+    std::lock_guard<std::mutex> guard(allocations_lock);
+    allocations.erase(memory);
+    if (format == receipt_format) {
+      published_receipt = true;
+      const void* data = GlobalLock(memory);
+      if (data) {
+        std::array<unsigned char, 16> token;
+        std::memcpy(token.data(), data, token.size());
+        if (!tokens.insert(token).second) ++duplicate_tokens;
+        GlobalUnlock(memory);
+      }
+    }
+  }
+  return result;
+}
+static BOOL ObservedOpen(HWND owner) {
+  if (publication_closed && fault == Fault::Reopen) return FALSE;
+  BOOL opened = OpenClipboard(owner);
+  if (opened) ++open_depth;
+  return opened;
+}
+static HANDLE ObservedGet(UINT format) {
+  if (format == receipt_format && fault == Fault::MissingRead) return nullptr;
+  HANDLE memory = GetClipboardData(format);
+  if (format == receipt_format) read_receipt_memory = memory;
+  return memory;
+}
+static BOOL ObservedClose() {
+  DWORD before = GetClipboardSequenceNumber();
+  BOOL closed = CloseClipboard();
+  DWORD after = GetClipboardSequenceNumber();
+  if (closed) --open_depth;
+  if (!publication_closed) {
+    publication_closed = true;
+    auto race = race_after_close; race_after_close = nullptr;
+    if (closed && race) race();
+  } else if (closed && published_receipt && verify_read_close && before != after) {
+    std::printf("FAIL CLIP_SEQUENCE read-only close changed sequence %lu -> %lu\n", before, after);
+    ++duplicate_tokens;  // A thread-safe fatal boundary failure, never an accepted write receipt.
+  }
+  return closed;
+}
+
+#define CoCreateGuid ObservedGuid
+#define RegisterClipboardFormatW ObservedFormat
+#define GlobalAlloc ObservedAlloc
+#define GlobalLock ObservedLock
+#define GlobalFree ObservedFree
+#define SetClipboardData ObservedSet
+#define OpenClipboard ObservedOpen
+#define GetClipboardData ObservedGet
+#define CloseClipboard ObservedClose
+@RECEIPT@
+namespace gesher { namespace devsvc {
+unsigned long long StartEvents() { return reinterpret_cast<unsigned long long>(g_window); }
+@DEV_WRITERS@
+} namespace windows {
+@RICH_WRITERS@
+} }
+#undef CoCreateGuid
+#undef RegisterClipboardFormatW
+#undef GlobalAlloc
+#undef GlobalLock
+#undef GlobalFree
+#undef SetClipboardData
+#undef OpenClipboard
+#undef GetClipboardData
+#undef CloseClipboard
+
+static std::vector<uint8_t> Image() {
+  std::vector<uint8_t> bytes(sizeof(BITMAPINFOHEADER) + 4);
+  BITMAPINFOHEADER header{}; header.biSize = sizeof(header); header.biWidth = 1;
+  header.biHeight = 1; header.biPlanes = 1; header.biBitCount = 32; header.biSizeImage = 4;
+  std::memcpy(bytes.data(), &header, sizeof(header));
+  bytes[sizeof(header)] = 0x12; bytes[sizeof(header) + 1] = 0x34; bytes[sizeof(header) + 2] = 0x56;
+  return bytes;
+}
+static bool Write(int kind, uint32_t* sequence) {
+  if (kind == 0) return gesher::devsvc::SetClipboard(u"own text", u"", sequence);
+  if (kind == 1) return gesher::devsvc::SetClipboard(u"own text", u"<b>own text</b>", sequence);
+  auto image = Image();
+  return gesher::windows::WriteRichClipboard(u"own text", u"<b>own text</b>", image.data(), image.size(), sequence);
+}
+static void VerifyContent(int kind) {
+  std::u16string text, html;
+  Check(gesher::devsvc::ClipboardText(&text) && text == u"own text", "actual native text readback");
+  bool has_html = gesher::devsvc::ClipboardHtml(&html);
+  Check(kind == 0 ? !has_html : has_html && html == u"<b>own text</b>", "actual native HTML readback");
+  std::vector<uint8_t> image;
+  bool has_image = gesher::windows::ReadClipboardImage(&image);
+  bool image_matches = false;
+  if (has_image && image.size() >= 14 + sizeof(BITMAPINFOHEADER) + 4) {
+    uint32_t offset; BITMAPINFOHEADER header;
+    std::memcpy(&offset, image.data() + 10, sizeof(offset));
+    std::memcpy(&header, image.data() + 14, sizeof(header));
+    image_matches = image[0] == 'B' && image[1] == 'M' && header.biWidth == 1 && header.biHeight == 1
+        && header.biPlanes == 1 && header.biBitCount == 32 && offset + 4 <= image.size()
+        && image[offset] == 0x12 && image[offset + 1] == 0x34 && image[offset + 2] == 0x56;
+  }
+  Check(kind == 2 ? image_matches : !has_image, "actual native image pixels and geometry readback");
+}
+static void CheckResources() {
+  { std::lock_guard<std::mutex> guard(allocations_lock); Check(allocations.empty(), "all untransferred allocations freed"); }
+  Check(open_depth == 0, "writer and receipt read released every open");
+  bool opened = OpenClipboard(nullptr) != 0;
+  Check(opened, "real clipboard can be reopened after operation");
+  if (opened) Check(CloseClipboard() != 0, "real resource-probe close");
+}
+static void SameOwnerReplacement() {
+  uint32_t replaced = 0;
+  publication_closed = false;
+  Check(gesher::devsvc::SetClipboard(u"same owner replacement", u"", &replaced), "same-HWND competing actual write");
+  Check(replaced != 0 && replaced == GetClipboardSequenceNumber(), "competing same-HWND receipt is current");
+  Check(GetClipboardOwner() == g_window, "competing write retains identical owner HWND");
+}
+struct ForeignState { HANDLE ready{}, stop{}, process{}; DWORD pid{}; };
+static ForeignState foreign;
+static bool clone_receipt;
+static bool RawWrite(HWND owner, const GUID* cloned) {
+  if (!OpenClipboard(owner)) return false;
+  bool ok = EmptyClipboard() != 0;
+  const wchar_t text[] = L"external foreign writer";
+  HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, sizeof(text));
+  if (!memory) ok = false;
+  else {
+    void* p = GlobalLock(memory);
+    if (!p) { GlobalFree(memory); ok = false; }
+    else { std::memcpy(p, text, sizeof(text)); GlobalUnlock(memory);
+      if (!SetClipboardData(CF_UNICODETEXT, memory)) { GlobalFree(memory); ok = false; } }
+  }
+  if (cloned) {
+    memory = GlobalAlloc(GMEM_MOVEABLE, sizeof(*cloned));
+    if (!memory) ok = false;
+    else { void* p = GlobalLock(memory);
+      if (!p) { GlobalFree(memory); ok = false; }
+      else { std::memcpy(p, cloned, sizeof(*cloned)); GlobalUnlock(memory);
+        if (!SetClipboardData(receipt_format, memory)) { GlobalFree(memory); ok = false; } }
+    }
+  }
+  return CloseClipboard() != 0 && ok;
+}
+static void StartForeignReplacement() {
+  wchar_t executable[32768];
+  Check(GetModuleFileNameW(nullptr, executable, 32768) != 0, "owned child executable path");
+  std::wstring suffix = std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64());
+  std::wstring ready_name = L"Local\\GesherClipboardReady_" + suffix;
+  std::wstring stop_name = L"Local\\GesherClipboardStop_" + suffix;
+  foreign.ready = CreateEventW(nullptr, TRUE, FALSE, ready_name.c_str());
+  foreign.stop = CreateEventW(nullptr, TRUE, FALSE, stop_name.c_str());
+  Check(foreign.ready && foreign.stop, "owned child synchronization handles");
+  std::wstring token = L"none";
+  if (clone_receipt) {
+    Check(OpenClipboard(nullptr) != 0, "read original token for foreign-owner negative");
+    HANDLE memory = GetClipboardData(receipt_format);
+    const unsigned char* bytes = memory ? static_cast<const unsigned char*>(GlobalLock(memory)) : nullptr;
+    Check(bytes != nullptr && GlobalSize(memory) == 16, "original receipt available for owner negative");
+    if (bytes) { token.clear(); const wchar_t hex[] = L"0123456789abcdef";
+      for (int i = 0; i < 16; ++i) { token += hex[bytes[i] >> 4]; token += hex[bytes[i] & 15]; } GlobalUnlock(memory); }
+    Check(CloseClipboard() != 0, "original token read close");
+  }
+  std::wstring command = L"\"" + std::wstring(executable) + L"\" --foreign " + ready_name + L" " + stop_name + L" " + token;
+  STARTUPINFOW startup{}; startup.cb = sizeof(startup); PROCESS_INFORMATION process{};
+  bool started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process) != 0;
+  Check(started, "real external writer process creation");
+  if (!started) return;
+  foreign.process = process.hProcess; foreign.pid = process.dwProcessId;
+  Check(CloseHandle(process.hThread) != 0, "child thread handle retired");
+  Check(WaitForSingleObject(foreign.ready, 10000) == WAIT_OBJECT_0, "external writer completed before receipt reopen");
+  DWORD owner_pid = 0; HWND owner = GetClipboardOwner(); GetWindowThreadProcessId(owner, &owner_pid);
+  Check(owner && owner != g_window && owner_pid == foreign.pid && owner_pid != GetCurrentProcessId(), "actual foreign owner PID and HWND");
+  FILETIME created, exited, kernel, user;
+  Check(GetProcessTimes(foreign.process, &created, &exited, &kernel, &user) != 0, "external writer native creation identity");
+  std::printf("CLIP_SEQUENCE foreign pid=%lu created=%08lx%08lx hwnd=%p cloned=%d\n", foreign.pid, created.dwHighDateTime, created.dwLowDateTime, (void*)owner, clone_receipt);
+}
+static void StopForeign() {
+  if (foreign.process) {
+    Check(SetEvent(foreign.stop) != 0, "signal owned external writer retirement");
+    DWORD waited = WaitForSingleObject(foreign.process, 10000), code = 0;
+    Check(waited == WAIT_OBJECT_0, "owned external writer retired within deadline");
+    if (waited != WAIT_OBJECT_0) { TerminateProcess(foreign.process, 90); WaitForSingleObject(foreign.process, 5000); }
+    Check(GetExitCodeProcess(foreign.process, &code) && code == 0, "external writer data and resource result");
+    Check(CloseHandle(foreign.process) != 0, "owned child process handle closed");
+  }
+  if (foreign.ready) Check(CloseHandle(foreign.ready) != 0, "owned ready event closed");
+  if (foreign.stop) Check(CloseHandle(foreign.stop) != 0, "owned stop event closed");
+  foreign = {};
+}
+static int Child(const char* ready_name, const char* stop_name, const char* token) {
+  HANDLE ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, ready_name), stop = OpenEventA(SYNCHRONIZE, FALSE, stop_name);
+  if (!ready || !stop) return 20;
+  GUID copied{}; GUID* clone = nullptr;
+  if (std::strlen(token) == 32) {
+    auto* bytes = reinterpret_cast<unsigned char*>(&copied);
+    for (int i = 0; i < 16; ++i) { char pair[3] = {token[i * 2], token[i * 2 + 1], 0}; bytes[i] = static_cast<unsigned char>(std::strtoul(pair, nullptr, 16)); }
+    clone = &copied;
+  }
+  HWND owner = CreateWindowExW(0, L"STATIC", L"Owned external clipboard control", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+  bool ok = owner && RawWrite(owner, clone) && SetEvent(ready);
+  if (ok) ok = WaitForSingleObject(stop, 30000) == WAIT_OBJECT_0;
+  if (owner) ok = DestroyWindow(owner) && ok;
+  ok = CloseHandle(ready) && ok; ok = CloseHandle(stop) && ok;
+  return ok ? 0 : 21;
+}
+int main(int argc, char** argv) {
+  receipt_format = RegisterClipboardFormatW(L"Gesher.Clipboard.WriteReceipt.v1");
+  if (argc == 5 && std::strcmp(argv[1], "--foreign") == 0) return Child(argv[2], argv[3], argv[4]);
+  bool old = argc == 2 && std::strcmp(argv[1], "--old-control") == 0;
+  g_window = CreateWindowExW(0, L"STATIC", L"Owned production clipboard contract", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+  if (!g_window || !receipt_format) return 10;
+  for (int kind = 0; kind < 3; ++kind) {
+    ResetControl(); uint32_t sequence = 0;
+    bool ok = Write(kind, &sequence);
+    DWORD after = GetClipboardSequenceNumber();
+    std::printf("CLIP_SEQUENCE case=%d success=%d receipt=%lu current=%lu owner=%p\n", kind, ok, (unsigned long)sequence, after, (void*)GetClipboardOwner());
+    Check(ok, "real native publication succeeds");
+    Check(sequence != 0 && sequence == after, "receipt matches completed native publication");
+    VerifyContent(kind); CheckResources();
+    Check(after == GetClipboardSequenceNumber(), "read-only closes do not change final sequence");
+  }
+  if (!old) {
+    ResetControl();
+    HWND saved_owner = g_window; g_window = nullptr; uint32_t unavailable = 99;
+    Check(!Write(2, &unavailable) && unavailable == 0, "rich publication fails closed without its real event window");
+    g_window = saved_owner; CheckResources();
+    for (int kind : {0, 2}) {
+      ResetControl(); race_after_close = SameOwnerReplacement; uint32_t sequence = 99;
+      Check(Write(kind, &sequence), "original write completed before same-owner race");
+      Check(sequence == 0, "same HWND replacement must not inherit original Android source");
+      std::u16string text; Check(gesher::devsvc::ClipboardText(&text) && text == u"same owner replacement", "same-owner actual replacement remains readable");
+      CheckResources();
+      for (bool clone : {false, true}) {
+        ResetControl(); clone_receipt = clone; race_after_close = StartForeignReplacement; sequence = 99;
+        Check(Write(kind, &sequence), "original write completed before foreign race");
+        Check(sequence == 0, "foreign writer must not inherit original Android source");
+        Check(gesher::devsvc::ClipboardText(&text) && text == u"external foreign writer", "actual external contents remain readable");
+        StopForeign(); CheckResources();
+      }
+      for (Fault failure : {Fault::Guid, Fault::Format, Fault::Allocate, Fault::LockWrite, Fault::Set, Fault::Reopen, Fault::LockRead, Fault::MissingRead}) {
+        ResetControl(failure); sequence = 99;
+        Check(Write(kind, &sequence), "data publication remains honest when attribution metadata unavailable");
+        Check(sequence == 0, "failed metadata/reopen must not invent a publication receipt");
+        fault = Fault::None; VerifyContent(kind); CheckResources();
+      }
+    }
+    std::atomic<int> write_errors{0};
+    auto concurrent = [&](int kind) {
+      verify_read_close = false;  // A competing writer may run immediately after this read releases its lock.
+      for (int i = 0; i < 16; ++i) {
+        fault = Fault::None; publication_closed = false; receipt_memory = nullptr; read_receipt_memory = nullptr;
+        allocating_receipt = false; published_receipt = false;
+        uint32_t sequence = 0;
+        if (!Write(kind, &sequence) || open_depth != 0) ++write_errors;
+      }
+    };
+    std::thread first(concurrent, 0), second(concurrent, 2); first.join(); second.join();
+    Check(write_errors == 0, "concurrent plain/rich writes release their native resources");
+    Check(duplicate_tokens == 0 && tokens.size() >= 40, "full per-write GUID uniqueness across helpers and concurrent same-HWND writers");
+    ResetControl(); uint32_t cleared = 99;
+    Check(gesher::devsvc::SetClipboard(u"", u"", &cleared), "clear publication succeeds");
+    Check(cleared == 0 && CountClipboardFormats() == 0, "clear has no private receipt or public formats");
+    std::u16string text, html; std::vector<uint8_t> image;
+    Check(!gesher::devsvc::ClipboardText(&text) && !gesher::devsvc::ClipboardHtml(&html)
+          && !gesher::windows::ReadClipboardImage(&image), "clear preserves absent text HTML and image");
+    CheckResources();
+  }
+  Check(DestroyWindow(g_window) != 0 && !IsWindow(g_window), "owned publication window retired");
+  std::printf("CLIP_SEQUENCE completed checks=%d failures=%d unique_receipts=%zu old=%d\n", checks, failures, tokens.size(), old);
+  return failures || duplicate_tokens ? 1 : 0;
+}

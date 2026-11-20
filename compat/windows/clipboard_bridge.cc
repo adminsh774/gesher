@@ -6,6 +6,8 @@
 #undef NOGDI
 #include "clipboard_bridge.h"
 #include <wingdi.h>
+#include "clipboard_write_receipt.h"
+#include "../devsvc/devsvc_win32.h"
 
 #include <jni.h>
 
@@ -56,9 +58,9 @@ std::u16string FromUtf8(const char* s, size_t len) {
   return U16(out.data(), out.size());
 }
 
-bool OpenClipboardRetrying() {
+bool OpenClipboardRetrying(HWND owner = nullptr) {
   for (int i = 0; i < 20; i++) {
-    if (OpenClipboard(nullptr)) return true;
+    if (OpenClipboard(owner)) return true;
     Sleep(10);
   }
   return false;
@@ -315,8 +317,11 @@ bool ReadRichClipboard(RichClipboardData* out) {
 bool WriteRichClipboard(const std::u16string& text, const std::u16string& html,
                         const uint8_t* image_bytes, size_t image_size, uint32_t* written_sequence) {
   if (written_sequence != nullptr) *written_sequence = 0;
-  if (!OpenClipboardRetrying()) return false;
-  EmptyClipboard();
+  // EmptyClipboard associates the data with the HWND passed to OpenClipboard;
+  // a null owner cannot identify this publication. Use the existing event window.
+  HWND owner = reinterpret_cast<HWND>(devsvc::StartEvents());
+  if (owner == nullptr || !OpenClipboardRetrying(owner)) return false;
+  if (!EmptyClipboard()) { CloseClipboard(); return false; }
 
   bool any = false;
 
@@ -375,9 +380,11 @@ bool WriteRichClipboard(const std::u16string& text, const std::u16string& html,
     }
   }
 
-  if (any && written_sequence != nullptr) *written_sequence = GetClipboardSequenceNumber();
-  CloseClipboard();
-  return any;
+  ClipboardWriteReceipt receipt;
+  if (any && written_sequence != nullptr) receipt.Publish();
+  bool closed = CloseClipboard() != 0;
+  if (closed && written_sequence != nullptr) *written_sequence = receipt.SequenceAfterClose(owner);
+  return any && closed;
 }
 
 }  // namespace windows

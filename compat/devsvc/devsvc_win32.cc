@@ -16,6 +16,7 @@
 #include <shlobj.h>
 
 #include "devsvc_toast.h"
+#include "../windows/clipboard_write_receipt.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -740,11 +741,14 @@ bool SetClipboard(const std::u16string& text, const std::u16string& html, uint32
       if (SetClipboardData(HtmlFormat(), g) == nullptr) GlobalFree(g);
     }
   }
-  // Capture ownership while the clipboard is still open. A later external write
-  // must not be mistaken for the sequence/provenance of this Android clip.
-  if (ok && written_sequence != nullptr) *written_sequence = GetClipboardSequenceNumber();
-  CloseClipboard();
-  return ok;
+  windows::ClipboardWriteReceipt receipt;
+  // A clear must leave no formats, including private metadata. It has no Android
+  // source to retain; a zero receipt lets the next read import any racing writer.
+  if (ok && written_sequence != nullptr && (!text.empty() || !html.empty())) receipt.Publish();
+  HWND owner = GetClipboardOwner();
+  bool closed = CloseClipboard() != 0;
+  if (closed && written_sequence != nullptr) *written_sequence = receipt.SequenceAfterClose(owner);
+  return ok && closed;
 }
 
 uint32_t ClipboardSequence() { return GetClipboardSequenceNumber(); }
