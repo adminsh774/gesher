@@ -1,0 +1,99 @@
+name: qa213-clipboard-receipts
+on:
+  push:
+    branches: ['qa/diagnostic-pr213-clipboard-receipt-20261120']
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: qa213-clipboard-receipts-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native-producer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the digest-pinned production compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p compiler
+          curl --fail --location --max-time 180 https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64.tar.xz -o compiler/archive.tar.xz
+          printf '%s  %s\n' 5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4 compiler/archive.tar.xz | sha256sum --check --strict
+          tar -xJf compiler/archive.tar.xz -C compiler
+      - name: Compile exact old negative and current production writers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cxx="$PWD/compiler/llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang++"
+          python3 tools/test_clipboard_write_sequence.py --compile-only --cxx "$cxx" --output receipt-inputs/fixed.exe --save-generated receipt-inputs/fixed
+          python3 tools/test_clipboard_write_sequence.py --compile-only --cxx "$cxx" --source-ref 1071a0ea72120bdb5afe602517e3ff2676e9f3b9 --output receipt-inputs/old.exe --save-generated receipt-inputs/old
+          git rev-parse HEAD > receipt-inputs/source-head.txt
+          git rev-parse HEAD^{tree} > receipt-inputs/source-tree.txt
+          sha256sum compiler/archive.tar.xz > receipt-inputs/compiler.sha256
+          (cd receipt-inputs && sha256sum fixed.exe old.exe fixed/clipboard.cc fixed/source-receipt.json old/clipboard.cc old/source-receipt.json > outputs.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qa213-clipboard-receipts-${{ github.sha }}-a${{ github.run_attempt }}
+          path: receipt-inputs/
+          if-no-files-found: error
+          retention-days: 7
+  windows:
+    needs: native-producer
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind current producer and exact artifact digest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tools/ci/artifact_receipt.py --name "qa213-clipboard-receipts-$env:GITHUB_SHA-a$env:GITHUB_RUN_ATTEMPT" --producer native-producer --destination receipt-inputs
+          if ($LASTEXITCODE -ne 0) { throw 'Current native producer verification failed' }
+          if ((Get-Content receipt-inputs/source-head.txt -Raw).Trim() -ne $env:GITHUB_SHA) { throw 'Native source mismatch' }
+          foreach ($line in Get-Content receipt-inputs/outputs.sha256) {
+            if ($line -notmatch '^([a-f0-9]{64})  (.+)$') { throw "Malformed output digest: $line" }
+            $expected = $Matches[1]; $path = Join-Path receipt-inputs $Matches[2]
+            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw "Native output digest mismatch: $path" }
+            Write-Host "CLIP_RECEIPT_INPUT $line"
+          }
+      - name: Require original negative and repaired races and resources
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & receipt-inputs/old.exe --old-control 2>&1 | Tee-Object -FilePath old-results.txt
+          $oldCode = $LASTEXITCODE
+          $old = Get-Content old-results.txt -Raw
+          if ($oldCode -ne 1 -or $old -notmatch 'CLIP_SEQUENCE completed checks=\d+ failures=(\d+) unique_receipts=0 old=1') { throw 'Exact old writer did not complete the required negative' }
+          if ([int]$Matches[1] -lt 2) { throw 'Original close transitions were not both rejected' }
+          foreach ($kind in @(0, 1)) {
+            if ($old -notmatch "CLIP_SEQUENCE case=$kind success=1 receipt=([0-9]+) current=([0-9]+)") { throw "Missing actual old publication $kind" }
+            if ($Matches[1] -eq $Matches[2] -or $Matches[1] -eq '0') { throw "Old source did not reproduce the measured close transition $kind" }
+          }
+          & receipt-inputs/fixed.exe 2>&1 | Tee-Object -FilePath fixed-results.txt
+          $fixedCode = $LASTEXITCODE
+          $fixed = Get-Content fixed-results.txt -Raw
+          if ($fixedCode -ne 0 -or $fixed -notmatch 'CLIP_SEQUENCE completed checks=\d+ failures=0 unique_receipts=\d+ old=0' -or $fixed.Contains('FAIL CLIP_SEQUENCE')) { throw 'Actual repaired clipboard publication/race/resource contract failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa213-clipboard-receipts-results-${{ matrix.os }}-${{ github.sha }}-a${{ github.run_attempt }}
+          path: |
+            old-results.txt
+            fixed-results.txt
+          if-no-files-found: error
+          retention-days: 7
