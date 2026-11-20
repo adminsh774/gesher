@@ -130,11 +130,11 @@ function ToastTags {
 }
 
 function DevsvcToastTag([int] $Id, [string] $Tag = 'null') {
-  # The toast bridge hashes the Android id/tag tuple as big-endian UTF-16.
+  # The Windows spelling retains the full SHA-256 of the big-endian UTF-16 key.
   $hash = [Security.Cryptography.SHA256]::Create()
   try {
     $key = [Text.Encoding]::BigEndianUnicode.GetBytes("$Id/$Tag")
-    return [BitConverter]::ToString($hash.ComputeHash($key)).Replace('-', '').ToLowerInvariant()
+    return 'sha256-' + [Convert]::ToBase64String($hash.ComputeHash($key)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
   } finally {
     $hash.Dispose()
   }
@@ -308,7 +308,7 @@ if (-not ($tags1.Contains($toast7) -and $tags1.Contains($toast8))) { $problems +
 if ($tags2.Contains($toast7) -or -not $tags2.Contains($toast8)) { $problems += "after cancel(7) the history has: $($tags2.Trim())" }
 if ($tags3.Contains('tag=')) { $problems += "after cancelAll the history has: $($tags3.Trim())" }
 if ($code -ne 0) { $problems += "launch exit $code" }
-DevsvcCheck "devsvc: notifications: posted notifications are toasts of $devsvcAppId in Windows' toast history (ToastNotificationManager.History), removed by cancel and cancelAll" $problems ($out + "`n--- package log`n" + $log + "`n--- system server`n" + ((DevsvcText $serverLog) -split "`n" | Select-String 'notification' | Out-String))
+DevsvcCheck "devsvc: notifications: posted notifications are toasts of $devsvcAppId in Windows' toast history (ToastNotificationManager.History), removed by cancel and cancelAll" $problems ($out + "`n--- package log`n" + $log + "`n--- system server`n" + ((DevsvcText $serverLog) -split "`n" | Select-String 'notification|TOAST_IDENTITY' | Out-String))
 $problems = @()
 foreach ($e in 'devsvc: listener: connected', 'devsvc: listener: posted com.gesher.devsvc 7 "Gesher notification"', 'devsvc: listener: removed com.gesher.devsvc 7') {
   if (-not $log.Contains($e)) { $problems += "no '$e'" }
