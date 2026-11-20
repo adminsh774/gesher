@@ -8,5 +8,6 @@ public final class SettingsProviderHost {
         try { gesher.services.SettingsProviderContractTest.contracts(args[1]); }
         finally { android.os.Binder.restoreCallingIdentity(identity); }
         System.out.println("Settings provider host passed: " + gesher.services.SettingsProviderContractTest.checks + " checks");
+        System.out.println("Settings write access host passed: " + gesher.services.SettingsWriteAccessTest.run(false) + " checks");
     }
 }
