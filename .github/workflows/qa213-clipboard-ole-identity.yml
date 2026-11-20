@@ -1,0 +1,155 @@
+name: qa213-clipboard-ole-identity
+on:
+  push:
+    branches: ['qa/diagnostic-pr213-clipboard-ole-20261120']
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: qa213-clipboard-ole-identity-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native-producer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the digest-pinned production compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p compiler
+          curl --fail --location --max-time 180 https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64.tar.xz -o compiler/archive.tar.xz
+          printf '%s  %s\n' 5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4 compiler/archive.tar.xz | sha256sum --check --strict
+          tar -xJf compiler/archive.tar.xz -C compiler
+      - name: Compile standalone OLE mechanism and unchanged original regression controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cxx="$PWD/compiler/llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-clang++"
+          mkdir -p receipt-inputs
+          "$cxx" -std=c++20 -O1 -g -Wall -Wextra -Werror -fno-exceptions -static -pthread -D_WIN32_WINNT=0x0A00 -municode tests/native/clipboard_ole_identity_diagnostic.cc -luser32 -lole32 -luuid -lgdi32 -o receipt-inputs/ole.exe
+          python3 tools/test_clipboard_write_sequence.py --compile-only --cxx "$cxx" --output receipt-inputs/rejected.exe --save-generated receipt-inputs/rejected
+          python3 tools/test_clipboard_write_sequence.py --compile-only --cxx "$cxx" --source-ref 1071a0ea72120bdb5afe602517e3ff2676e9f3b9 --output receipt-inputs/old.exe --save-generated receipt-inputs/old
+          cp tests/native/clipboard_ole_identity_diagnostic.cc receipt-inputs/ole.cc
+          cp tests/native/clipboard_ole_identity_diagnostic.md receipt-inputs/measurement-scope.md
+          cp .github/workflows/qa213-clipboard-ole-identity.yml receipt-inputs/workflow.yml
+          git rev-parse HEAD > receipt-inputs/source-head.txt
+          git rev-parse HEAD^{tree} > receipt-inputs/source-tree.txt
+          sha256sum compiler/archive.tar.xz > receipt-inputs/compiler.sha256
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          paths = ['tests/native/clipboard_ole_identity_diagnostic.cc',
+                   'tests/native/clipboard_ole_identity_diagnostic.md',
+                   '.github/workflows/qa213-clipboard-ole-identity.yml']
+          record = {'purpose': 'standalone native API measurement; no product repair approval',
+                    'source': subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(),
+                    'tree': subprocess.check_output(['git','rev-parse','HEAD^{tree}'], text=True).strip(),
+                    'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                    'producer': os.environ['GITHUB_JOB'],
+                    'original_production': '1071a0ea72120bdb5afe602517e3ff2676e9f3b9',
+                    'unchanged_rejected_diagnostic_parent': '0cbdafa973064dc715a2c30ccbbf23b0564797a8',
+                    'source_sha256': {p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths}}
+          pathlib.Path('receipt-inputs/ole-source-receipt.json').write_text(json.dumps(record, indent=2)+'\n')
+          print(json.dumps(record))
+          PY
+          (cd receipt-inputs && sha256sum ole.exe ole.cc measurement-scope.md workflow.yml ole-source-receipt.json rejected.exe old.exe rejected/clipboard.cc rejected/source-receipt.json old/clipboard.cc old/source-receipt.json > outputs.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qa213-clipboard-ole-identity-${{ github.sha }}-a${{ github.run_attempt }}
+          path: receipt-inputs/
+          if-no-files-found: error
+          retention-days: 7
+  windows:
+    needs: native-producer
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind current producer and exact artifact digest
+        id: inputs
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tools/ci/artifact_receipt.py --name "qa213-clipboard-ole-identity-$env:GITHUB_SHA-a$env:GITHUB_RUN_ATTEMPT" --producer native-producer --destination receipt-inputs
+          if ($LASTEXITCODE -ne 0) { throw 'Current native producer verification failed' }
+          if ((Get-Content receipt-inputs/source-head.txt -Raw).Trim() -ne $env:GITHUB_SHA) { throw 'Native source mismatch' }
+          $checkoutTree = (git rev-parse 'HEAD^{tree}').Trim()
+          if ($LASTEXITCODE -ne 0 -or (Get-Content receipt-inputs/source-tree.txt -Raw).Trim() -ne $checkoutTree) { throw 'Native source tree mismatch' }
+          foreach ($line in Get-Content receipt-inputs/outputs.sha256) {
+            if ($line -notmatch '^([a-f0-9]{64})  (.+)$') { throw "Malformed output digest: $line" }
+            $expected = $Matches[1]; $path = Join-Path receipt-inputs $Matches[2]
+            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw "Native output digest mismatch: $path" }
+            Write-Host "OLE_IDENTITY_INPUT $line"
+          }
+          $receipt = Get-Content receipt-inputs/ole-source-receipt.json -Raw | ConvertFrom-Json
+          if ($receipt.source -ne $env:GITHUB_SHA -or $receipt.tree -ne $checkoutTree -or $receipt.run -ne $env:GITHUB_RUN_ID -or $receipt.attempt -ne $env:GITHUB_RUN_ATTEMPT -or $receipt.producer -ne 'native-producer') { throw 'OLE producer receipt mismatch' }
+      - name: Measure actual OLE identity, format reads, replacements and shutdown
+        timeout-minutes: 4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $start = [System.Diagnostics.ProcessStartInfo]::new()
+          $start.FileName = (Resolve-Path receipt-inputs/ole.exe).Path
+          $start.UseShellExecute = $false
+          $start.RedirectStandardOutput = $true
+          $start.RedirectStandardError = $true
+          $process = [System.Diagnostics.Process]::new()
+          $process.StartInfo = $start
+          if (-not $process.Start()) { throw 'OLE probe did not start' }
+          $stdout = $process.StandardOutput.ReadToEndAsync()
+          $stderr = $process.StandardError.ReadToEndAsync()
+          $finished = $process.WaitForExit(180000)
+          if (-not $finished) { $process.Kill($true); $process.WaitForExit() }
+          $output = $stdout.GetAwaiter().GetResult()
+          $errors = $stderr.GetAwaiter().GetResult()
+          $code = $process.ExitCode
+          $process.Dispose()
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'ole-results.txt'), $output)
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'ole-errors.txt'), $errors)
+          Write-Host $output
+          Write-Host $errors
+          if (-not $finished) { throw 'Actual OLE probe exceeded its unchanged diagnostic process bound' }
+          if ($code -ne 0 -or $output -notmatch 'OLE_IDENTITY completed cases=16 checks=\d+ failures=0 live_objects=0 live_enumerators=0 data_calls=\d+' -or $output.Contains('FAIL OLE_IDENTITY')) { throw 'The measured OLE mechanism did not satisfy the required identity/data/lifecycle controls' }
+      - name: Keep the existing native stale-source and concurrency regressions fatal
+        if: always() && steps.inputs.outcome == 'success'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & receipt-inputs/old.exe --old-control 2>&1 | Tee-Object -FilePath old-results.txt
+          $oldCode = $LASTEXITCODE
+          $old = Get-Content old-results.txt -Raw
+          if ($oldCode -ne 1 -or $old -notmatch 'CLIP_SEQUENCE completed checks=\d+ failures=(\d+) unique_receipts=0 old=1') { throw 'Exact old writer did not complete the required negative' }
+          if ([int]$Matches[1] -lt 2) { throw 'Original close transitions were not both rejected' }
+          foreach ($kind in @(0, 1)) {
+            if ($old -notmatch "CLIP_SEQUENCE case=$kind success=1 receipt=([0-9]+) current=([0-9]+)") { throw "Missing actual old publication $kind" }
+            if ($Matches[1] -eq $Matches[2] -or $Matches[1] -eq '0') { throw "Old source did not reproduce the measured close transition $kind" }
+          }
+          & receipt-inputs/rejected.exe 2>&1 | Tee-Object -FilePath rejected-results.txt
+          $rejectedCode = $LASTEXITCODE
+          $rejected = Get-Content rejected-results.txt -Raw
+          if ($rejectedCode -ne 0 -or $rejected -notmatch 'CLIP_SEQUENCE completed checks=\d+ failures=0 unique_receipts=\d+ old=0' -or $rejected.Contains('FAIL CLIP_SEQUENCE')) { throw 'Previously rejected production writer still fails its unchanged actual regression controls; no repair is claimed by this measurement' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa213-clipboard-ole-identity-results-${{ matrix.os }}-${{ github.sha }}-a${{ github.run_attempt }}
+          path: |
+            ole-results.txt
+            ole-errors.txt
+            old-results.txt
+            rejected-results.txt
+          if-no-files-found: error
+          retention-days: 7
