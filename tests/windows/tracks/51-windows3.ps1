@@ -35,6 +35,13 @@ public static class GesherW3Win32 {
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int cmd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
   [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
+  [StructLayout(LayoutKind.Sequential)] struct FILETIME { public uint Low, High; }
+  [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr process, out FILETIME created, out FILETIME exited, out FILETIME kernel, out FILETIME user);
+  public static ulong Generation(System.Diagnostics.Process process) {
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(process.Handle, out c, out e, out k, out u)) throw new InvalidOperationException("GetProcessTimes failed");
+    return ((ulong)c.High << 32) | c.Low;
+  }
   // The client area on the screen: {left, top, right, bottom}.
   public static int[] ClientOnScreen(IntPtr hwnd) {
     POINT p = new POINT();
@@ -203,13 +210,48 @@ function W3BackChecks([string] $Mode, [IntPtr] $app, [scriptblock] $ReadLog,
   if (-not $iconic) { $out += 'the window is not minimized' }
   if (-not $visible) { $out += 'the window was hidden (no taskbar button)' }
   if ($RequireClipboardDenial) {
-    $nativeForeground = [ImeInput]::GetForegroundWindow()
-    if ($nativeForeground -eq [IntPtr]::Zero -or
-        [GesherWin32]::ProcessId($nativeForeground) -eq [GesherWin32]::ProcessId($app)) {
-      $out += 'background-denial check needs an actual foreground process other than the app'
-    }
-    if (-not (W3Wait $ReadLog $mark 'MainActivity stopped clipboard present false' 15).Success) {
-      $out += 'the background application did not report clipboard read denial'
+    $foreign = $null
+    $folder = Join-Path $env:RUNNER_TEMP "clipboard-foreground-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $folder | Out-Null
+    $receiptPath = Join-Path $folder 'window.json'; $stopPath = Join-Path $folder 'stop'
+    $foreignWindow = [IntPtr]::Zero
+    try {
+      $foreign = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-File',
+        "`"$PSScriptRoot/../clipboard/ForeignForeground.ps1`"", '-Receipt', "`"$receiptPath`"", '-Stop', "`"$stopPath`"") -PassThru -WindowStyle Hidden
+      $deadline = (Get-Date).AddSeconds(15)
+      while (-not (Test-Path $receiptPath) -and -not $foreign.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+      if (-not (Test-Path $receiptPath)) { throw 'owned foreground window did not start' }
+      $receipt = Get-Content $receiptPath -Raw | ConvertFrom-Json
+      $foreignWindow = [IntPtr][long]$receipt.hwnd
+      if ($foreign.HasExited -or $receipt.pid -ne $foreign.Id -or $receipt.created -le 0 -or
+          [GesherW3Win32]::Generation($foreign) -ne [ulong]$receipt.created -or
+          [GesherWin32]::ProcessId($foreignWindow) -ne $foreign.Id -or $foreign.Id -eq [GesherWin32]::ProcessId($app)) { throw 'owned foreground process identity differs from its native window' }
+      [void][GesherW3Win32]::ShowWindowAsync($foreignWindow, 5)
+      if (-not [ImeInput]::Foreground($foreignWindow)) { throw 'owned foreign window did not become the actual foreground window' }
+      $token = [Guid]::NewGuid().ToString('N')
+      Set-Clipboard -Value "background-denial-$token"
+      if ((Get-Clipboard -Raw) -cne "background-denial-$token") { throw 'denial probe needs a real nonempty Windows clipboard' }
+      if ([ImeInput]::GetForegroundWindow() -ne $foreignWindow) { throw 'foreground changed before the application probe' }
+      $request = $env:GESHER_WINAPP_CLIPBOARD_PROBE
+      if (-not $request -or (Test-Path $request)) { throw 'background request path is absent or reused' }
+      [IO.File]::WriteAllText($request + '.new', $token, [Text.Encoding]::ASCII)
+      [IO.File]::Move($request + '.new', $request)
+      if (-not (W3Wait $ReadLog $mark "MainActivity stopped clipboard present false probe $token" 15).Success) {
+        $out += 'the background application did not report clipboard read denial'
+      }
+      if ($foreign.HasExited -or [ImeInput]::GetForegroundWindow() -ne $foreignWindow -or
+          [GesherWin32]::ProcessId($foreignWindow) -ne $foreign.Id -or
+          [GesherW3Win32]::Generation($foreign) -ne [ulong]$receipt.created) { throw 'owned native foreground changed during the application getter' }
+      Write-Host "CLIPBOARD_FOREGROUND hwnd=$foreignWindow pid=$($foreign.Id) created=$($receipt.created) appPid=$([GesherWin32]::ProcessId($app)) probe=$token"
+    } catch { $out += "background-denial prerequisite: $_" }
+    finally {
+      [IO.File]::WriteAllText($stopPath, 'stop')
+      if ($foreign) {
+        if (-not $foreign.WaitForExit(10000)) { $foreign.Kill(); $out += 'owned foreground helper did not retire'; [void]$foreign.WaitForExit(5000) }
+        elseif ($foreign.ExitCode -ne 0) { $out += "owned foreground helper exited $($foreign.ExitCode)" }
+        $foreign.Dispose()
+      }
+      if ($foreignWindow -ne [IntPtr]::Zero -and [GesherWin32]::IsWindow($foreignWindow)) { $out += 'owned foreground HWND leaked after helper retirement' }
     }
   }
   $out += @(W3Order $ReadLog $mark @('MainActivity onPause', 'MainActivity onStop') 'moved to the back')
@@ -404,7 +446,7 @@ $single = 'single process'
 # pasted bytes and listener notification come from the real foreground window.
 $standaloneSavedEnvironment = @{}
 foreach ($name in @('ANDROID_DATA', 'GESHER_LOGS', 'GESHER_MICROG_SPOOF', 'GESHER_UID',
-                     'GESHER_BINDER_UID', 'GESHER_BINDER', 'GESHER_STANDALONE_RESTARTED')) {
+                     'GESHER_BINDER_UID', 'GESHER_BINDER', 'GESHER_STANDALONE_RESTARTED', 'GESHER_WINAPP_CLIPBOARD_PROBE')) {
   $standaloneSavedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
 }
 try {
@@ -424,6 +466,7 @@ try {
     }
     $script:standaloneClipboardUid = 0
     for ($attempt = 1; $attempt -le 2; $attempt++) {
+      $env:GESHER_WINAPP_CLIPBOARD_PROBE = NoDrive (Join-Path $profile "background-$attempt.request")
       $identityMode = "standalone canonical identity, GMS $gmsMode, launch $attempt"
       W3Run $identityMode 'Gesher windows3 main' @('com.gesher.app.Main', '--window', '--display', '400x800@160', $apkW3) {
         param($app, $readLog)
