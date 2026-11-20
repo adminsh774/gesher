@@ -2,8 +2,10 @@
 // The services components/net fixtures separately run Main, PackageManager and ART with
 // a later installed package, whose canonical UID differs from the default 10000.
 #include <windows.h>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <string>
 
@@ -51,13 +53,37 @@ struct File {
   }
 };
 
+bool ReadChildIdentity(const std::string& report, DWORD* pid, unsigned long long* birth) {
+  constexpr char prefix[] = "child pid=";
+  constexpr char separator[] = " generation=";
+  auto at = report.find(prefix);
+  if (at == std::string::npos) return false;
+  const char* end = report.data() + report.size();
+  DWORD parsed_pid = 0;
+  auto pid_result = std::from_chars(report.data() + at + sizeof(prefix) - 1, end, parsed_pid);
+  if (pid_result.ec != std::errc{} || parsed_pid == 0
+      || static_cast<size_t>(end - pid_result.ptr) < sizeof(separator) - 1
+      || std::memcmp(pid_result.ptr, separator, sizeof(separator) - 1) != 0) return false;
+  unsigned long long parsed_birth = 0;
+  auto birth_result = std::from_chars(pid_result.ptr + sizeof(separator) - 1, end, parsed_birth);
+  // A trailing space proves the numeric field is complete, even while polling a partial write.
+  if (birth_result.ec != std::errc{} || parsed_birth == 0
+      || birth_result.ptr == end || *birth_result.ptr != ' ') return false;
+  *pid = parsed_pid;
+  *birth = parsed_birth;
+  return true;
+}
+
 void Worker(uint32_t expected, const wchar_t* payload) {
   Check(std::wcscmp(payload, L"argument with spaces \u05d0") == 0, "same Unicode arguments");
-  const char* restarted = std::getenv("GESHER_STANDALONE_RESTARTED");
-  if (restarted != nullptr && std::strcmp(restarted, "1") == 0) {
-    const char* uid = std::getenv("GESHER_UID"), *binder = std::getenv("GESHER_BINDER_UID");
-    Check(uid != nullptr && std::strcmp(uid, "10037") == 0, "UID before child code");
-    Check(binder != nullptr && std::strcmp(binder, uid) == 0, "matching Binder environment");
+  wchar_t restarted[2]{};
+  if (GetEnvironmentVariableW(L"GESHER_STANDALONE_RESTARTED", restarted, 2) == 1
+      && restarted[0] == L'1') {
+    wchar_t uid[6]{}, binder[6]{};
+    DWORD uid_length = GetEnvironmentVariableW(L"GESHER_UID", uid, 6);
+    DWORD binder_length = GetEnvironmentVariableW(L"GESHER_BINDER_UID", binder, 6);
+    Check(uid_length == 5 && std::wcscmp(uid, L"10037") == 0, "UID before child code");
+    Check(binder_length == 5 && std::wcscmp(binder, uid) == 0, "matching Binder environment");
     char input[64]{};
     Check(std::fgets(input, sizeof(input), stdin) != nullptr
         && std::strcmp(input, "original input\n") == 0, "original stdin bytes");
@@ -114,13 +140,11 @@ void Run(uint32_t expected) {
   Check(AssignProcessToJobObject(job.value, process.value) != FALSE, "fixture job enrollment");
   Check(ResumeThread(thread.value) != static_cast<DWORD>(-1), "run supervisor");
   if (expected == 99) {
-    unsigned long pid = 0;
+    DWORD pid = 0;
     unsigned long long birth = 0;
     for (int i = 0; i < 200; ++i) {
       std::string report = output.Read();
-      auto at = report.find("child pid=");
-      if (at != std::string::npos
-          && std::sscanf(report.c_str() + at, "child pid=%lu generation=%llu", &pid, &birth) == 2) break;
+      if (ReadChildIdentity(report, &pid, &birth)) break;
       Sleep(25);
     }
     Check(pid != 0 && birth != 0, "parked child reported actual identity");
