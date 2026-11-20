@@ -108,6 +108,46 @@ a real conversion error; it may not silently reinterpret or discard metadata.
 
 ## Provenance and remaining product gates
 
+### Follow-up to the completed e1f68 image observations
+
+Run 44727512461 attempt 1 executed the unchanged old107 image writer and reader
+on both Windows versions. Only the eleven named INFO inputs produced an image
+through that old preferred reader; the eleven CORE/V2/V3/V4/V5 inputs did not.
+The earlier assumption that all 22 old reads would succeed was false. The new
+diagnostic requires that exact 11/11 observation matrix to reproduce, rather
+than treating an unavailable old image as a successful old read.
+
+The first new projection also left the rendering intent at zero for pre-V5
+headers. Both Windows versions returned LCS_GM_IMAGES (4) for the old INFO
+publication. The candidate now preserves that measured default, and four
+separate valid-intent controls require explicit V5 values to remain unchanged.
+
+A separate consumer oracle invokes the real Windows Imaging Component BMP
+decoder. Its source file is built directly from each original fixture's packed
+bytes and independent file offsets; it does not use the candidate converter.
+The oracle decodes source, old output and new output to the same complete
+32-bit BGRA representation with the decoder's top-to-bottom orientation.
+It prints every pixel and alpha byte, dimensions, original pixel-format GUID,
+horizontal and vertical DPI, actual color-context HRESULTs and complete profile
+bytes. No color transform is requested. Raw input and returned BMP bytes remain
+in the log, so decoder normalization cannot be mistaken for byte equality.
+
+For all eleven previously available old inputs, source/new decode failure,
+different decoded pixels or alpha, resolution, or color-context result remains
+fatal. Old/source pixel equality is recorded separately: the observed external
+bitfield masks at the old BMP pixel offset and truncated RLE end marker must be
+interpreted by the real decoder, not preserved solely for byte equality.
+
+For the eleven formerly unavailable old layouts, actual source/new errors or
+semantic differences are explicitly counted as extended_unresolved. They do
+not become compatibility approval, even if the private publication binding
+itself passes. The bounded profile fixture still does not claim a valid color
+engine profile. The full 47-case origin, mutation, precedence, concurrency and
+retirement matrix, and all separate old fatal controls, remain required.
+
+The oracle's small decoded-output bound applies only to these two-by-two test
+fixtures. It introduces no production image-size or header acceptance rule.
+
 The workflow uses the digest-pinned 20261006 compiler, an exact current checkout,
 the current producer/run/attempt and the existing artifact-receipt verifier.
 Consumer jobs verify the archive and every staged source/binary/receipt digest.

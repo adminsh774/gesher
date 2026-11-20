@@ -57,12 +57,13 @@ jobs:
           pathlib.Path('receipt-inputs/legacy-image-source-receipt.json').write_text(json.dumps(record, indent=2)+'\n')
           print(json.dumps(record))
           PY
-          "$cxx" -std=c++20 -O1 -g -Wall -Wextra -Werror -fno-exceptions -static -pthread -D_WIN32_WINNT=0x0A00 -municode -Ireceipt-inputs tests/native/clipboard_ole_binding_diagnostic.cc -luser32 -lole32 -luuid -lgdi32 -o receipt-inputs/binding.exe
+          "$cxx" -std=c++20 -O1 -g -Wall -Wextra -Werror -fno-exceptions -static -pthread -D_WIN32_WINNT=0x0A00 -municode -Ireceipt-inputs tests/native/clipboard_ole_binding_diagnostic.cc -luser32 -lole32 -luuid -lgdi32 -lwindowscodecs -o receipt-inputs/binding.exe
           "$cxx" -std=c++20 -O1 -g -Wall -Wextra -Werror -fno-exceptions -static -pthread -D_WIN32_WINNT=0x0A00 -municode tests/native/clipboard_ole_identity_diagnostic.cc -luser32 -lole32 -luuid -lgdi32 -o receipt-inputs/api-only.exe
           python3 tools/test_clipboard_write_sequence.py --compile-only --cxx "$cxx" --output receipt-inputs/rejected.exe --save-generated receipt-inputs/rejected
           python3 tools/test_clipboard_write_sequence.py --compile-only --cxx "$cxx" --source-ref 1071a0ea72120bdb5afe602517e3ff2676e9f3b9 --output receipt-inputs/old.exe --save-generated receipt-inputs/old
           cp tests/native/clipboard_ole_binding_diagnostic.cc receipt-inputs/binding.cc
           cp tests/native/clipboard_dib_layout_diagnostic.h receipt-inputs/clipboard_dib_layout_diagnostic.h
+          cp tests/native/clipboard_wic_decode_diagnostic.h receipt-inputs/clipboard_wic_decode_diagnostic.h
           cp tests/native/clipboard_ole_identity_diagnostic.cc receipt-inputs/api-only.cc
           cp tests/native/clipboard_ole_binding_diagnostic.md receipt-inputs/measurement-scope.md
           cp .github/workflows/qa213-clipboard-ole-binding.yml receipt-inputs/workflow.yml
@@ -73,6 +74,7 @@ jobs:
           import hashlib, json, os, pathlib, subprocess
           paths = ['tests/native/clipboard_ole_binding_diagnostic.cc',
                    'tests/native/clipboard_dib_layout_diagnostic.h',
+                   'tests/native/clipboard_wic_decode_diagnostic.h',
                    'tests/native/clipboard_ole_identity_diagnostic.cc',
                    'tools/test_clipboard_write_sequence.py',
                    'tests/native/clipboard_ole_binding_diagnostic.md',
@@ -91,7 +93,7 @@ jobs:
           pathlib.Path('receipt-inputs/binding-source-receipt.json').write_text(json.dumps(record, indent=2)+'\n')
           print(json.dumps(record))
           PY
-          (cd receipt-inputs && sha256sum binding.exe binding.cc clipboard_dib_layout_diagnostic.h clipboard_legacy_image_probe_generated.h legacy-image-source-receipt.json api-only.exe api-only.cc measurement-scope.md workflow.yml binding-source-receipt.json rejected.exe old.exe rejected/clipboard.cc rejected/source-receipt.json old/clipboard.cc old/source-receipt.json > outputs.sha256)
+          (cd receipt-inputs && sha256sum binding.exe binding.cc clipboard_dib_layout_diagnostic.h clipboard_wic_decode_diagnostic.h clipboard_legacy_image_probe_generated.h legacy-image-source-receipt.json api-only.exe api-only.cc measurement-scope.md workflow.yml binding-source-receipt.json rejected.exe old.exe rejected/clipboard.cc rejected/source-receipt.json old/clipboard.cc old/source-receipt.json > outputs.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: qa213-clipboard-ole-binding-${{ github.sha }}-a${{ github.run_attempt }}
@@ -158,6 +160,7 @@ jobs:
           Write-Host $errors
           if (-not $finished) { throw 'Actual OLE probe exceeded its unchanged diagnostic process bound' }
           if ($code -ne 0 -or $output -notmatch 'OLE_BINDING completed cases=47 checks=\d+ failures=0 live_objects=0 live_enumerators=0 data_calls=\d+' -or $output.Contains('FAIL OLE_BINDING')) { throw 'The new binding did not satisfy its actual native data, precedence, concurrency or lifecycle controls' }
+          if ($output -notmatch 'OLE_IMAGE_SEMANTICS_SUMMARY old_available=11 required_inputs=11 extended_unresolved=\d+') { throw 'The source-bound original image support and real decoded-image matrix is incomplete' }
       - name: Reproduce the unchanged API-only in-place negative baseline
         if: always() && steps.inputs.outcome == 'success'
         timeout-minutes: 4

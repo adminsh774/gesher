@@ -118,8 +118,10 @@ inline bool ParsePackedDib(const std::vector<uint8_t>& input, PackedDib* result)
   }
   // No color transform is performed. V4/V5 color-space, gamma, endpoints,
   // alpha, intent and profile fields stay byte-exact. Older headers have no
-  // explicit color-space/intent fields; the old/new Windows result is the gate.
+  // explicit intent field. Both measured Windows versions synthesize IMAGES
+  // for the old INFO inputs, rather than the undocumented zero value.
   if (header_size < 108) h.bV5CSType = LCS_sRGB;
+  if (header_size < 124) h.bV5Intent = LCS_GM_IMAGES;
   h.bV5Size = sizeof(BITMAPV5HEADER);
   *result = out;
   return true;

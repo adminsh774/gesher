@@ -31,6 +31,7 @@
 #include <thread>
 #include "clipboard_dib_layout_diagnostic.h"
 #include "clipboard_legacy_image_probe_generated.h"
+#include "clipboard_wic_decode_diagnostic.h"
 
 namespace {
 int checks = 0;
@@ -1109,6 +1110,9 @@ void ConcurrentCase() {
 
 unsigned layout_exact_differences = 0;
 unsigned layout_conversion_failures = 0;
+unsigned layout_old_available = 0;
+unsigned layout_semantics_required = 0;
+unsigned layout_extended_unresolved = 0;
 struct ImageInput { const char* name; std::vector<uint8_t> bytes; };
 std::vector<uint8_t> ImageFixture(DWORD header_size, WORD bits, DWORD compression,
                                 bool top_down = false, bool profile = false) {
@@ -1190,6 +1194,51 @@ void HexImage(const char* name, const char* phase, const std::vector<uint8_t>& b
   for (uint8_t value : bytes) std::printf("%02x", static_cast<unsigned>(value));
   std::printf("\n");
 }
+
+// Wrap only the fixture's original packed bytes in a file header. This does
+// not call the candidate converter or learn offsets from its output. Windows'
+// actual BMP decoder independently interprets the requested source file.
+std::vector<uint8_t> FixtureBmp(const std::vector<uint8_t>& dib) {
+  if (dib.size() < 12) return {};
+  DWORD size = 0;
+  std::memcpy(&size, dib.data(), sizeof(size));
+  size_t pixel_offset = 0;
+  if (size == 12) {
+    BITMAPCOREHEADER h{};
+    std::memcpy(&h, dib.data(), sizeof(h));
+    pixel_offset = 12u + (h.bcBitCount <= 8 ? (size_t{1} << h.bcBitCount) * 3u : 0u);
+  } else {
+    if (dib.size() < sizeof(BITMAPINFOHEADER)) return {};
+    BITMAPINFOHEADER h{};
+    std::memcpy(&h, dib.data(), sizeof(h));
+    const size_t colors = h.biClrUsed ? h.biClrUsed
+        : (h.biBitCount <= 8 ? size_t{1} << h.biBitCount : 0u);
+    const size_t masks = size == 40 && h.biCompression == BI_BITFIELDS ? 12u
+        : (size == 40 && h.biCompression == 6 ? 16u : 0u);
+    pixel_offset = static_cast<size_t>(size) + masks + colors * 4u;
+  }
+  if (pixel_offset >= dib.size() || dib.size() > 64u * 1024u * 1024u) return {};
+  static_assert(sizeof(BITMAPFILEHEADER) == 14);
+  BITMAPFILEHEADER file{};
+  file.bfType = 0x4d42;
+  file.bfSize = static_cast<DWORD>(14u + dib.size());
+  file.bfOffBits = static_cast<DWORD>(14u + pixel_offset);
+  std::vector<uint8_t> result(14u + dib.size());
+  std::memcpy(result.data(), &file, sizeof(file));
+  std::memcpy(result.data() + 14u, dib.data(), dib.size());
+  return result;
+}
+
+bool RecordedOldImageAvailable(const char* name) {
+  // Exact old107 observations on both Windows 2022/2025 in 44727512461 a1.
+  // This is a named regression matrix, not a general image acceptance policy.
+  const char* const available[] = {"info-1", "info-4", "info-8", "info-16-rgb",
+      "info-16-masks", "info-24", "info-24-top-down", "info-32-rgb",
+      "info-32-masks", "info-rle8", "info-rle4"};
+  for (const char* value : available) if (std::strcmp(name, value) == 0) return true;
+  return false;
+}
+
 void ImageLayoutCase(const ImageInput& input) {
   ++case_number;
   ClearFixture();
@@ -1203,6 +1252,8 @@ void ImageLayoutCase(const ImageInput& input) {
   const bool old_has_image = old_read && old_bmp.size() >= 14u + sizeof(BITMAPINFOHEADER)
       && old_projection.opened && old_projection.closed && old_projection.image_format != 0
       && std::vector<uint8_t>(old_bmp.begin() + 14, old_bmp.end()) == old_projection.raw_image;
+  const bool expected_old_image = RecordedOldImageAvailable(input.name);
+  if (old_has_image) ++layout_old_available;
   HexImage(input.name, "input-dib", input.bytes);
   HexImage(input.name, "old-reader-bmp", old_bmp);
   ClearFixture();
@@ -1214,6 +1265,25 @@ void ImageLayoutCase(const ImageInput& input) {
   std::vector<uint8_t> new_bmp;
   const bool new_read = old_image::ReadClipboardImage(&new_bmp);
   HexImage(input.name, "new-reader-bmp", new_bmp);
+  const auto source_bmp = FixtureBmp(input.bytes);
+  HexImage(input.name, "source-bmp", source_bmp);
+  const auto source_picture = gesher::wic_diagnostic::Decode(source_bmp);
+  const auto old_picture = gesher::wic_diagnostic::Decode(old_bmp);
+  const auto new_picture = gesher::wic_diagnostic::Decode(new_bmp);
+  gesher::wic_diagnostic::Print(input.name, "source", source_picture);
+  gesher::wic_diagnostic::Print(input.name, "old-reader", old_picture);
+  gesher::wic_diagnostic::Print(input.name, "new-reader", new_picture);
+  const bool source_new_pixels = source_picture.pixels_equal(new_picture);
+  const bool source_old_pixels = source_picture.pixels_equal(old_picture);
+  const bool source_new_resolution = source_picture.resolution_result == S_OK
+      && new_picture.resolution_result == S_OK
+      && source_picture.dpi_x == new_picture.dpi_x && source_picture.dpi_y == new_picture.dpi_y;
+  const bool source_new_contexts = source_picture.color_result == new_picture.color_result
+      && source_picture.colors == new_picture.colors;
+  std::printf("OLE_IMAGE_SEMANTICS name=%s old_expected=%d source_old_pixels=%d "
+      "source_new_pixels=%d source_new_resolution=%d source_new_contexts=%d\n",
+      input.name, expected_old_image, source_old_pixels, source_new_pixels,
+      source_new_resolution, source_new_contexts);
   const bool exact = old_read == new_read && old_bmp == new_bmp;
   if (!exact) ++layout_exact_differences;
   std::printf("OLE_IMAGE_LAYOUT case=%u name=%s old_set=%d new_set=%08lx old_image=%d "
@@ -1225,11 +1295,27 @@ void ImageLayoutCase(const ImageInput& input) {
   // All complete-byte differences remain explicit evidence for independent
   // compatibility review. A positive binding is not a byte-exact migration or
   // product approval; no image decoder or metadata compatibility is presumed.
-  Check(old_has_image, "old preferred image is actually available through the exact production reader");
+  Check(old_has_image == expected_old_image,
+        "exact old reader reproduces its independently observed 11 available and 11 unavailable layouts");
   Check(new_set == S_OK && current.sequence != 0 && new_read
         && new_bmp.size() >= 14u + sizeof(BITMAPINFOHEADER)
         && std::vector<uint8_t>(new_bmp.begin() + 14, new_bmp.end()) == current.projection.raw_image,
         "every observed old image input retains its complete actual preferred-reader binding");
+  Check(!source_bmp.empty(), "original fixture has an independent complete BMP input for Windows decoding");
+  if (expected_old_image) {
+    ++layout_semantics_required;
+    Check(source_picture.result == S_OK && new_picture.result == S_OK && source_new_pixels,
+          "every actually supported old input preserves all requested decoded pixels and alpha");
+    Check(source_new_resolution,
+          "every actually supported old input preserves its actual horizontal and vertical resolution");
+    Check(source_new_contexts,
+          "every actually supported old input preserves its actual color-context result and bytes");
+  } else {
+    // A decoder error, normalized alpha or profile difference here remains an
+    // explicit unresolved extension, never a compatibility PASS for the product.
+    if (!source_new_pixels || !source_new_resolution || !source_new_contexts)
+      ++layout_extended_unresolved;
+  }
   ClearFixture();
   candidate->Release();
   PumpPending();
@@ -1262,6 +1348,15 @@ void InvalidLayouts() {
           "invalid layout returns an explicit failure without fabricated image bytes");
   }
   Check(GetClipboardSequenceNumber() == before, "conversion errors never publish or clear the clipboard");
+  for (DWORD intent : {LCS_GM_BUSINESS, LCS_GM_GRAPHICS, LCS_GM_IMAGES, LCS_GM_ABS_COLORIMETRIC}) {
+    auto explicit_v5 = ImageFixture(124, 24, BI_RGB);
+    std::memcpy(explicit_v5.data() + 108, &intent, sizeof(intent));
+    std::vector<uint8_t> output;
+    const bool converted = gesher::clipboard_diagnostic::ToPackedV5(explicit_v5, &output);
+    DWORD retained = 0;
+    if (converted && output.size() >= 112) std::memcpy(&retained, output.data() + 108, 4);
+    Check(converted && retained == intent, "every explicit V5 rendering intent remains caller-owned");
+  }
   std::printf("OLE_IMAGE_INVALID case=%u inputs=%zu\n", case_number, invalid.size());
 }
 
@@ -1363,5 +1458,7 @@ int wmain(int argc, wchar_t** argv) {
       static_cast<long>(data_calls));
   std::printf("OLE_IMAGE_LAYOUT_SUMMARY inputs=%zu exact_differences=%u conversion_failures=%u\n",
       sizeof(images) / sizeof(images[0]), layout_exact_differences, layout_conversion_failures);
+  std::printf("OLE_IMAGE_SEMANTICS_SUMMARY old_available=%u required_inputs=%u extended_unresolved=%u\n",
+      layout_old_available, layout_semantics_required, layout_extended_unresolved);
   return failures ? 1 : 0;
 }
