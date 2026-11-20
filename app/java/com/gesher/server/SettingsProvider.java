@@ -5,6 +5,7 @@
 package com.gesher.server;
 
 import android.app.ContentProviderHolder;
+import android.app.AppOpsManager;
 import android.content.ComponentName;
 import android.content.ContentProvider;
 import android.content.ContentValues;
@@ -317,12 +318,25 @@ final class SettingsProvider extends ContentProvider {
         if (mCallers == null) throw new SecurityException("Settings writer identity unavailable");
         if (mCallers.isSystem()) return;
         String actual = mCallers.callerPackage();
-        String permission = SYSTEM.equals(table) ? "android.permission.WRITE_SETTINGS"
-                : "android.permission.WRITE_SECURE_SETTINGS";
-        if (mPm.permissions().checkPermission(actual, permission)
-                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            throw new SecurityException("Settings write permission denied");
+        // AOSP's system-table special access is an AppOp for ordinary apps.
+        // Secure/global still require the actual privileged permission; its holders
+        // may also write system settings independently of the special-access AppOp.
+        if (mPm.permissions().checkPermission(actual, android.Manifest.permission.WRITE_SECURE_SETTINGS)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED) return;
+        if (SYSTEM.equals(table)) {
+            int uid = Binder.getCallingUid();
+            String attribution = getCallingAttributionTag();
+            int mode;
+            long identity = Binder.clearCallingIdentity();
+            try {
+                mode = mPm.appOps().noteOperation(AppOpsManager.OP_WRITE_SETTINGS, uid, actual,
+                        attribution, false, null, false).getOpMode();
+            } finally { Binder.restoreCallingIdentity(identity); }
+            if (mode == AppOpsManager.MODE_ALLOWED || mode == AppOpsManager.MODE_DEFAULT
+                    && mPm.permissions().checkPermission(actual, android.Manifest.permission.WRITE_SETTINGS)
+                        == android.content.pm.PackageManager.PERMISSION_GRANTED) return;
         }
+        throw new SecurityException("Settings write permission denied");
     }
 
     @Override

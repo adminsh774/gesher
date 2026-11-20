@@ -30,6 +30,30 @@ import android.widget.LinearLayout;
 public class MainActivity extends Reporting {
     private String mLaidOut;
     private ClipboardManager mClipboard;
+    private final android.os.Handler mProbeHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private boolean mStopped;
+    private long mProbeDeadline;
+    private final Runnable mClipboardProbe = new Runnable() {
+        @Override public void run() {
+            if (!mStopped || isDestroyed()) return;
+            String path = System.getenv("GESHER_WINAPP_CLIPBOARD_PROBE");
+            if (path == null || path.isEmpty()) return;
+            java.io.File request = new java.io.File(path);
+            if (request.isFile()) {
+                try {
+                    String token = java.nio.file.Files.readString(request.toPath(), java.nio.charset.StandardCharsets.US_ASCII).trim();
+                    if (!token.matches("[a-f0-9]{32}")) throw new AssertionError("Invalid clipboard probe challenge");
+                    // The external fixture signals only after proving its foreign HWND is
+                    // actually foreground. This is the application's ordinary public getter.
+                    say("MainActivity stopped clipboard present " + (mClipboard.getPrimaryClip() != null)
+                            + " probe " + token);
+                } catch (java.io.IOException failure) { throw new AssertionError(failure); }
+                return;
+            }
+            if (android.os.SystemClock.uptimeMillis() >= mProbeDeadline) throw new AssertionError("Clipboard foreground probe was not signalled");
+            mProbeHandler.postDelayed(this, 50);
+        }
+    };
     private final ClipboardManager.OnPrimaryClipChangedListener mClipListener = () -> {
         ClipData clip = mClipboard.getPrimaryClip();
         CharSequence text = clip != null && clip.getItemCount() > 0
@@ -129,17 +153,21 @@ public class MainActivity extends Reporting {
     @Override
     protected void onStop() {
         super.onStop();
-        // The desktop fixture checks the actual foreground PID independently before
-        // asserting denial. This ordinary app only reports its public clipboard result.
-        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
-            if (!isDestroyed() && !hasWindowFocus() && mClipboard != null) {
-                say("MainActivity stopped clipboard present " + (mClipboard.getPrimaryClip() != null));
-            }
-        }, 500);
+        mStopped = true;
+        mProbeDeadline = android.os.SystemClock.uptimeMillis() + 30_000;
+        mProbeHandler.post(mClipboardProbe);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        mStopped = false;
+        mProbeHandler.removeCallbacks(mClipboardProbe);
     }
 
     @Override
     protected void onDestroy() {
+        mProbeHandler.removeCallbacksAndMessages(null);
         if (mClipboard != null) mClipboard.removePrimaryClipChangedListener(mClipListener);
         super.onDestroy();
     }
