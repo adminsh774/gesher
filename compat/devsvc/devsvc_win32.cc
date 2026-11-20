@@ -367,11 +367,13 @@ HRESULT StartDocumentLifetime(DocumentLifetime* state) {
   if (FAILED(status)) return status;
   if (!state->window || next_document_timer == std::numeric_limits<UINT_PTR>::max()) return E_FAIL;
   UINT_PTR id = ++next_document_timer;
-  state->timer = SetTimer(state->window, id, 100, DocumentLifetimeTimer);
-  if (!state->timer) {
+  if (!SetTimer(state->window, id, 100, DocumentLifetimeTimer)) {
     status = HRESULT_FROM_WIN32(GetLastError());
     return FAILED(status) ? status : E_FAIL;
   }
+  // With a non-null HWND, WM_TIMER and KillTimer use the requested identifier.
+  // SetTimer's nonzero success value need not be that identifier.
+  state->timer = id;
   document_timers.emplace(state->timer, state);
   return S_OK;
 }
