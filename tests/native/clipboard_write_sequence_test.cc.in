@@ -30,6 +30,25 @@ static thread_local bool verify_read_close = true;
 static thread_local int open_depth;
 static thread_local void (*race_after_close)();
 static UINT receipt_format;
+static thread_local bool trace_calls, materialize_before_close, probe_foreign_while_open;
+struct BoundaryCall { const char* name; long long result; DWORD error; int depth; HWND open_window; };
+static thread_local std::vector<BoundaryCall> boundary_calls;
+static void ProbeForeignWhileOpen();
+static void RecordCall(const char* name, long long result, DWORD error) {
+  if (trace_calls) boundary_calls.push_back({name, result, error, open_depth, GetOpenClipboardWindow()});
+  SetLastError(error);
+}
+static void MaterializeFormats() {
+  bool text = IsClipboardFormatAvailable(CF_UNICODETEXT) != 0;
+  bool image = IsClipboardFormatAvailable(CF_DIB) != 0;
+  for (UINT format : {CF_TEXT, CF_OEMTEXT, CF_LOCALE, CF_BITMAP, CF_DIBV5}) {
+    if ((format == CF_TEXT || format == CF_OEMTEXT || format == CF_LOCALE) ? !text : !image) continue;
+    DWORD before = GetClipboardSequenceNumber(); SetLastError(ERROR_SUCCESS);
+    HANDLE value = GetClipboardData(format); DWORD error = GetLastError();
+    std::printf("CLIP_MATERIALIZE format=%u handle=%p error=%lu before=%lu after=%lu open=%p\n",
+        format, value, error, before, GetClipboardSequenceNumber(), (void*)GetOpenClipboardWindow());
+  }
+}
 
 static void Check(bool value, const char* name) {
   ++checks;
@@ -71,7 +90,8 @@ static HGLOBAL ObservedFree(HGLOBAL memory) {
 }
 static HANDLE ObservedSet(UINT format, HANDLE memory) {
   if (format == receipt_format && fault == Fault::Set) return nullptr;
-  HANDLE result = SetClipboardData(format, memory);
+  SetLastError(ERROR_SUCCESS);
+  HANDLE result = SetClipboardData(format, memory); DWORD error = GetLastError();
   if (result) {
     std::lock_guard<std::mutex> guard(allocations_lock);
     allocations.erase(memory);
@@ -86,13 +106,22 @@ static HANDLE ObservedSet(UINT format, HANDLE memory) {
       }
     }
   }
+  RecordCall("SetClipboardData", reinterpret_cast<intptr_t>(result), error);
   return result;
 }
 static BOOL ObservedOpen(HWND owner) {
   if (publication_closed && fault == Fault::Reopen) return FALSE;
-  BOOL opened = OpenClipboard(owner);
+  SetLastError(ERROR_SUCCESS);
+  BOOL opened = OpenClipboard(owner); DWORD error = GetLastError();
   if (opened) ++open_depth;
+  RecordCall("OpenClipboard", opened, error);
   return opened;
+}
+static BOOL ObservedEmpty() {
+  SetLastError(ERROR_SUCCESS);
+  BOOL empty = EmptyClipboard(); DWORD error = GetLastError();
+  RecordCall("EmptyClipboard", empty, error);
+  return empty;
 }
 static HANDLE ObservedGet(UINT format) {
   if (format == receipt_format && fault == Fault::MissingRead) return nullptr;
@@ -101,10 +130,19 @@ static HANDLE ObservedGet(UINT format) {
   return memory;
 }
 static BOOL ObservedClose() {
+  bool measured = materialize_before_close && !publication_closed;
+  if (measured) MaterializeFormats();
+  if (probe_foreign_while_open && !publication_closed) {
+    probe_foreign_while_open = false;
+    ProbeForeignWhileOpen();
+  }
   DWORD before = GetClipboardSequenceNumber();
-  BOOL closed = CloseClipboard();
+  SetLastError(ERROR_SUCCESS);
+  BOOL closed = CloseClipboard(); DWORD error = GetLastError();
   DWORD after = GetClipboardSequenceNumber();
   if (closed) --open_depth;
+  RecordCall("CloseClipboard", closed, error);
+  if (measured) std::printf("CLIP_MATERIALIZE close=%d error=%lu before=%lu after=%lu stable=%d\n", closed, error, before, after, before == after);
   if (!publication_closed) {
     publication_closed = true;
     auto race = race_after_close; race_after_close = nullptr;
@@ -123,6 +161,7 @@ static BOOL ObservedClose() {
 #define GlobalFree ObservedFree
 #define SetClipboardData ObservedSet
 #define OpenClipboard ObservedOpen
+#define EmptyClipboard ObservedEmpty
 #define GetClipboardData ObservedGet
 #define CloseClipboard ObservedClose
 @RECEIPT@
@@ -139,6 +178,7 @@ unsigned long long StartEvents() { return reinterpret_cast<unsigned long long>(g
 #undef GlobalFree
 #undef SetClipboardData
 #undef OpenClipboard
+#undef EmptyClipboard
 #undef GetClipboardData
 #undef CloseClipboard
 
@@ -193,6 +233,7 @@ struct ForeignState { HANDLE ready{}, stop{}, process{}, mapping{}; ForeignObser
 static ForeignState foreign;
 static bool clone_receipt;
 static bool borrow_original_owner;
+static bool foreign_during_open;
 static bool raw_opened;
 static bool RawWrite(HWND owner, const GUID* cloned) {
   raw_opened = false;
@@ -235,13 +276,13 @@ static void StartForeignReplacement() {
   if (foreign.observation) *foreign.observation = {-1, -1, 0};
   std::wstring token = L"none";
   if (clone_receipt) {
-    Check(OpenClipboard(nullptr) != 0, "read original token for foreign-owner negative");
+    if (!foreign_during_open) Check(OpenClipboard(nullptr) != 0, "read original token for foreign-owner negative");
     HANDLE memory = GetClipboardData(receipt_format);
     const unsigned char* bytes = memory ? static_cast<const unsigned char*>(GlobalLock(memory)) : nullptr;
     Check(bytes != nullptr && GlobalSize(memory) == 16, "original receipt available for owner negative");
     if (bytes) { token.clear(); const wchar_t hex[] = L"0123456789abcdef";
       for (int i = 0; i < 16; ++i) { token += hex[bytes[i] >> 4]; token += hex[bytes[i] & 15]; } GlobalUnlock(memory); }
-    Check(CloseClipboard() != 0, "original token read close");
+    if (!foreign_during_open) Check(CloseClipboard() != 0, "original token read close");
   }
   std::wstring command = L"\"" + std::wstring(executable) + L"\" --foreign " + ready_name + L" " + stop_name + L" " + token
       + L" " + map_name + L" " + std::to_wstring(borrow_original_owner ? reinterpret_cast<uintptr_t>(g_window) : 0);
@@ -281,6 +322,16 @@ static void StopForeign() {
   if (foreign.observation) Check(UnmapViewOfFile(foreign.observation) != 0, "owned observation view closed");
   if (foreign.mapping) Check(CloseHandle(foreign.mapping) != 0, "owned observation mapping closed");
   foreign = {};
+}
+static void ProbeForeignWhileOpen() {
+  foreign_during_open = true; clone_receipt = true; borrow_original_owner = true;
+  StartForeignReplacement();
+  Check(foreign.observation && foreign.observation->opened == 0,
+        "foreign borrowed HWND cannot join the still-held publication lock");
+  std::printf("CLIP_LOCK_EXCLUSION opened=%ld published=%ld error=%lu\n",
+      foreign.observation ? foreign.observation->opened : -1L, foreign.observation ? foreign.observation->published : -1L,
+      foreign.observation ? foreign.observation->error : 0);
+  StopForeign(); foreign_during_open = false;
 }
 static int Child(const char* ready_name, const char* stop_name, const char* token, const char* map_name, const char* borrowed_owner) {
   HANDLE ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, ready_name), stop = OpenEventA(SYNCHRONIZE, FALSE, stop_name);
@@ -373,16 +424,32 @@ int main(int argc, char** argv) {
       }
     }
     std::atomic<int> write_errors{0};
+    std::atomic<int> write_rejections{0}, depth_errors{0};
     auto concurrent = [&](int kind) {
       verify_read_close = false;  // A competing writer may run immediately after this read releases its lock.
+      trace_calls = true;
       for (int i = 0; i < 16; ++i) {
         fault = Fault::None; publication_closed = false; receipt_memory = nullptr; read_receipt_memory = nullptr;
         allocating_receipt = false; published_receipt = false;
+        boundary_calls.clear();
         uint32_t sequence = 0;
-        if (!Write(kind, &sequence) || open_depth != 0) ++write_errors;
+        ULONGLONG started = GetTickCount64();
+        bool wrote = Write(kind, &sequence); DWORD error = GetLastError();
+        if (!wrote || open_depth != 0) ++write_errors;
+        if (!wrote) ++write_rejections;
+        if (open_depth != 0) ++depth_errors;
+        std::string events;
+        for (const auto& event : boundary_calls) {
+          char text[200];
+          std::snprintf(text, sizeof(text), " %s(result=%lld,error=%lu,depth=%d,open=%p)", event.name, event.result, event.error, event.depth, (void*)event.open_window);
+          events += text;
+        }
+        std::printf("CLIP_CONCURRENT tid=%lu kind=%d index=%d success=%d receipt=%lu depth=%d error=%lu elapsed=%llu%s\n",
+            GetCurrentThreadId(), kind, i, wrote, (unsigned long)sequence, open_depth, error, GetTickCount64() - started, events.c_str());
       }
     };
     std::thread first(concurrent, 0), second(concurrent, 2); first.join(); second.join();
+    std::printf("CLIP_CONCURRENT totals rejected=%d depth_errors=%d combined=%d\n", write_rejections.load(), depth_errors.load(), write_errors.load());
     Check(write_errors == 0, "concurrent plain/rich writes release their native resources");
     Check(duplicate_tokens == 0 && tokens.size() >= 40, "full per-write GUID uniqueness across helpers and concurrent same-HWND writers");
     ResetControl(); uint32_t cleared = 99;
@@ -392,6 +459,16 @@ int main(int argc, char** argv) {
     Check(!gesher::devsvc::ClipboardText(&text) && !gesher::devsvc::ClipboardHtml(&html)
           && !gesher::windows::ReadClipboardImage(&image), "clear preserves absent text HTML and image");
     CheckResources();
+    for (int kind = 0; kind < 3; ++kind) {
+      ResetControl(); materialize_before_close = true; uint32_t sequence = 0;
+      std::printf("CLIP_MATERIALIZE begin kind=%d\n", kind);
+      Check(Write(kind, &sequence), "format synthesis measurement still publishes actual data");
+      materialize_before_close = false; VerifyContent(kind); CheckResources();
+    }
+    ResetControl(); probe_foreign_while_open = true; uint32_t exclusive_sequence = 0;
+    Check(Write(0, &exclusive_sequence), "held-lock probe leaves real own publication intact");
+    Check(exclusive_sequence != 0 && exclusive_sequence == GetClipboardSequenceNumber(), "held-lock exclusion preserves own current receipt");
+    VerifyContent(0); CheckResources();
   }
   Check(PostThreadMessageW(owner_thread_id, WM_QUIT, 0, 0) != 0, "owned event thread retirement posted");
   if (WaitForSingleObject(owner_done, 5000) != WAIT_OBJECT_0) {
