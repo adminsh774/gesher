@@ -19,23 +19,19 @@ a later label application. A pending label in the same/adjacent timestamp second
 is conservatively retained when GitHub supplies no proof that it predates the
 push; it cannot authorize a new head without a matching approval receipt.
 
-The existing author routes are unchanged: an author may deliberately reapply an
-earlier label, or precede their first label with an unedited exact-head COMMENT
-review. A different authorized collaborator may apply their first label. The bot
+Any collaborator with write/admin access, including the PR author, approves the
+current head by applying the label after the PR was opened. The controller
+removes only a label applied at creation (or in the same second, or before the
+recorded opening boundary) and labels invalidated by a push, reopening or
+retargeting. A creation-time label is the only route an author without write
+access could use to request automerge, and the permission check rejects such an
+author's later labels. No separate author COMMENT review is required. The bot
 records a native approval binding the repository, PR, head, base and label event.
 This receipt records authorization; it is not a code-review or scope verdict.
 
-An author first-label review states the reviewed commit, scope verdict, contract
-evidence, actionable findings, tests and validation limits required by
-CONTRIBUTING.md. Include exactly one standalone compact marker with actual values:
-
-```text
-<!-- gesher-automerge-qa-v1 {"repository":1426153186,"number":115,"head":"FULL_40_CHARACTER_HEAD_SHA","base":"main"} -->
-```
-
-Edited, duplicate or mismatched proof fails closed. Legacy unedited receipts and
-opening boundaries retain their meaning. Maintainer approval cannot waive the
-Android-visible contract requirements in CONTRIBUTING.md.
+Legacy unedited receipts and opening boundaries retain their meaning. Maintainer
+approval cannot waive the Android-visible contract requirements in
+CONTRIBUTING.md.
 
 ## One PR CI run and final QA
 
@@ -69,6 +65,17 @@ covers source identity and the ARM64 build. The deployed configuration is
 all three contexts are bound to GitHub Actions, force pushes/deletion are blocked,
 and there are no permanent bypass actors. Branch updates may need fresh CI;
 there is no automatic second full CI run simply for merging.
+
+GitHub's stale-review dismissal (`dismiss_stale_reviews_on_push`) is off. With
+it on, GitHub dismissed the controller's exact-head approval with "The
+merge-base changed after approval" whenever `main` advanced, and kept dismissing
+every fresh approval of the same head until the branch was updated, although
+`git merge-base` was unchanged (PR 120 after #218). Approval stays exact-head
+without it: `qa/label-approval` is required and bound to the reviewed head, a
+push removes the label, disarms native auto-merge and dismisses the controller's
+own approvals of older heads, and only a fresh label on the new head can turn
+the gate green again. An approval therefore survives `main` advancing but never
+authorizes a different PR head.
 
 ## API quota
 
