@@ -6,8 +6,10 @@ function Assert-WifiNetworkSpecifierParcelEvidence([string[]] $Output, [string] 
     throw 'Expected the pinned Android Wi-Fi r4 writer profile'
   }
   $specifierExpected = @($specifierReference.wire_cases)
-  $specifierObserved = [regex]::Matches(($Output -join "`n"), '^WIFI_SPECIFIER_PARCEL (\S+) bytes=([0-9]+) sha256=([0-9a-f]{64})\r?$', [Text.RegularExpressions.RegexOptions]::Multiline)
-  if ($specifierExpected.Count -ne 12 -or $specifierObserved.Count -ne 12) { throw 'Expected twelve complete native Parcel observations' }
+  $specifierText = $Output -join "`n"
+  $specifierObserved = [regex]::Matches($specifierText, '^WIFI_SPECIFIER_PARCEL (\S+) bytes=([0-9]+) sha256=([0-9a-f]{64})\r?$', [Text.RegularExpressions.RegexOptions]::Multiline)
+  $specifierMarkers = [regex]::Matches($specifierText, '^WIFI_SPECIFIER_PARCEL(?:\s|$)', [Text.RegularExpressions.RegexOptions]::Multiline)
+  if ($specifierExpected.Count -ne 12 -or $specifierObserved.Count -ne 12 -or $specifierMarkers.Count -ne 12) { throw 'Expected twelve complete native Parcel observations' }
   $specifierSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
   foreach ($specifierCase in $specifierObserved) {
     $specifierName = $specifierCase.Groups[1].Value

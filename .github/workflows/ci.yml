@@ -205,6 +205,10 @@ jobs:
         shell: pwsh
         run: tests/windows/test-test-shards.ps1
 
+      - name: Wi-Fi specifier native evidence checker contracts
+        shell: pwsh
+        run: tests/windows/WifiNetworkSpecifierParcelChecks.ps1
+
       - name: Strict archive adversarial controls
         run: |
           python3 tools/ci/receipt_identity.py
