@@ -109,7 +109,7 @@ public final class ClipboardFixture implements AutoCloseable {
         volatile String text, html;
         volatile byte[] image;
         volatile int writes, clears;
-        volatile boolean changeAfterWrite;
+        volatile boolean changeAfterWrite, rejectWrite;
         final CopyOnWriteArrayList<WindowsHost.Listener> listeners = new CopyOnWriteArrayList<>();
         Object boundary() throws Exception {
             Class<?> host = type("ClipboardService$Host");
@@ -123,6 +123,7 @@ public final class ClipboardFixture implements AutoCloseable {
                     case "html": return html;
                     case "image": return image;
                     case "write":
+                        if (rejectWrite) { writes++; return 0; }
                         text = (String)args[0]; html = (String)args[1]; image = (byte[])args[2]; sequence++; writes++;
                         int written = sequence;
                         if (changeAfterWrite) { text = "external-after-write"; html = null; image = null; sequence++; }

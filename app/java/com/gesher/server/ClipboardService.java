@@ -51,6 +51,7 @@ public final class ClipboardService extends IClipboard.Default
     }
 
     private static final class WindowsClipboard implements Host {
+        private boolean publisherRetained;
         public boolean available() { return WindowsHost.available(); }
         public long[] foregroundProcess() { return WindowsHost.foregroundProcess(); }
         public int sessionLockState() { return WindowsHost.sessionLockState(); }
@@ -61,9 +62,28 @@ public final class ClipboardService extends IClipboard.Default
         public int write(String text, String html, byte[] image) {
             return WindowsHost.setClipboardSequence(text, html, image);
         }
-        public int clear() { return WindowsHost.setClipboardSequence("", null, null); }
-        public void addListener(WindowsHost.Listener listener) { WindowsHost.addListener(listener); }
-        public void removeListener(WindowsHost.Listener listener) { WindowsHost.removeListener(listener); }
+        public int clear() { return WindowsHost.clearClipboardSequence(); }
+        public synchronized void addListener(WindowsHost.Listener listener) {
+            if (publisherRetained) return;
+            if (!WindowsHost.retainClipboardPublisher()) {
+                throw new IllegalStateException("Windows clipboard publisher unavailable");
+            }
+            publisherRetained = true;
+            try { WindowsHost.addListener(listener); }
+            catch (Throwable failure) {
+                publisherRetained = false;
+                WindowsHost.removeListener(listener);
+                WindowsHost.releaseClipboardPublisher();
+                throw failure;
+            }
+        }
+        public synchronized void removeListener(WindowsHost.Listener listener) {
+            WindowsHost.removeListener(listener);
+            if (publisherRetained) {
+                publisherRetained = false;
+                WindowsHost.releaseClipboardPublisher();
+            }
+        }
     }
 
     private final RemoteCallbackList<IOnPrimaryClipChangedListener> mListeners =
@@ -172,8 +192,8 @@ public final class ClipboardService extends IClipboard.Default
         synchronized (mLifecycleLock) {
             if (mClosed) throw new IllegalStateException("Clipboard service is closed");
             if (mStarted) return;
-            mStarted = true;
             if (mHost.available()) mHost.addListener(this);
+            mStarted = true;
         }
         syncFromWindows(false);
     }
@@ -364,6 +384,12 @@ public final class ClipboardService extends IClipboard.Default
             int writtenSequence = mHost.available() ? mHost.write(windows[0], windows[1], image) : 0;
             replaceLocked(saved, source, null);
             if (writtenSequence != 0) { mSequence = writtenSequence; mHaveSequence = true; }
+            else if (mHost.available()) {
+                // No receipt can bind the saved typed clip to native data. The next
+                // read/event must import the actual native generation, even if an
+                // unsuccessful write left its sequence equal to our previous one.
+                mHaveSequence = false;
+            }
         }
         notifyListeners();
     }
@@ -383,6 +409,12 @@ public final class ClipboardService extends IClipboard.Default
             int writtenSequence = mHost.available() ? mHost.clear() : 0;
             changed = replaceLocked(null, null, null);
             if (writtenSequence != 0) { mSequence = writtenSequence; mHaveSequence = true; }
+            else if (mHost.available()) {
+                // No receipt can bind the saved typed clip to native data. The next
+                // read/event must import the actual native generation, even if an
+                // unsuccessful write left its sequence equal to our previous one.
+                mHaveSequence = false;
+            }
         }
         if (changed) notifyListeners();
     }

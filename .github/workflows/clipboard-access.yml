@@ -3,6 +3,8 @@ on:
   pull_request:
     paths:
       - 'compat/devsvc/**'
+      - 'compat/windows/clipboard*'
+      - 'compat/windows/windows.cmake'
       - 'cmake/aosp/devsvc.cmake'
       - 'app/java/com/gesher/server/ClipboardService.java'
       - 'app/java/com/gesher/server/WindowsHost.java'
@@ -16,6 +18,7 @@ on:
       - 'compat/framework/services_zygote.*'
       - 'compat/framework/services_natives.cc'
       - 'tests/clipboard/**'
+      - 'tests/windows/clipboard/Publication.ps1'
       - 'tools/test_clipboard_native.py'
       - '.github/workflows/clipboard-access.yml'
   workflow_dispatch:
@@ -52,3 +55,9 @@ jobs:
         run: |
           & .\standalone-restart.exe
           if ($LASTEXITCODE -ne 0) { throw 'Native standalone restart gate failed' }
+      - name: Build actual private clipboard publication and competing-writer regression
+        shell: cmd
+        run: cl /nologo /std:c++17 /EHsc /W4 /WX /D_WIN32_WINNT=0x0A00 /I"%JAVA_HOME%\include" /I"%JAVA_HOME%\include\win32" tests\clipboard\publication_windows_test.cc compat\windows\clipboard_bridge.cc /Fe:clipboard-publication.exe ole32.lib uuid.lib user32.lib gdi32.lib windowscodecs.lib
+      - name: Verify actual publication, image projection and retirement on Windows
+        shell: pwsh
+        run: tests/windows/clipboard/Publication.ps1

@@ -320,6 +320,25 @@ if ($LASTEXITCODE -ne 0 -or -not $grantOut.Contains('Permission grant completed 
   throw "Lifecycle CAMERA prerequisite grant failed: $grantOut"
 }
 try {
+function SettingsFixtureSetup([string[]] $Arguments) {
+  $savedUid = $env:GESHER_UID; $savedBinderUid = $env:GESHER_BINDER_UID
+  try {
+    $env:GESHER_UID = '1000'; $env:GESHER_BINDER_UID = '1000'
+    RunTimed "$Dir/dalvikvm.exe" ($dvmApp + '-cp', (NoDrive "$Dir/services-tests.dex"),
+      'gesher.services.FixtureSettingsSetup' + $Arguments) 90
+  } finally {
+    $env:GESHER_UID = $savedUid; $env:GESHER_BINDER_UID = $savedBinderUid
+  }
+}
+# A declared special permission is not a runtime/signature grant. Authorize the
+# actual fixture through the real persistent WRITE_SETTINGS AppOp before it runs.
+$settingsSetup = SettingsFixtureSetup @((NoDrive "$Dir/components.apk"))
+if ($LASTEXITCODE -ne 0 -or $settingsSetup -notmatch 'FixtureSettingsSetup persisted special access UID ([0-9]+) package com\.gesher\.components') {
+  throw "Components standalone special-access setup failed: $settingsSetup"
+}
+$componentsUid = [int]$Matches[1]
+if ($componentsUid -lt 10000 -or $componentsUid -gt 19999) { throw 'Components fixture requires an ordinary admitted UID' }
+Write-Host $settingsSetup
 $appOut = RunTimed "$Dir/dalvikvm.exe" ($dvmApp + 'com.gesher.app.Main', '--system-server', '--keep-task',
   '--ez', 'com.gesher.lifecycle.REQUEST_PERMISSIONS', 'true', (NoDrive "$Dir/lifecycle.apk")) 400
 $appCode = $LASTEXITCODE
@@ -428,7 +447,7 @@ Start-Sleep -Milliseconds 500
 $serverOut = (Get-Content "$logs/system_server.out" -Raw -ErrorAction SilentlyContinue) + ''
 $s = 'system_server: '
 $null = CheckSequences 'services: system_server drives components.apk: NewIntentItem, ActivityResultItem, services, receivers, providers, notifications' $serverOut @(
-  ,@("${s}com.gesher.components parsed by PackageParser2: 7 activities, 3 services, 1 receivers, 1 providers",
+  ,@("${s}com.gesher.components parsed by PackageParser2: 8 activities, 4 services, 1 receivers, 1 providers",
     "${s}publishContentProviders: com.gesher.components.items (com.gesher.components.ItemsProvider)",
     "${s}scheduleTransaction NewIntentItem to com.gesher.components/com.gesher.components.SingleTopActivity",
     "${s}scheduleTransaction ActivityResultItem, ResumeActivityItem to com.gesher.components/com.gesher.components.MainActivity",
@@ -442,6 +461,42 @@ $null = CheckSequences 'services: system_server drives components.apk: NewIntent
     "${s}scheduleReceiver com.gesher.components/com.gesher.components.ManifestReceiver",
     "${s}settings: updated system key gesher_test", "${s}scheduleExit: process ")
 )
+# A real SpellCheckerService runs in the fixture's :checker process. Only the
+# host may select it, then real AOSP client APIs exercise both remote sessions.
+$checkerRun = $dvmApp + 'com.gesher.app.Main', '--system-server', '--keep-task',
+  '--activity', '.SpellCheckerActivity'
+$checkerApk = NoDrive "$Dir/components.apk"
+$checkerUnselected = RunTimed "$Dir/dalvikvm.exe" ($checkerRun + '--ez',
+  'spell-checker-unselected', 'true', $checkerApk) 90
+$checkerCode = $LASTEXITCODE
+$null = CheckOrdered 'text services: installed unselected APK is discoverable but inactive' `
+  $checkerUnselected @('spell checker contract: unselected APK remains inactive') $checkerCode
+$checkerCommand = $dvmApp + 'com.gesher.server.RuntimeCommands', 'spell-checker'
+foreach ($checkerOptions in @(
+  @{ Args = @('use', 'com.gesher.components/.TestSpellChecker') },
+  @{ Args = @('language', '1002') },
+  @{ Args = @('enable') }
+)) {
+  $checkerAdminOut = RunTimed "$Dir/dalvikvm.exe" ($checkerCommand + $checkerOptions.Args) 45
+  $checkerAdminCode = $LASTEXITCODE
+  $null = CheckOrdered "text services: trusted host $($checkerOptions.Args[0])" `
+    $checkerAdminOut @('Spell-checker setting updated') $checkerAdminCode
+}
+try {
+  $checkerOut = RunTimed "$Dir/dalvikvm.exe" ($checkerRun + $checkerApk) 90
+  $checkerCode = $LASTEXITCODE
+  $null = CheckOrdered 'text services: real word, sentence, language and cancellation Binder contracts' `
+    $checkerOut @('spell checker contract: distinct process, words, sentence, locale, cancel and close passed') $checkerCode
+  $checkerServerOut = (Get-Content "$logs/system_server.out" -Raw -ErrorAction SilentlyContinue) + ''
+  $null = CheckOrdered 'text services: provider binding is released after both sessions close' `
+    $checkerServerOut @('scheduleBindService com.gesher.components/.TestSpellChecker',
+    'publishService com.gesher.components/.TestSpellChecker', 'scheduleUnbindService com.gesher.components/.TestSpellChecker')
+} finally {
+  $checkerResetOut = RunTimed "$Dir/dalvikvm.exe" ($checkerCommand + 'automatic') 45
+  $checkerResetCode = $LASTEXITCODE
+  $null = CheckOrdered 'text services: restore automatic checker selection' `
+    $checkerResetOut @('Spell-checker setting updated') $checkerResetCode
+}
 foreach ($p in $server, $servicemanager, $binderd) {
   if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
 }
@@ -687,12 +742,35 @@ if (-not (CheckSequences 'services: gesher-app launch lifecycle.apk: the system 
     'gesher-app: the process of com.gesher.lifecycle ended (exit code 0)')
 ) $code)) { Write-Host $out }
 
-# A second app on the same device (installed by its first launch):
+# A second app on the same device, installed and explicitly authorized before launch:
 # components.apk runs its activities, services, broadcasts and providers to the
 # end (--keep-task).
-$out = RunTimed "$Dir/dalvikvm.exe" ($launcher + 'launch', (NoDrive "$Dir/components.apk"), '--keep-task') 500
+$componentsInstall = RunTimed "$Dir/dalvikvm.exe" ($launcher + 'install', (NoDrive "$Dir/components.apk")) 180
+if ($LASTEXITCODE -ne 0 -or -not $componentsInstall.Contains('gesher-app: installed com.gesher.components (version 1) in ')) {
+  throw "Components actual installation failed: $componentsInstall"
+}
+foreach ($settingsMode in @(3, 1, 2, 0)) {
+  $settingsAllowed = if ($settingsMode -eq 0) { 'true' } else { 'false' }
+  $modeSetup = SettingsFixtureSetup @('--remote', [string]$componentsUid, 'com.gesher.components', [string]$settingsMode)
+  if ($LASTEXITCODE -ne 0 -or -not $modeSetup.Contains("FixtureSettingsSetup live special access UID $componentsUid package com.gesher.components source ") -or
+      -not $modeSetup.Contains(" mode $settingsMode")) { throw "Real settings mode setup failed: $modeSetup" }
+  $modeOut = RunTimed "$Dir/dalvikvm.exe" ($launcher + 'launch', 'com.gesher.components', '--activity', '.SettingsAccessActivity',
+    '--keep-task', '--headless', '--ez', 'allowed', $settingsAllowed) 180
+  $modeCode = $LASTEXITCODE
+  Write-Host $modeSetup
+  $null = CheckOrdered "services: Settings.System.canWrite and actual provider write, AppOp mode $settingsMode" $modeOut @(
+    "components: settings special access canWrite $settingsAllowed uid $componentsUid pid ",
+    '; secure/global and foreign package denied', 'gesher-app: done') $modeCode
+  if ($modeCode -ne 0 -or -not $modeOut.Contains("components: settings special access canWrite $settingsAllowed uid $componentsUid pid ")) { Write-Host $modeOut }
+}
+$settingsSetup = SettingsFixtureSetup @('--remote', [string]$componentsUid, 'com.gesher.components')
+if ($LASTEXITCODE -ne 0 -or -not $settingsSetup.Contains("FixtureSettingsSetup live special access UID $componentsUid package com.gesher.components source ")) {
+  throw "Components installed special-access setup failed: $settingsSetup"
+}
+Write-Host $settingsSetup
+$out = $componentsInstall + "`n" + (RunTimed "$Dir/dalvikvm.exe" ($launcher + 'launch', (NoDrive "$Dir/components.apk"), '--keep-task') 500)
 $code = $LASTEXITCODE
-$ok = CheckOrdered 'services: gesher-app launch components.apk --keep-task: installed on first launch, its own process, every step' $out @(
+$ok = CheckOrdered 'services: gesher-app launch components.apk --keep-task: installed and authorized before launch, its own process, every step' $out @(
   'gesher-app: connected to the running Gesher device ',
   'gesher-app: installed com.gesher.components (version 1) in ',
   'gesher-app: app process for com.gesher.components: pid ',

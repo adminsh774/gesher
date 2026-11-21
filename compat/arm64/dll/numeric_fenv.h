@@ -19,6 +19,10 @@ class NumericFenvScope {
     constexpr int modes[] = {FE_TONEAREST, FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO};
     std::fegetenv(&saved_);
     std::fesetenv(FE_DFL_ENV);
+    // The pinned MinGW default reset initializes x87 but leaves MXCSR intact.
+    // Start SSE arithmetic with clear status, masked traps and no native FTZ/DAZ;
+    // changing only the rounding field would retain flags when it is unchanged.
+    _mm_setcsr(_MM_MASK_MASK);
     std::fesetround(modes[(fpcr >> 22) & 3]);
   }
   ~NumericFenvScope() {
