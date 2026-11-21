@@ -38,9 +38,12 @@ void Check(bool ok, const char* what) {
   }
 }
 bool PumpWait(HANDLE event, DWORD timeout) { return gesher::windows::WaitPumping(event, timeout); }
-bool Open(HWND owner) {
+bool Open(HWND owner, DWORD* error = nullptr) {
   for (int attempt = 0; attempt != 20; ++attempt) {
-    if (OpenClipboard(owner)) return true;
+    if (error) SetLastError(ERROR_SUCCESS);
+    const BOOL opened = OpenClipboard(owner);
+    if (error) *error = GetLastError();
+    if (opened) return true;
     Sleep(10);
   }
   return false;
@@ -342,6 +345,78 @@ std::atomic<unsigned> actual_set_calls{0};
 HANDLE held_entered = nullptr, held_release = nullptr;
 Snapshot before_foreign, after_foreign;
 
+// An ordinary concurrent native consumer, like the service's Windows-events
+// thread. It only opens/reads/closes the clipboard; it never replaces data.
+struct NativeReader {
+  HANDLE opened = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::thread thread;
+  const char* phase;
+  bool rendering = false;
+  bool acquired = false, read = false, closed = false;
+  DWORD open_thread = 0, close_thread = 0;
+  DWORD open_error = 0, data_error = 0, lock_error = 0, close_error = 0;
+  explicit NativeReader(const char* name) : phase(name) {
+    Check(opened && release && done, "native reader owns its synchronization events");
+    if (!opened || !release || !done) ExitProcess(3);
+  }
+  void Start(bool render) {
+    rendering = render;
+    thread = std::thread([this, render] {
+      open_thread = GetCurrentThreadId();
+      acquired = Open(nullptr, &open_error);
+      SetEvent(opened);
+      if (acquired) {
+        if (render) {
+          // OleSetClipboard has just accepted a fresh delayed-rendered object.
+          // GetClipboardData needs its owning STA to dispatch WM_RENDERFORMAT.
+          SetLastError(ERROR_SUCCESS);
+          HANDLE value = GetClipboardData(CF_UNICODETEXT);
+          data_error = GetLastError();
+          SetLastError(ERROR_SUCCESS);
+          const void* bytes = value ? GlobalLock(value) : nullptr;
+          lock_error = GetLastError();
+          const auto expected = WideBytes(OwnText());
+          read = bytes && GlobalSize(value) >= expected.size()
+              && std::memcmp(bytes, expected.data(), expected.size()) == 0;
+          if (bytes) GlobalUnlock(value);
+        } else {
+          Check(WaitForSingleObject(release, 5000) == WAIT_OBJECT_0,
+                "held native reader is released after the actual competing open");
+        }
+        close_thread = GetCurrentThreadId();
+        SetLastError(ERROR_SUCCESS);
+        closed = CloseClipboard() != 0;
+        close_error = GetLastError();
+      }
+      SetEvent(done);
+    });
+  }
+  void Finish() {
+    if (!thread.joinable()) { Check(false, "actual native reader started"); return; }
+    const bool ended = PumpWait(done, 5000);
+    Check(ended, "native reader and delayed rendering finish within their bound");
+    if (!ended) ExitProcess(3);
+    thread.join();
+    // Report the worker's immediate API errors, not Finish's thread-local error.
+    std::printf("CLIPBOARD_NATIVE_READER phase=%s render=%d acquired=%d read=%d closed=%d "
+        "open_thread=%lu close_thread=%lu open_error=%lu data_error=%lu lock_error=%lu close_error=%lu\n",
+        phase, rendering, acquired, read, closed,
+        static_cast<unsigned long>(open_thread), static_cast<unsigned long>(close_thread),
+        static_cast<unsigned long>(open_error), static_cast<unsigned long>(data_error),
+        static_cast<unsigned long>(lock_error), static_cast<unsigned long>(close_error));
+    Check(acquired && closed, "native reader acquired and released actual clipboard access");
+  }
+  ~NativeReader() {
+    if (thread.joinable()) { SetEvent(release); Finish(); }
+    CloseHandle(opened); CloseHandle(release); CloseHandle(done);
+  }
+};
+std::atomic<NativeReader*> held_reader{nullptr}, completion_reader{nullptr};
+std::atomic<unsigned> contended_set_calls{0};
+std::atomic<std::atomic<bool>*> cancel_after_contended_open{nullptr};
+
 void ForeignWrite(const ForeignCase& test, IDataObject* object) {
   before_foreign = Read();
   Check(OleIsCurrentClipboard(object) == S_OK, "accepted product object is current before the competing process");
@@ -538,6 +613,59 @@ void Concurrent() {
   gesher::windows::ReleaseClipboardPublisher();
   Check(!gesher::windows::State().current, "all concurrent requests and their worker retire");
 }
+void NativeReadContention() {
+  ++case_number;
+  Check(gesher::windows::RetainClipboardPublisher(), "native reader fixture retains a publisher lease");
+  uint32_t sequence = 0;
+  Check(PublishKind(1, &sequence), "native reader starts from an actual publication");
+  for (bool clear : {false, true}) {
+    NativeReader reader(clear ? "clear-contention" : "write-contention");
+    reader.Start(false);
+    Check(PumpWait(reader.opened, 5000), "native consumer holds the actual clipboard before publication");
+    const unsigned before = contended_set_calls.load();
+    held_reader.store(&reader, std::memory_order_release);
+    const bool published = clear ? gesher::windows::ClearClipboardPublication(&sequence)
+        : PublishKind(1, &sequence);
+    held_reader.store(nullptr, std::memory_order_release);
+    SetEvent(reader.release);
+    reader.Finish();
+    Check(contended_set_calls.load() > before, "real OleSetClipboard reported the consumer's temporary open");
+    Check(published && sequence != 0, "write and clear retry a temporary native reader without losing their completion proof");
+    if (clear) Check(CountClipboardFormats() == 0, "contended clear still removes every actual format");
+  }
+  {
+    NativeReader reader("delayed-render");
+    completion_reader.store(&reader, std::memory_order_release);
+    const bool published = PublishKind(1, &sequence);
+    completion_reader.store(nullptr, std::memory_order_release);
+    reader.Finish();
+    Check(reader.read, "concurrent native consumer receives the exact delayed-rendered text");
+    Check(published && sequence != 0,
+          "completion proof services a native consumer waiting for this STA's delayed formats");
+  }
+  for (bool stop : {false, true}) {
+    const auto before_clipboard = Read();
+    std::atomic<bool> cancelled{false}, stopping{false};
+    NativeReader reader(stop ? "stop-retry" : "cancel-retry");
+    reader.Start(false);
+    Check(PumpWait(reader.opened, 5000), "native reader holds clipboard before a cancelled retry");
+    held_reader.store(&reader, std::memory_order_release);
+    cancel_after_contended_open.store(stop ? &stopping : &cancelled, std::memory_order_release);
+    const unsigned before_calls = actual_set_calls.load();
+    // Exercise the production retry boundary with the same cancellation flags
+    // its request/worker supplies, changing one only after the real open fails.
+    const HRESULT result = gesher::windows::SetClipboardRetrying(nullptr, cancelled, stopping);
+    cancel_after_contended_open.store(nullptr, std::memory_order_release);
+    held_reader.store(nullptr, std::memory_order_release);
+    SetEvent(reader.release);
+    reader.Finish();
+    Check(result == E_ABORT && actual_set_calls.load() == before_calls + 1,
+          "cancellation and shutdown prevent a fresh publication attempt after a contended open");
+    Check(Same(before_clipboard, Read()), "cancelled retry preserves the actual previous publication");
+  }
+  gesher::windows::ReleaseClipboardPublisher();
+  Check(!gesher::windows::State().current, "native reader contention retires its publisher and requests");
+}
 void TimeoutRequests() {
   ++case_number;
   Check(gesher::windows::RetainClipboardPublisher(), "timeout fixture retains a live service lease");
@@ -592,6 +720,10 @@ void ErrorAndResources() {
   gesher::windows::ReleaseClipboardPublisher();
   DWORD before = 0, after = 0;
   Check(GetProcessHandleCount(GetCurrentProcess(), &before) != 0, "record native handle baseline after warm-up");
+  SetLastError(ERROR_SUCCESS);
+  const DWORD user_before = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+  Check(user_before != 0 || GetLastError() == ERROR_SUCCESS,
+        "record native USER-object baseline after warm-up");
   for (int pass = 0; pass != 16; ++pass) {
     Check(gesher::windows::RetainClipboardPublisher(), "re-entry takes a fresh service lease");
     Check(PublishKind(pass % 3, &sequence), "re-entered service publishes through a live STA");
@@ -601,7 +733,13 @@ void ErrorAndResources() {
   }
   Check(GetProcessHandleCount(GetCurrentProcess(), &after) != 0 && after <= before + 1,
         "repeated service lifetimes release native thread, request and event handles");
-  std::printf("CLIPBOARD_RESOURCES before=%lu after=%lu\n", static_cast<unsigned long>(before), static_cast<unsigned long>(after));
+  SetLastError(ERROR_SUCCESS);
+  const DWORD user_after = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+  Check((user_after != 0 || GetLastError() == ERROR_SUCCESS) && user_after == user_before,
+        "repeated service lifetimes release every private read window");
+  std::printf("CLIPBOARD_RESOURCES before=%lu after=%lu user_before=%lu user_after=%lu\n",
+      static_cast<unsigned long>(before), static_cast<unsigned long>(after),
+      static_cast<unsigned long>(user_before), static_cast<unsigned long>(user_after));
 }
 struct ImageInput { const char* name; std::vector<uint8_t> bytes; };
 std::vector<uint8_t> ImageFixture(DWORD header_size, WORD bits, DWORD compression,
@@ -766,7 +904,26 @@ HRESULT PublicationTestSetClipboard(IDataObject* object) {
   if (clipboard_test::fail_set.exchange(false, std::memory_order_acq_rel)) return E_ACCESSDENIED;
   ++clipboard_test::actual_set_calls;
   const HRESULT result = ::OleSetClipboard(object);
+  if (result == CLIPBRD_E_CANT_OPEN) {
+    auto* cancelled = clipboard_test::cancel_after_contended_open.load(std::memory_order_acquire);
+    if (cancelled) cancelled->store(true, std::memory_order_release);
+    auto* reader = clipboard_test::held_reader.load(std::memory_order_acquire);
+    if (reader) {
+      ++clipboard_test::contended_set_calls;
+      SetEvent(reader->release);
+    }
+  }
   if (result == S_OK) clipboard_test::last_set_object.store(object, std::memory_order_release);
+  if (result == S_OK && object) {
+    auto* reader = clipboard_test::completion_reader.exchange(nullptr, std::memory_order_acq_rel);
+    if (reader) {
+      reader->Start(true);
+      // Deliberately do not pump yet: the production completion proof must
+      // dispatch the consumer's delayed-render request while retrying its open.
+      clipboard_test::Check(WaitForSingleObject(reader->opened, 5000) == WAIT_OBJECT_0,
+                           "native consumer opens the fresh publication before its receipt");
+    }
+  }
   if (result == S_OK && object && clipboard_test::hold_next_set.exchange(false, std::memory_order_acq_rel)) {
     SetEvent(clipboard_test::held_entered);
     clipboard_test::Check(clipboard_test::PumpWait(clipboard_test::held_release, 20000),
@@ -845,7 +1002,7 @@ int wmain(int argc, wchar_t** argv) {
       {"flush-normal-inplace-html", false, false, false, 2},
       {"flush-borrowed-inplace-image", true, false, false, 3}}}) FlushReplacement(value);
   for (const auto& input : images) ImageCase(input);
-  EmptyAndLeases(); Concurrent(); TimeoutRequests(); ErrorAndResources();
+  EmptyAndLeases(); Concurrent(); NativeReadContention(); TimeoutRequests(); ErrorAndResources();
   ClearFixture();
   OleUninitialize();
   std::printf("Clipboard publication Windows completed: cases=%u checks=%d failures=%d\n", case_number, checks.load(), failures.load());

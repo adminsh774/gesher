@@ -47,6 +47,8 @@ The recipe retains the current notification, SoftAP and Wi-Fi Direct contracts
 and adds the suggestion/Passpoint value, network specifier and geolocation
 lifetime contracts. It also retains the current package-visibility gate in both
 GMS modes, including canonical and authenticated shared-UID queries.
+The union also keeps the current package-installer identity, speech-recognition
+connection lifecycle and persisted activity-usage checks.
 Changes to PR workflow files cannot change the policy authorized by the runner
 group. Publishing a replacement requires reviewing/pinning a new immutable
 policy and explicitly updating the group allowlist before enabling local use.

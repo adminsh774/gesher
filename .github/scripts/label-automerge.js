@@ -64,6 +64,22 @@ async function nativeReleaseState(github, pr) {
   throw new Error('Native merge state cannot be released: ' + node.mergeStateStatus);
 }
 
+// The controller republishes the required QA status immediately before it reads
+// the native state, and GitHub recomputes mergeStateStatus asynchronously. An
+// immediate BLOCKED read is therefore usually stale. Without native waiting,
+// returning on it strands a green PR: every later reconciliation republishes
+// the gate first and reads the same stale state. Re-read a bounded number of
+// times before deferring. Required evidence is still rechecked after this read.
+const RELEASE_STATE = {attempts: 7, delayMs: 5000};
+async function settledReleaseState(github, pr) {
+  let mode = await nativeReleaseState(github, pr);
+  for (let attempt = 1; mode === 'blocked' && attempt < RELEASE_STATE.attempts; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, RELEASE_STATE.delayMs));
+    mode = await nativeReleaseState(github, pr);
+  }
+  return mode;
+}
+
 async function release(mergeGithub, pr) {
   await mergeGithub.graphql(`mutation($id: ID!, $head: GitObjectID!) {
     mergePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head,
@@ -183,6 +199,23 @@ async function stuck(github, statusReader, owner, repo, pr, gate) {
   return evidence.ready || Boolean(evidence.failed);
 }
 
+// An unlabeled open PR without native waiting needs a controller run only to
+// revoke a leftover green QA context, as the recovery schedule already assumes.
+// Otherwise a completed CI run would repeat its revocation: several reads, an
+// App status write and a legacy write on the repository's GITHUB_TOKEN quota.
+// Any success in either QA context, trusted or not, still takes the full path.
+async function unlabeledAndSettled(github, statusReader, owner, repo, number, head) {
+  const {data: current} = await github.rest.pulls.get({owner, repo, pull_number: number});
+  if (current.state !== 'open' || current.head.sha !== head || p.hasLabel(current) || current.auto_merge)
+    return false;
+  const values = await p.list(async args => {
+    const response = await statusReader.rest.repos.getCombinedStatusForRef(args);
+    if (response.data.sha !== head) throw new Error('QA settlement status head mismatch');
+    return response;
+  }, {owner, repo, ref: head}, 'statuses');
+  return !values.some(s => [STATUS, qaStatuses.APP_STATUS].includes(s.context) && s.state === 'success');
+}
+
 async function reconcile(github, prGithub, owner, repo, number, core, mergeGithub, publisher, expectedHead) {
   const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: number});
   if (pr.state !== 'open' || (expectedHead && pr.head.sha !== expectedHead)) return;
@@ -241,7 +274,7 @@ async function reconcile(github, prGithub, owner, repo, number, core, mergeGithu
         await statuses.set(pr.head.sha, false);
         return await cancel(github, owner, repo, pr, mergeGithub);
       }
-      const mode = await nativeReleaseState(github, pr);
+      const mode = await settledReleaseState(github, pr);
       const finalEvent = await p.labelEvent(github, owner, repo, number);
       const finalEvidence = await ciEvidence(github, owner, repo, pr);
       if (finalEvidence.failed) {
@@ -311,7 +344,13 @@ module.exports = async ({github: actionsGithub, readGithub, context, core, prGit
       x.base.repo?.id === baseRepositoryId && Number.isSafeInteger(x.number));
     const prs = named.length ? named :
       await p.list(github.rest.pulls.list, {owner, repo, state: 'open', base: 'main'});
+    // The read token requests statuses access only while the App status is on.
+    const statusReader = appQaStatus ? github : actionsGithub;
     for (const pr of prs.filter(x => x.head.sha === run.head_sha && x.head.repo?.id === run.head_repository.id)) {
+      if (await unlabeledAndSettled(github, statusReader, owner, repo, pr.number, run.head_sha)) {
+        core.info('#' + pr.number + ': no automerge label, native waiting or green QA context; nothing to reconcile');
+        continue;
+      }
       if (appQaStatus && pr.number !== run.pull_requests?.[0]?.number) {
         const {data: current} = await github.rest.pulls.get({owner, repo, pull_number: pr.number});
         if (current.head.sha === run.head_sha && current.head.repo?.id === run.head_repository.id)
@@ -416,6 +455,7 @@ module.exports = async ({github: actionsGithub, readGithub, context, core, prGit
   await reconcile(github, prGithub, owner, repo, number, core, mergeGithub, statuses);
 };
 module.exports.approved = approved;
+module.exports.RELEASE_STATE = RELEASE_STATE;
 module.exports.ciReady = ciReady;
 module.exports.STATUS = STATUS;
 module.exports.APP_SLUG = p.APP_SLUG;
