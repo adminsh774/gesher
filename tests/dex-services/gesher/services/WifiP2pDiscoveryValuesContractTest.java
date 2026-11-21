@@ -301,7 +301,18 @@ public final class WifiP2pDiscoveryValuesContractTest {
     }
     public static void main(String[] args) throws Exception {
         boolean parcel = args.length == 0 || !args[0].equals("--no-parcel");
-        if (parcel) productionGraph();
+        if (parcel) {
+            String root = System.getenv("ANDROID_ROOT");
+            if (root == null || root.isEmpty()) {
+                throw new IllegalStateException("ANDROID_ROOT is required");
+            }
+            // Keep SDK-only compilation; native readers use the real runtime bootstrap.
+            Class.forName("com.gesher.app.Main")
+                    .getMethod("bootstrap", String.class, String.class, String.class)
+                    .invoke(null, "wifi-p2p-discovery-values", root + "/build.prop",
+                            root + "/framework/framework-res.apk");
+            productionGraph();
+        }
         run(parcel, true);
         Class.forName("gesher.services.WifiP2pDiscoveryValuesExtendedTest")
                 .getMethod("run", boolean.class, boolean.class).invoke(null, parcel, true);

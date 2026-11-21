@@ -186,7 +186,18 @@ public final class WifiChannelBlockingValuesContractTest {
     }
     public static void main(String[] args) throws Exception {
         boolean parcel = args.length == 0 || !args[0].equals("--no-parcel");
-        if (parcel) productionGraph();
+        if (parcel) {
+            String root = System.getenv("ANDROID_ROOT");
+            if (root == null || root.isEmpty()) {
+                throw new IllegalStateException("ANDROID_ROOT is required");
+            }
+            // Keep SDK-only compilation; native readers use the real runtime bootstrap.
+            Class.forName("com.gesher.app.Main")
+                    .getMethod("bootstrap", String.class, String.class, String.class)
+                    .invoke(null, "wifi-channel-blocking-values", root + "/build.prop",
+                            root + "/framework/framework-res.apk");
+            productionGraph();
+        }
         run(parcel);
         Class.forName("gesher.services.WifiChannelBlockingValuesExtendedTest")
                 .getMethod("run", boolean.class).invoke(null, parcel);
