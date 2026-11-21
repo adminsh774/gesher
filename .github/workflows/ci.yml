@@ -827,7 +827,7 @@ jobs:
     needs: [source-identity]
     # This reviewed immutable policy keeps every combined framework contract gate.
     # Restricted runner use requires separate policy authorization; use hosted CI.
-    uses: gesher-runtime/gesher/.github/workflows/framework.yml@15b2d5c75884ec3508d26b29004bc91a09bca1c8
+    uses: gesher-runtime/gesher/.github/workflows/framework.yml@0b3042145410d998283c5be3cc019b0103189dbe
     with:
       local-runner: false
 
