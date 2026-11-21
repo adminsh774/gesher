@@ -248,16 +248,35 @@ function CheckOrdered([string] $Name, [string] $Out, [string[]] $Expect, [int] $
 # destroys the activity (PauseActivityItem, StopActivityItem,
 # DestroyActivityItem) and ends the process (scheduleExit). A second run asks
 # the activity to finish() itself.
+# Keep the exact handles from each successful Start-Process. Every later throw
+# (including fixture prerequisites) must retire the manual device before returning.
+$manualServicesOwned = [Collections.Generic.List[object]]::new()
+$manualServicesFailure = $null
+$manualServicesBinder = $env:GESHER_BINDER
+function Own-ManualService([Diagnostics.Process] $Process, [string] $Role) {
+  # Retain the object even if reading its identity fails; the finally must still
+  # try to retire this successful start, and must report any unproved cleanup.
+  $record = [pscustomobject]@{ Process=$Process; Handle=$null; Role=$Role; Pid=$null; Created=$null }
+  $manualServicesOwned.Add($record)
+  $record.Handle = $Process.SafeHandle
+  $record.Pid = $Process.Id
+  $record.Created = $Process.StartTime.ToUniversalTime().ToFileTimeUtc()
+  Write-Host "SERVICE_FIXTURE_OWN role=$Role pid=$($record.Pid) created=$($record.Created)"
+}
+try {
 $device = "apps-$PID"
 $env:GESHER_BINDER = $device
 $binderd = Start-Process "$Dir/binderd.exe" -ArgumentList $device -PassThru -NoNewWindow `
   -RedirectStandardOutput "$logs/apps-binderd.out" -RedirectStandardError "$logs/apps-binderd.log"
+Own-ManualService $binderd binderd
 $servicemanager = Start-ReadyServiceManager $binderd $device "$logs/apps-servicemanager" "$logs/apps-binderd.log"
+Own-ManualService $servicemanager servicemanager
 $dvmApp = @("-Xbootclasspath:$bcpApp", "-Ximage:$(NoDrive "$root/system")/framework/boot.art",
   '-Xint', '-Xusejit:false')
 $server = Start-Process "$Dir/dalvikvm.exe" -PassThru -NoNewWindow `
   -ArgumentList ($dvmApp + 'com.gesher.server.SystemServer', (NoDrive "$Dir/lifecycle.apk"), (NoDrive "$Dir/components.apk")) `
   -RedirectStandardOutput "$logs/system_server.out" -RedirectStandardError "$logs/system_server.err"
+Own-ManualService $server system_server
 $failedBefore = $failed
 $appOut = RunTimed "$Dir/dalvikvm.exe" ($dvmApp + 'com.gesher.app.Main', '--system-server',
   (NoDrive "$Dir/lifecycle.apk")) 400
@@ -497,8 +516,42 @@ try {
   $null = CheckOrdered 'text services: restore automatic checker selection' `
     $checkerResetOut @('Spell-checker setting updated') $checkerResetCode
 }
-foreach ($p in $server, $servicemanager, $binderd) {
-  if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+} catch {
+  $manualServicesFailure = $_
+  throw
+} finally {
+  $manualServicesExitCode = $global:LASTEXITCODE
+  $manualServicesCleanup = @()
+  for ($index = $manualServicesOwned.Count - 1; $index -ge 0; $index--) {
+    $record = $manualServicesOwned[$index]
+    $retired = $false; $problem = ''
+    try {
+      if ($null -eq $record.Handle -or $record.Handle.IsClosed) {
+        throw 'Owned process handle was already closed by startup failure cleanup'
+      }
+      if (-not $record.Process.HasExited) { $record.Process.Kill($true) }
+      $retired = $record.Process.WaitForExit(5000)
+      if (-not $retired) { throw 'Owned manual service did not retire within five seconds' }
+    } catch { $problem = [string]$_ }
+    finally {
+      try { $record.Process.Dispose() }
+      catch { $problem += " Dispose failed: $_" }
+    }
+    Write-Host "SERVICE_FIXTURE_RETIRE role=$($record.Role) pid=$($record.Pid) created=$($record.Created) exited=$retired closed=$($record.Handle.IsClosed) problem=$problem"
+    if ($problem -or -not $retired -or -not $record.Handle.IsClosed) {
+      $manualServicesCleanup += "$($record.Role): $problem (exited=$retired, closed=$($record.Handle.IsClosed))"
+    }
+  }
+  $env:GESHER_BINDER = $manualServicesBinder
+  $global:LASTEXITCODE = $manualServicesExitCode
+  if ($manualServicesCleanup.Count) {
+    $script:failed++
+    $cleanupMessage = 'Owned manual-device cleanup failed: ' + ($manualServicesCleanup -join '; ')
+    if ($null -ne $manualServicesFailure) {
+      # Report cleanup too, without replacing the original exception/exit status.
+      Write-Error -ErrorAction Continue $cleanupMessage
+    } else { throw $cleanupMessage }
+  }
 }
 Start-Sleep -Milliseconds 500
 $serverOut = (Get-Content "$logs/system_server.out" -Raw -ErrorAction SilentlyContinue) + ''
@@ -521,7 +574,7 @@ if ($failed -ne $failedBefore) {
     Get-Content "$logs/$f" -ErrorAction SilentlyContinue | Select-Object -Last 80 | Out-Host
   }
 }
-Remove-Item Env:GESHER_BINDER
+# The manual-device finally restored the prior Binder environment.
 
 # The Gesher device (docs/services.md, ADR 0026): binderd, servicemanager and a
 # persistent system server that every launch shares, started detached by the
