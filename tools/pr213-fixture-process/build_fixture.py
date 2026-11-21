@@ -40,11 +40,13 @@ tools = work / "build-tools/android-16"
 for binary in ("aapt2", "zipalign"):
     (tools / binary).chmod(0o755)
 historical = ROOT / "historical-inputs"
-extract(historical / "classes/framework-classes.zip", work / "framework")
+# javac and the existing generators accept this verified archive directly. Java
+# class names are case-sensitive; no Windows filesystem extraction is involved.
+framework = historical / "classes/framework-classes.zip"
 extract(historical / "classes/coremod.zip", work / "coremod")
 env = dict(os.environ, R8_JAR=str(work / "r8.jar"), APKSIG_JAR=str(work / "apksig.jar"),
            BUILD_TOOLS_DIR=str(tools))
-framework_args = ["--framework-classes", str(work / "framework"), "--core-classes", str(work / "coremod")]
+framework_args = ["--framework-classes", str(framework), "--core-classes", str(work / "coremod")]
 commands = [
     ["bash", "app/build.sh", str(work / "app"), *framework_args],
     ["bash", "tests/dex-services/build.sh", str(work / "services"), *framework_args,
