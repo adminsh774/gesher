@@ -79,6 +79,7 @@ public final class FixtureSettingsSetup {
         } else {
             ApplicationSharedMemory.setInstance(ApplicationSharedMemory.create());
             ApkPackage apk = ApkPackage.parse(args[0]);
+            require(apk.hasVerifiedSigningIdentity(), "Special access requires the fixture's real verified APK signer");
             PackageManagerService packages = new PackageManagerService(List.of(apk));
             require(UserHandle.isApp(apk.uid()), "Ordinary admitted application required");
             require(apk.parsed.getRequestedPermissions().contains(Manifest.permission.WRITE_SETTINGS), "Fixture must declare special access");
@@ -87,7 +88,13 @@ public final class FixtureSettingsSetup {
             AppOpsService ops = attach(packages);
             ops.setMode(AppOpsManager.OP_WRITE_SETTINGS, apk.uid(), apk.packageName, AppOpsManager.MODE_ALLOWED);
             require(ops.checkOperation(AppOpsManager.OP_WRITE_SETTINGS, apk.uid(), apk.packageName) == AppOpsManager.MODE_ALLOWED, "Special-access readback failed");
+            // setMode publishes an asynchronous policy snapshot. Cross the real
+            // operator durability boundary before opening a second service/store.
+            ops.reloadNonHistoricalState();
             ApkPackage reopened = ApkPackage.parse(args[0]);
+            require(reopened.hasVerifiedSigningIdentity()
+                    && java.util.Objects.equals(apk.verifiedSignerSha256(), reopened.verifiedSignerSha256()),
+                    "Special-access signer changed on reopen");
             PackageManagerService readback = new PackageManagerService(List.of(reopened));
             require(reopened.uid() == apk.uid(), "Special-access subject changed on reopen");
             require(attach(readback).checkOperation(AppOpsManager.OP_WRITE_SETTINGS, reopened.uid(), reopened.packageName) == AppOpsManager.MODE_ALLOWED,
