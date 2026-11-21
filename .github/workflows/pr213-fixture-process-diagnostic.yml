@@ -1,0 +1,132 @@
+name: PR213 isolated fixture process diagnosis
+on:
+  push:
+    branches:
+      - qa/diagnostic-pr213-fixture-process-20261121
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: pr213-fixture-process-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  observe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify historical sources and generate reversible phase observation
+        shell: pwsh
+        run: |
+          python tools/pr213-fixture-process/generate.py diagnostic-output
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic source materialization failed' }
+          git rev-parse HEAD
+          git rev-parse 'HEAD^{tree}'
+      - name: Measure original budgets and actual owned-process retirement
+        shell: pwsh
+        run: |
+          & tools/pr213-fixture-process/run.ps1 -Output diagnostic-output *>&1 |
+            Tee-Object -FilePath diagnostic-output/driver.log
+      - name: Bind all generated and result bytes
+        if: always()
+        shell: pwsh
+        run: |
+          $rows = @(Get-ChildItem diagnostic-output -File -Recurse | ForEach-Object {
+            [pscustomobject]@{ path=[IO.Path]::GetRelativePath((Resolve-Path diagnostic-output), $_.FullName);
+              bytes=$_.Length; sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+          })
+          $rows | ConvertTo-Json -Depth 5 | Set-Content diagnostic-output/file-digests.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr213-fixture-process-${{ matrix.os }}-${{ github.sha }}-a${{ github.run_attempt }}
+          path: diagnostic-output
+          if-no-files-found: error
+
+  fixture-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Verify historical compilation inputs explicitly
+        run: python3 tools/pr213-fixture-process/historical_inputs.py --inputs classes framework --destination historical-inputs
+      - name: Build the independently reviewed signed fixture and services DEX
+        run: python3 tools/pr213-fixture-process/build_fixture.py fixture-build-output
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr213-fixture-payload
+          path: fixture-build-output/payload
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr213-fixture-build-logs
+          path: |
+            fixture-build-output/*.log
+            historical-inputs/historical-input-receipt.json
+          if-no-files-found: error
+  actual-art:
+    needs: [fixture-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify exact historical runtime installer
+        shell: pwsh
+        run: |
+          python tools/pr213-fixture-process/historical_inputs.py --inputs installer --destination historical-inputs
+          if ($LASTEXITCODE -ne 0) { throw 'Historical runtime input qualification failed' }
+      - name: Verify exact current diagnostic fixture producer and archive
+        shell: pwsh
+        run: |
+          python tools/ci/artifact_receipt.py --name pr213-fixture-payload --producer fixture-build --destination current-fixtures
+          if ($LASTEXITCODE -ne 0) { throw 'Current fixture producer qualification failed' }
+      - name: Observe real Track50 Settings and owned ART processes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force actual-art-output | Out-Null
+          Copy-Item historical-inputs/historical-input-receipt.json actual-art-output/
+          Copy-Item current-fixtures/build-receipt.json actual-art-output/
+          & tools/pr213-fixture-process/art-run.ps1 -InstallerRoot historical-inputs/installer -FixtureRoot current-fixtures -Output actual-art-output *>&1 |
+            Tee-Object -FilePath actual-art-output/driver.log
+      - name: Bind actual ART diagnostic bytes
+        if: always()
+        shell: pwsh
+        run: |
+          $rows = @(Get-ChildItem actual-art-output -File -Recurse | Where-Object {
+            ([IO.Path]::GetRelativePath((Resolve-Path actual-art-output), $_.FullName) -replace '\\','/') -notmatch '/android/'
+          } | ForEach-Object {
+            [pscustomobject]@{path=[IO.Path]::GetRelativePath((Resolve-Path actual-art-output), $_.FullName);
+              bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+          })
+          $rows | ConvertTo-Json -Depth 5 | Set-Content actual-art-output/file-digests.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr213-actual-art-${{ matrix.os }}-${{ github.sha }}-a${{ github.run_attempt }}
+          path: |
+            actual-art-output/**
+            !actual-art-output/**/android/**
+          if-no-files-found: error
