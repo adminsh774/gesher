@@ -60,6 +60,16 @@ An absent Java environment, a throwing Java policy or a denied Java result also
 denies. The NDK recording provider continues to call this live bridge; an absent
 provider already denies through `RecordingAllowed`.
 
+NDK-first use does not depend on constructing a Java AudioRecord. The OBJECT
+library in `cmake/aosp/media.cmake` links `audio_record_jni.cc` into dalvikvm,
+including its static provider registration. `Main.bootstrap` (also called by
+`GesherAppProcess`) loads `android_runtime`; its `gRegJNI` media entry calls
+`register_gesher_media`, which sets the Java VM before registering AudioRecord.
+The OpenSL test activity loads its NDK test library directly in `onCreate`.
+Independent review verified this source ordering. The host fixture explicitly
+registers its JNI/provider boundary and does not itself execute ART startup;
+the existing Windows OpenSL application cases cover that integrated first use.
+
 Existing callers and their error translations are retained:
 
 | Existing admission point | Retained denied behavior |
@@ -131,13 +141,33 @@ The minimal local AOSP source tree emits only local-source compatibility table
 entries. These local DEX outputs are not release qualification; exact-head CI
 builds the full pinned source and compatibility table.
 
-## CI and parallel PR integration
+## Independent review and CI wiring
 
-The new host gate is declared in `framework.yml`; the caller's immutable recipe
-pin must be moved to its reviewed, published recipe before this PR is opened.
+Independent scope and correctness review passed candidate
+`ef7eec7c8d35c594f6e86799f442f925b2521ab6`, tree
+`bc810394ea57d85f04662fe1c5efb9cec58c5038`. The reviewer rebuilt the application
+Java/DEX classes and independently reran the 50 Java/JNI/provider checks, 30
+native failure controls, 105 AAudio checks, both original-source negative
+controls, all four changed PowerShell parses and the shard-planner checks.
+The review also verified first-use provider registration and the exact shared
+camera fixture/helper bytes. Windows/ART execution remains an exact-head CI gate.
+
+The reviewed source was published by `palmoni5` as
+`8332eac1a6d0a62f684cbc8fd3fc77825d680d61`; its remote tree exactly matches the
+reviewed tree above. The caller now pins `framework.yml` to that immutable
+published recipe, retaining `local-runner: false` and existing runner, action,
+checkout, cache, permissions and artifact policies. The recipe checks out the
+caller revision and tests its freshly built classes. The pin also retains the
+installer-attribution, Bluetooth and Wi-Fi host gates already on the baseline
+but absent from the previously pinned recipe. Review scanned all changed paths
+and baseline blob IDs for static source-integrity receipts; none require a
+refresh. The `ci-processes` OpenSL function-body check remains unchanged.
+
 Reviewing the declaration alone does not establish that CI executed it.
 The exact-head run must show the microphone host step and Windows public/native
 and existing recording gates actually executing.
+
+## Parallel PR integration
 
 The foreground-service, camera and microphone rounds each pin their own reviewed
 recipe. After one merges, remaining PRs must refresh their branch and pin to a
