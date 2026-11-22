@@ -16,6 +16,14 @@ Outgoing Binder Parcel callbacks are deliberately delayed rather than replaced b
 a fake transport. Actual ART/Binder transport and the native sensor queue belong
 to the integrated Windows guest fixture; these tests alone do not establish them.
 
+`tools/test_sensor_access_jni.py --java-home <JDK> --jni-include
+<libnativehelper/include_jni>` compiles the actual JNI initialization entrypoint
+and atomic receiver against a real host JVM. Real native threads cover first-use
+attachment, ownership-preserving cleanup, unavailable/throwing policy transport,
+existing caller exceptions, reconnect setup, and the steady-state no-JNI path.
+The runtime VM accessor and Java policy service are explicit test boundaries;
+the Windows/guest JNI ABI remains the integrated runtime fixture's responsibility.
+
 Production wiring is `Services` → `SensorAccessService` → authenticated
 `ActivityTaskManagerService.authenticatedPackageCodeForPid`, with immutable policy
 updates from actual activity and foreground-service state changes. Only ordered
