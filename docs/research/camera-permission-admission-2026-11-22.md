@@ -80,6 +80,18 @@ isolated test decisions; they do not alter production consent policy.
 The surfaces and recording tracks also use explicit CAMERA grants for their
 camera-calling APKs, verified in both standalone and installed profiles. Their
 single-process runners use each fixture's actual ordinary application UID.
+The recording fixture also receives its declared RECORD_AUDIO grant because it
+exercises both microphone and camera; the no-permission fixtures remain denied.
+
+The reusable framework recipe is pinned to the already-published, independently
+reviewed source `be66472dc55317738f3374d0c637a453d081207d`, tree
+`3704c9c4a04ea2f602e731dd4d42194be494daa6`. That recipe contains this change's
+camera admission gate. The previous immutable recipe predates it, so an otherwise
+green run of that recipe would not establish coverage of the new gate. Runner,
+action, permission and concurrency policy remain unchanged by the pin refresh.
+After another bounded issue-56 PR merges, rebase and refresh the pin to a reviewed
+published recipe containing the union of merged and new gates. Selecting one
+competing branch's old pin can silently omit another branch's coverage.
 
 Actual Windows CI results belong to the published commit/run. No Linux host
 result, prepared gate or APK build is described as physical-camera or matching

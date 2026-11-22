@@ -221,10 +221,10 @@ function RecordChecks([string] $Mode, [string] $Out, [int] $Code) {
 if (Test-Path "$Dir/recordapp.apk") {
   $bcpRec = (('core-oj', 'core-libart', 'core-icu4j', 'framework', 'gesher-app') | ForEach-Object { NoDrive "$Dir/$_.jar" }) -join ':'
   $dvmRec = @("-Xbootclasspath:$bcpRec", "-Ximage:$(NoDrive "$root/system")/framework/boot.art", '-Xint', '-Xusejit:false')
-  # Grant CAMERA only as an explicit isolated test-operator decision. The APK
-  # still runs with its ordinary UID and cannot grant itself camera access.
+  # Grant the camera and microphone permissions used by this fixture only as
+  # explicit isolated operator decisions. The APK retains its ordinary UID.
   $recordUid = Grant-FixturePermissions $captureRuntime $dvmRec (NoDrive "$Dir/services-tests.dex") `
-    (NoDrive "$Dir/recordapp.apk") 'com.gesher.recordapp' @('android.permission.CAMERA')
+    (NoDrive "$Dir/recordapp.apk") 'com.gesher.recordapp' @('android.permission.CAMERA', 'android.permission.RECORD_AUDIO')
   $recordIdentity = @{ GESHER_UID = [string]$recordUid; GESHER_BINDER_UID = [string]$recordUid }
   CheckTimed 'media3: Camera2 request selection is atomic against 1000 contended cancel/flush calls, with ordered frame numbers and queued-capture priority' "$Dir/dalvikvm.exe" `
     @($dvmRec + @('-cp', (NoDrive "$Dir/services-tests.dex"), 'gesher.services.CameraRequestRaceTest')) `
@@ -266,7 +266,7 @@ if (Test-Path "$Dir/recordapp.apk") {
   $recordInstall = RunTimed $captureRuntime ($launcherRec + @('install', (NoDrive "$Dir/recordapp.apk"))) 180
   if ($LASTEXITCODE -ne 0) { throw "Record fixture installation prerequisite failed: $recordInstall" }
   $null = Grant-FixturePermissions $captureRuntime $dvmRec (NoDrive "$Dir/services-tests.dex") `
-    (NoDrive "$Dir/recordapp.apk") 'com.gesher.recordapp' @('android.permission.CAMERA') `
+    (NoDrive "$Dir/recordapp.apk") 'com.gesher.recordapp' @('android.permission.CAMERA', 'android.permission.RECORD_AUDIO') `
     -Installed -ExpectedUid $recordUid
   $recordDeviceLog = Join-Path $root 'logs/com.gesher.recordapp.log'
   if (Test-Path -LiteralPath $recordDeviceLog) { Remove-Item -LiteralPath $recordDeviceLog -Force }
