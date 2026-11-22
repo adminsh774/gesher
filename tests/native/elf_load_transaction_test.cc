@@ -135,7 +135,7 @@ void Unpublished(std::initializer_list<const char*> names) {
     Check(elf::LookupGlobal(symbol.c_str()) == nullptr, "failed graph has no global export");
     bool seen = false;
     elf::ForEachLoaded([&](const elf::PhdrInfo& info) {
-      if ((std::string(info.name).substr(std::string(info.name).find_last_of("/\\") + 1) == name)) seen = true;
+      if (std::strcmp(info.name, name) == 0) seen = true;
       return 0;
     });
     Check(!seen, "failed graph is absent from public program-header iteration");
@@ -244,7 +244,7 @@ void MissingDependencyAndRetry() {
   const bool guest_arm64 = elf::IsAarch64(root);
   elf::ForEachLoaded([&](const elf::PhdrInfo& info) {
     for (const char* name : {"tx_newchild.so", "tx_late.so", "tx_middle.so", "tx_root.so"}) {
-      if ((std::string(info.name).substr(std::string(info.name).find_last_of("/\\") + 1) == name)) {
+      if (std::strcmp(info.name, name) == 0) {
         const auto* headers = static_cast<const Elf64_Phdr*>(info.phdr);
         bool has_tls = false;
         for (size_t i = 0; headers && i < info.phnum; ++i) {

@@ -129,8 +129,10 @@ void Identity() {
   void* first_entry = elf::Lookup(first, "ns_value");
   Check(elf::FindAddress(first_entry, &first_info) &&
         elf::FindAddress(elf::Lookup(second, "ns_value"), &second_info) &&
-        std::strstr(first_info.soname, "/identity/a/") &&
-        std::strstr(second_info.soname, "/identity/b/"),
+        std::strcmp(first_info.soname, "libns_identity.so") == 0 &&
+        std::strcmp(second_info.soname, "libns_identity.so") == 0 &&
+        std::strstr(first_info.path, "/identity/a/") &&
+        std::strstr(second_info.path, "/identity/b/"),
         "address metadata identifies actual different resolved source paths");
   Check(elf::FindCaller(first_entry) == first && elf::LibraryNamespace(first) == a,
         "actual ELF instruction address identifies its primary namespace");

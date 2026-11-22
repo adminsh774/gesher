@@ -46,6 +46,7 @@
 
 #include <gesher/bionic_shim.h>
 #include <gesher/egl_angle.h>
+#include <gesher/perf_trace.h>
 #include <gesher/elf_loader.h>
 #include <gesher/symbol_table.h>
 
@@ -66,6 +67,7 @@
 #include <windows.h>
 
 #include "egl_child_surface.h"  // surfaces track: windows without an HWND
+#include "egl_native_buffer.h"  // ADR 0089: native buffers and fences
 
 #ifndef EGL_PLATFORM_ANGLE_ANGLE
 #define EGL_PLATFORM_ANGLE_ANGLE 0x3202
@@ -472,20 +474,43 @@ EGLBoolean BIONIC_SYSV DestroySurface(EGLDisplay dpy, EGLSurface surface) {
 
 // surfaces track: a child surface's frame goes to its ANativeWindow before ANGLE swaps.
 EGLBoolean BIONIC_SYSV SwapBuffers(EGLDisplay dpy, EGLSurface surface) {
-  ChildSurfaceBeforeSwap(dpy, surface);
-  return MS(eglSwapBuffers)(dpy, surface);
+  if (!ChildSurfaceBeforeSwap(dpy, surface)) return EGL_TRUE;  // a child surface's frame, posted
+  static gesher::perf::Site site("EGL: ANGLE's eglSwapBuffers");
+  const int64_t start = gesher::perf::Now();
+  const EGLBoolean swapped = MS(eglSwapBuffers)(dpy, surface);
+  site.Add(gesher::perf::Now() - start);
+  return swapped;
+}
+
+// A child surface's swap chain keeps interval 0 (egl_child_surface.h).
+EGLBoolean SwapIntervalMs(EGLDisplay dpy, EGLint interval) {
+  EGLBoolean result = EGL_FALSE;
+  if (ChildSurfaceSwapInterval(dpy, &result)) return result;
+  return MS(eglSwapInterval)(dpy, interval);
+}
+
+EGLBoolean BIONIC_SYSV SwapInterval(EGLDisplay dpy, EGLint interval) {
+  return SwapIntervalMs(dpy, interval);
 }
 
 EGLBoolean BIONIC_SYSV SwapBuffersWithDamageKhr(EGLDisplay dpy, EGLSurface surface,
                                                 const EGLint* rects, EGLint n_rects) {
-  ChildSurfaceBeforeSwap(dpy, surface);
-  return MS(eglSwapBuffersWithDamageKHR)(dpy, surface, rects, n_rects);
+  if (!ChildSurfaceBeforeSwap(dpy, surface)) return EGL_TRUE;  // a child surface's frame, posted
+  static gesher::perf::Site site("EGL: ANGLE's eglSwapBuffersWithDamageKHR");
+  const int64_t start = gesher::perf::Now();
+  const EGLBoolean swapped = MS(eglSwapBuffersWithDamageKHR)(dpy, surface, rects, n_rects);
+  site.Add(gesher::perf::Now() - start);
+  return swapped;
 }
 
 EGLBoolean BIONIC_SYSV SwapBuffersWithDamageExt(EGLDisplay dpy, EGLSurface surface,
                                                 const EGLint* rects, EGLint n_rects) {
-  ChildSurfaceBeforeSwap(dpy, surface);
-  return MS(eglSwapBuffersWithDamageEXT)(dpy, surface, rects, n_rects);
+  if (!ChildSurfaceBeforeSwap(dpy, surface)) return EGL_TRUE;  // a child surface's frame, posted
+  static gesher::perf::Site site("EGL: ANGLE's eglSwapBuffersWithDamageEXT");
+  const int64_t start = gesher::perf::Now();
+  const EGLBoolean swapped = MS(eglSwapBuffersWithDamageEXT)(dpy, surface, rects, n_rects);
+  site.Add(gesher::perf::Now() - start);
+  return swapped;
 }
 
 // --- callbacks -----------------------------------------------------------------------------------
@@ -593,6 +618,7 @@ const GlThunk kHandwritten[] = {
     {"eglCreatePlatformWindowSurfaceEXT", reinterpret_cast<void*>(&CreatePlatformWindowSurfaceExt), kGlNames[I_eglCreatePlatformWindowSurfaceEXT].owners},
     {"eglDestroySurface", reinterpret_cast<void*>(&DestroySurface), kGlNames[I_eglDestroySurface].owners},
     {"eglSwapBuffers", reinterpret_cast<void*>(&SwapBuffers), kGlNames[I_eglSwapBuffers].owners},
+    {"eglSwapInterval", reinterpret_cast<void*>(&SwapInterval), kGlNames[I_eglSwapInterval].owners},
     {"eglSwapBuffersWithDamageKHR", reinterpret_cast<void*>(&SwapBuffersWithDamageKhr), kGlNames[I_eglSwapBuffersWithDamageKHR].owners},
     {"eglSwapBuffersWithDamageEXT", reinterpret_cast<void*>(&SwapBuffersWithDamageExt), kGlNames[I_eglSwapBuffersWithDamageEXT].owners},
     {"eglDebugMessageControlKHR", reinterpret_cast<void*>(&DebugMessageControlKhr), kGlNames[I_eglDebugMessageControlKHR].owners},
@@ -614,21 +640,36 @@ __eglMustCastToProperFunctionPointerType BIONIC_SYSV EglGetProcAddress(const cha
                               : nullptr;
 }
 
+void AddGlSymbol(const char* name, void* fn, unsigned owners) {
+  ByName()[name] = fn;
+  // Internal proc-address plumbing also contains extension entry points
+  // which are not exported by any provided Android DSO.
+  AddBionicSymbol(name, fn);
+  if (owners & 1) AddBionicSymbol("libEGL.so", name, fn);
+  if (owners & 2) AddBionicSymbol("libGLESv1_CM.so", name, fn);
+  if (owners & 4) AddBionicSymbol("libGLESv2.so", name, fn);
+  if (owners & 8) AddBionicSymbol("libGLESv3.so", name, fn);
+}
+
+void RegisterNativeBufferSymbol(const char* name, void* fn) {
+  unsigned owners = 0;
+  for (const GlName& entry : kGlNames) {
+    if (std::strcmp(entry.name, name) == 0) {
+      owners = entry.owners;
+      break;
+    }
+  }
+  AddGlSymbol(name, fn, owners);
+}
+
 void Register() {
-  auto add = [](const char* name, void* fn, unsigned owners) {
-    ByName()[name] = fn;
-    // Internal proc-address plumbing also contains extension entry points
-    // which are not exported by any provided Android DSO.
-    AddBionicSymbol(name, fn);
-    if (owners & 1) AddBionicSymbol("libEGL.so", name, fn);
-    if (owners & 2) AddBionicSymbol("libGLESv1_CM.so", name, fn);
-    if (owners & 4) AddBionicSymbol("libGLESv2.so", name, fn);
-    if (owners & 8) AddBionicSymbol("libGLESv3.so", name, fn);
-  };
-  for (const GlThunk& t : kGlThunks) add(t.name, t.thunk, t.owners);
-  for (const GlThunk& t : kHandwritten) add(t.name, t.thunk, t.owners);
-  add("eglGetProcAddress", reinterpret_cast<void*>(&EglGetProcAddress),
-      kGlNames[I_eglGetProcAddress].owners);
+  for (const GlThunk& t : kGlThunks) AddGlSymbol(t.name, t.thunk, t.owners);
+  for (const GlThunk& t : kHandwritten) AddGlSymbol(t.name, t.thunk, t.owners);
+  // Real native-buffer/fence implementations replace their generated entries,
+  // retaining the same pinned Android DSO ownership and proc-address surface.
+  RegisterNativeBufferEgl(RegisterNativeBufferSymbol);
+  AddGlSymbol("eglGetProcAddress", reinterpret_cast<void*>(&EglGetProcAddress),
+              kGlNames[I_eglGetProcAddress].owners);
 }
 
 [[maybe_unused]] const bool g_registered = (Register(), true);
@@ -675,8 +716,12 @@ extern "C" unsigned gesher_egl_destroy_surface(void* display, void* surface) {
   return gesher::bionic::gl::DestroySurface(display, surface);
 }
 
-extern "C" void gesher_egl_before_swap(void* display, void* surface) {
-  gesher::bionic::gl::ChildSurfaceBeforeSwap(display, surface);
+extern "C" unsigned gesher_egl_swap_interval(void* display, int32_t interval) {
+  return gesher::bionic::gl::SwapIntervalMs(display, interval);
+}
+
+extern "C" unsigned gesher_egl_before_swap(void* display, void* surface) {
+  return gesher::bionic::gl::ChildSurfaceBeforeSwap(display, surface) ? 1u : 0u;
 }
 
 extern "C" void* gesher_egl_surface_hwnd(void* surface) {

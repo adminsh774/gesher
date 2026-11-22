@@ -25,6 +25,7 @@ void LoaderDlvsym() {}
 
 @REGISTRY_IMPLEMENTATION@
 @PUBLIC_LOOKUP_IMPLEMENTATION@
+@LATE_REGISTRATION@
 }  // namespace gesher::bionic
 
 namespace {
@@ -61,6 +62,8 @@ std::set<std::string> ReadMap(const std::string& path) {
 constexpr const char* kInternalCompatibility[] = {
     "atexit", "bcopy", "bsd_signal", "bzero", "gmtime64_r", "localtime64_r",
     "mktime64", "putw", "sysv_signal", "timegm64", "tkill"};
+constexpr const char* kRawSyscallAliases[] = {
+    "__fgetxattr", "__fsetxattr", "__flistxattr"};
 struct Positive {
   const char* owner;
   const char* name;
@@ -68,6 +71,7 @@ struct Positive {
 constexpr Positive kPublicEntries[] = {
     {"libc", "__cxa_atexit"}, {"libc", "memcpy"}, {"libc", "gmtime_r"},
     {"libc", "localtime_r"}, {"libc", "mktime"}, {"libc", "timegm"}, {"libc", "tgkill"},
+    {"libc", "fgetxattr"}, {"libc", "fsetxattr"}, {"libc", "flistxattr"},
     {"libm", "cos"}, {"libdl", "dlsym"},
     {"libdl_android", "android_update_LD_LIBRARY_PATH"}};
 }  // namespace
@@ -80,6 +84,31 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string directory = argv[1];
+  const auto late = LateEntries();
+  if (!late.empty()) {
+    std::unordered_map<std::string, std::set<std::string>> allowed;
+    for (const char* owner : {"libandroid.so", "libnativewindow.so"}) {
+      std::string stem(owner);
+      stem.erase(stem.size() - 3);
+      allowed.emplace(owner, ReadMap(directory + "/" + stem + ".map.txt"));
+    }
+    RegisterLateProviders();
+    for (const LateEntry& entry : late) {
+      Check(LookupBionicSymbol(entry.name) == entry.address,
+            std::string(entry.name) + " retains the actual late registration address");
+      unsigned owners = 0;
+      for (const char* owner : {"libandroid.so", "libnativewindow.so", "libc.so", "libm.so", "libdl.so",
+                               "liblog.so", "libEGL.so", "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so"}) {
+        const auto map = allowed.find(owner);
+        const bool exported = map != allowed.end() && map->second.count(entry.name) != 0;
+        owners += exported;
+        Check(LookupOwnedSymbol(owner, entry.name) == (exported ? entry.address : nullptr),
+              std::string(owner) + "/" + entry.name + " matches the actual NDK map and function address");
+      }
+      Check(owners != 0, std::string(entry.name) + " has a real Android DSO owner");
+    }
+    std::printf("Late NDK provider registrations: %zu real entries checked against both source maps\n", late.size());
+  }
   const auto unfiltered = ReadMap(directory + "/libc.unfiltered.map.txt");
   for (const char* architecture : {"arm64", "x86_64"}) {
     std::unordered_map<std::string, std::set<std::string>> allowed;
@@ -91,6 +120,13 @@ int main(int argc, char** argv) {
       Check(unfiltered.count(name) == 1, label + " is present in unfiltered source map");
       Check(allowed.at("libc").count(name) == 0, label + " is excluded by Android's architecture filter");
       Check(LookupBionicSymbol(name) != nullptr, label + " remains in the internal aggregate");
+      Check(LookupOwnedSymbol("libc.so", name) == nullptr, label + " has no false LP64 owner");
+    }
+    for (const char* name : kRawSyscallAliases) {
+      const std::string label = std::string(architecture) + "/libc/" + name;
+      Check(unfiltered.count(name) == 0, label + " is not a public Bionic export");
+      Check(allowed.at("libc").count(name) == 0, label + " is not in the generated LP64 map");
+      Check(LookupBionicSymbol(name) != nullptr, label + " remains available to raw syscall dispatch");
       Check(LookupOwnedSymbol("libc.so", name) == nullptr, label + " has no false LP64 owner");
     }
     for (const Positive& entry : kPublicEntries) {

@@ -1,13 +1,13 @@
-# gesher: JNI for the app's .so files (compat/bionic/jni_bridge.cc), linked
-# into dalvikvm. An OBJECT library because nothing calls it: its static
-# initializer registers the ELF loader with gesher-base's dlopen
-# (<gesher/elf_dlopen.h>), which ART's host libnativeloader path calls for
-# System.loadLibrary. Phase 6, docs/native-libs.md.
+# JNI for the app's .so files. The native-loader adapter calls InstallJniBridge,
+# so its archive owns the real bridge object and carries its dependencies to
+# every ART consumer, including dex2oat, oatdump and the runtime tests.
+# Extracting this object also retains its ELF-loader registration initializer.
+# Do not insert the same object directly into dalvikvm a second time.
 add_library(gesher_jni_bridge OBJECT ${CMAKE_CURRENT_LIST_DIR}/jni_bridge.cc)
 target_include_directories(gesher_jni_bridge PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 target_link_libraries(gesher_jni_bridge PRIVATE gesher_bionic gesher_elf nativehelper)
 target_compile_options(gesher_jni_bridge PRIVATE -Wall -Wextra -Werror)
-target_link_libraries(dalvikvm PRIVATE gesher_jni_bridge gesher_bionic gesher_elf)
+target_link_libraries(art_nativeloader PRIVATE gesher_jni_bridge)
 
 # gesher: libandroid.so's non-graphics NDK APIs for the app's .so files
 # (compat/bionic/libandroid.cc), over libandroidfw, the framework's
@@ -25,6 +25,19 @@ set_target_properties(gesher_libandroid PROPERTIES CXX_STANDARD 23)
 target_compile_options(gesher_libandroid PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter
   -Wno-deprecated-anon-enum-enum-conversion -Wno-deprecated-copy)
 target_link_libraries(dalvikvm PRIVATE gesher_libandroid)
+
+# libandroid.so's AInputTransferToken and AInputReceiver (API 35) over the
+# framework's InputTransferToken natives (input_jni, cmake/aosp/input.cmake);
+# ADR 0089. gui/InputTransferToken.h is libgui's only header in aosp.lock.
+add_library(gesher_input_receiver OBJECT ${CMAKE_CURRENT_LIST_DIR}/input_receiver.cc)
+target_include_directories(gesher_input_receiver PRIVATE ${CMAKE_CURRENT_LIST_DIR}
+  ${AOSP_DIR}/frameworks/base/core/jni/include ${AOSP_DIR}/frameworks/native/libs/gui/include)
+target_link_libraries(gesher_input_receiver PRIVATE gesher_bionic gesher_elf binder utils log base
+  nativehelper)
+# AOSP's InputTransferToken.h marks one override only.
+target_compile_options(gesher_input_receiver PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter
+  -Wno-inconsistent-missing-override)
+target_link_libraries(dalvikvm PRIVATE gesher_input_receiver)
 
 # Bitmap's NDK entry points over hwui's ABitmap storage, with the loaded
 # library's System V ABI and JNI proxy translated at the boundary.

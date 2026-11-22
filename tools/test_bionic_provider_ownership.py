@@ -88,6 +88,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bionic-source", type=Path, required=True,
                         help="actual pinned Bionic checkout fetched by aosp.lock")
+    parser.add_argument("--aosp-root", type=Path,
+                        help="also verify late NDK registrations against the fetched libandroid/nativewindow maps")
     parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
     parser.add_argument("--source-ref", help="historical production registry/registration commit")
     parser.add_argument("--sanitize", action="store_true")
@@ -142,8 +144,35 @@ def main() -> int:
             bootstrap.append("  " + (f't["{value}"] = &address;' if kind == "key" else value + "(t);"))
         bootstrap.append("}")
 
+    late = []
+    late_calls = []
+    late_entries = []
+    if args.aosp_root:
+        for index, name in enumerate(("hardware_buffer", "surface_control", "input_receiver")):
+            text = read("compat/bionic/" + name + ".cc")
+            matches = list(re.finditer(r'(?m)^void Register\(\)\s*\{', text))
+            if len(matches) != 1:
+                raise ValueError("late NDK registration boundary changed: " + name)
+            match = matches[0]
+            body = text[match.start():body_end(text, match.end()) + 1]
+            entries = re.findall(r'\bE\("([A-Za-z_]\w*)",\s*([A-Za-z_]\w*)\)', body)
+            if not entries:
+                raise ValueError("late NDK registration has no literal entries: " + name)
+            namespace = "late_provider_" + str(index)
+            late.append("namespace " + namespace + " {")
+            late.extend("void " + function + "() {}" for function in sorted({function for _, function in entries}))
+            late += [body, "}"]
+            late_calls.append(namespace + "::Register();")
+            late_entries.extend('{"' + symbol + '", reinterpret_cast<void*>(&' + namespace + '::' + function + ')}'
+                                for symbol, function in entries)
+    late += ["struct LateEntry { const char* name; void* address; };",
+             "void RegisterLateProviders() { " + " ".join(late_calls) + " }",
+             "std::vector<LateEntry> LateEntries() { return {" + ",".join(late_entries) + "}; }"]
+
     print("BOUNDARY unchanged actual Registry/owned/internal lookup; actual registration keys with inert addresses", flush=True)
     print("BOUNDARY unmodified Android map generator for arm64/x86_64; no complete ABI/N10 or compatibility-function execution", flush=True)
+    if args.aosp_root:
+        print("BOUNDARY unchanged late NDK Register bodies and Registry; inert function addresses, no graphics/input backend execution", flush=True)
     print("SOURCE_REF " + (reference or "working-tree snapshot"), flush=True)
     template_path = ROOT / "tests/native/bionic_provider_ownership_host.cc.in"
     template = template_path.read_text()
@@ -152,7 +181,8 @@ def main() -> int:
     source = (template.replace("@TABLE_TYPE@", table_type)
               .replace("@REGISTRATION_BOOTSTRAP@", "\n".join(bootstrap))
               .replace("@REGISTRY_IMPLEMENTATION@", registry)
-              .replace("@PUBLIC_LOOKUP_IMPLEMENTATION@", public))
+              .replace("@PUBLIC_LOOKUP_IMPLEMENTATION@", public)
+              .replace("@LATE_REGISTRATION@", "\n".join(late)))
     header = read("compat/arm64/include/gesher/symbol_table.h")
     for name, digest in sorted(source_hashes.items()):
         print("SOURCE_SHA256 " + name + " " + digest, flush=True)
@@ -171,6 +201,18 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="gesher-provider-owners-") as temporary:
         folder = Path(temporary)
+        if args.aosp_root:
+            for owner, repository, name in (
+                ("libandroid", "frameworks/base", "native/android/libandroid.map.txt"),
+                ("libnativewindow", "frameworks/native", "libs/nativewindow/libnativewindow.map.txt"),
+            ):
+                checkout = args.aosp_root.resolve() / repository
+                path = checkout / name
+                data = path.read_bytes() if path.exists() else subprocess.check_output(
+                    ["git", "show", "HEAD:" + name], cwd=checkout)
+                print("NDK_MAP_SHA256 " + repository + "/" + name + " " +
+                      hashlib.sha256(data).hexdigest(), flush=True)
+                (folder / (owner + ".map.txt")).write_bytes(data)
         generator = folder / "generate-version-script.py"
         generator.write_bytes(bionic_input("tools/generate-version-script.py"))
         for owner, name in MAPS.items():
