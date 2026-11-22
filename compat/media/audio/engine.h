@@ -82,6 +82,12 @@ struct TrackEvents {
 
 class Engine;
 
+// Rate and latency must be observed together when a route/query changes output.
+struct OutputTiming {
+  uint32_t sample_rate;
+  uint32_t latency_frames;
+};
+
 class Track : public std::enable_shared_from_this<Track> {
  public:
   enum class State { kStopped, kPlaying, kStopping, kPaused };

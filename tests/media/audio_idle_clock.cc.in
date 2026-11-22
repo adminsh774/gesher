@@ -1,0 +1,78 @@
+// Actual clock/null/capture sinks; a controlled monotonic clock and Mixer boundary.
+#include <cstring>
+#include <cstdio>
+#include <cmath>
+#include "audio_idle_platform.h"
+@ENGINE_HEADER@
+@SINK@
+namespace gesher {
+inline int64_t fixture_now = 0;
+inline int64_t FixtureMonotonicNanos() { return fixture_now; }
+}
+namespace gesher::media {
+float StreamGain(int) { return 1; }
+int StreamOfGroup(int group) { return group; }
+}
+#define MonotonicNanos FixtureMonotonicNanos
+@CLOCK@
+}  // anonymous namespace
+}  // gesher::media
+#undef MonotonicNanos
+namespace {
+using namespace gesher::media;
+int checks = 0;
+void Check(bool value, const char* reason) {
+  ++checks;
+  if (!value) { std::fprintf(stderr, "FAIL audio idle clock: %s\n", reason); std::exit(1); }
+}
+class FixtureMixer : public Mixer {
+ public:
+  uint64_t frames = 0; float value = 0.25f;
+  bool GroupWanted(int) override { return true; }
+  bool MixGroup(int group, float* out, size_t count) override {
+    std::fill(out, out + count * 2, group == 0 ? value : 0);
+    if (group == 0) frames += count;
+    return group == 0;
+  }
+};
+void Advance(int milliseconds) { gesher::fixture_now += int64_t(milliseconds) * 1000000; }
+}
+int main() {
+  FixtureMixer mixer;
+  NullSink sink("isolated test");
+  Advance(10); sink.Tick(&mixer);
+  Check(mixer.frames == 480, "active null sink advances at real rate");
+  sink.SetIdle(true); Advance(60000); sink.Tick(&mixer);
+  Check(mixer.frames == 480, "idle never mixes queued samples");
+  sink.SetIdle(false); sink.Tick(&mixer);
+  Check(mixer.frames == 480, "resume skips idle elapsed time");
+  Advance(10); sink.Tick(&mixer);
+  Check(mixer.frames == 960, "new PCM is paced from resume");
+  Advance(30); sink.Tick(&mixer);
+  Check(mixer.frames == 2400, "busy active clock still catches up without changing timeline");
+
+  gesher::fixture_now = 0;
+  FILE* file = std::tmpfile(); Check(file != nullptr, "capture fixture file");
+  {
+    CaptureSink capture(file, "isolated capture"); FixtureMixer captured;
+    Advance(10); capture.Tick(&captured);
+    capture.SetIdle(true); Advance(50); capture.Tick(&captured);
+    Check(captured.frames == 480, "idle capture never pulls newly queued PCM");
+    const long idle_size = std::ftell(file);
+    Check(idle_size == 44 + 480 * 4, "capture file is not periodically extended during idle");
+    capture.SetIdle(false); capture.Tick(&captured);
+    Check(captured.frames == 480, "capture resume emits only silence for gap");
+    captured.value = 0.5f; Advance(10); capture.Tick(&captured);
+    Check(captured.frames == 960, "new capture PCM advances only after resume");
+    std::rewind(file); unsigned char header[44];
+    Check(std::fread(header, 1, sizeof(header), file) == sizeof(header), "read complete WAV header");
+    uint32_t bytes = 0; std::memcpy(&bytes, header + 40, sizeof(bytes));
+    Check(bytes == 3360 * 4, "capture timeline retains 50ms silent gap");
+    std::vector<int16_t> pcm(bytes / 2);
+    Check(std::fread(pcm.data(), 2, pcm.size(), file) == pcm.size(), "read complete captured timeline");
+    Check(pcm.front() == 8192 && pcm[2880 * 2] == 16384, "first sample before and after idle is preserved");
+    Check(std::all_of(pcm.begin() + 480 * 2, pcm.begin() + 2880 * 2,
+                     [](int16_t sample) { return sample == 0; }), "idle gap contains silence rather than future audio");
+  }
+  std::printf("audio idle clock: %d checks (actual null/capture code; controlled clock)\n", checks);
+}

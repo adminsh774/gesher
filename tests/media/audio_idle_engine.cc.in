@@ -1,0 +1,279 @@
+// Actual Engine and Track code; only endpoint/OS transport is substituted.
+#include <sys/types.h>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <future>
+#include <system_error>
+#include "audio_idle_platform.h"
+@HEADER@
+@SINK@
+namespace fixture {
+inline std::atomic<int> opens{0}, capture_opens{0}, ticks{0}, idle_stops{0};
+inline std::atomic<int> route{1};
+inline std::atomic<bool> fail_tick{false}, no_endpoint{false}, change_during_probe{false};
+inline std::atomic<uint64_t> device_generation{1};
+inline std::atomic<uint64_t> render_generation{1};
+inline std::atomic<uint64_t> timing{(uint64_t(48000) << 32) | 960};
+inline std::atomic<int> instance_serial{0}, active_instance{0}, active_closes{0};
+inline std::atomic<int> active_route{0}, route_lookups{0}, route_failures{0}, open_failures{0};
+inline std::function<void()> first_tick_hook, lookup_hook, open_hook;
+inline std::function<void()> route_wake;
+inline std::mutex pcm_mu;
+inline std::array<std::vector<float>, 5> pcm;
+inline std::wstring EndpointId(int route_number) {
+  return std::wstring(L"render-") + static_cast<wchar_t>(L'A' + route_number - 1);
+}
+inline bool ConsumeFailure(std::atomic<int>& remaining) {
+  int count = remaining.load();
+  while (count > 0) if (remaining.compare_exchange_weak(count, count - 1)) return true;
+  return false;
+}
+inline void Metadata() { ++device_generation; if (route_wake) route_wake(); }
+inline void Route() { ++route; ++render_generation; Metadata(); }
+}
+@ENGINE@
+namespace gesher::media {
+uint32_t Generation() { return 1; }
+float GetMasterVolume() { return 1; }
+bool GetMasterMute() { return false; }
+void MarkStreamActive(int, uint64_t) {}
+bool StreamActive(int, int) { return false; }
+@WATCHER@
+std::unique_ptr<OutputDeviceWatcher> WatchOutputDevices(std::function<void()> wake) {
+  fixture::route_wake = std::move(wake);
+  if (std::getenv("GESHER_TEST_NO_WATCHER")) return nullptr;
+  return std::make_unique<FixtureWatcher>();
+}
+class FixtureSink : public Sink {
+ public:
+  explicit FixtureSink(bool null = false)
+      : route_(fixture::route), null_(null), timing_(fixture::timing), instance_(++fixture::instance_serial),
+        endpoint_id_(null ? L"" : fixture::EndpointId(route_)) {}
+  ~FixtureSink() override { if (fixture::active_instance == instance_) ++fixture::active_closes; }
+  uint32_t rate() const override { return static_cast<uint32_t>(timing_ >> 32); }
+  uint32_t channels() const override { return 2; }
+  uint32_t latency_frames() const override { return static_cast<uint32_t>(timing_); }
+  std::string Describe() const override { return null_ ? "none (fixture)" : "WASAPI fixture"; }
+  std::string DeviceName() const override { return "fixture-route-" + std::to_string(route_); }
+  const std::wstring& EndpointId() const override { return endpoint_id_; }
+  void SetIdle(bool idle) override { if (idle) ++fixture::idle_stops; }
+  bool Tick(Mixer* mixer) override {
+    ++fixture::ticks;
+    fixture::active_instance = instance_;
+    fixture::active_route = null_ ? 0 : route_;
+    if (fixture::fail_tick.exchange(false)) return false;
+    for (int group = 0; group < kNumGroups; ++group) {
+      if (!mixer->GroupWanted(group)) continue;
+      float out[960] = {};
+      if (mixer->MixGroup(group, out, 480)) {
+        std::lock_guard<std::mutex> lock(fixture::pcm_mu);
+        fixture::pcm[group].insert(fixture::pcm[group].end(), out, out + 960);
+      }
+    }
+    auto hook = std::move(fixture::first_tick_hook);
+    if (hook) hook();
+    return true;
+  }
+ private: int route_; bool null_; uint64_t timing_; int instance_; std::wstring endpoint_id_;
+};
+std::unique_ptr<Sink> OpenWasapiSink(const std::u16string&, std::string* error) {
+  ++fixture::opens;
+  auto hook = std::move(fixture::open_hook);
+  if (hook) hook();
+  if (fixture::change_during_probe.exchange(false)) fixture::Route();
+  if (fixture::ConsumeFailure(fixture::open_failures)) { *error = "fixture: temporary output open failure"; return nullptr; }
+  if (fixture::no_endpoint) { *error = "fixture: no endpoint"; return nullptr; }
+  return std::make_unique<FixtureSink>();
+}
+std::unique_ptr<Sink> OpenCaptureSink(const std::wstring&, std::string*) {
+  ++fixture::capture_opens; return std::make_unique<FixtureSink>();
+}
+std::unique_ptr<Sink> OpenNullSink(const std::string&) { return std::make_unique<FixtureSink>(true); }
+}
+namespace {
+using namespace gesher::media;
+int checks = 0;
+void Check(bool value, const char* why) {
+  ++checks;
+  if (!value) { std::fprintf(stderr, "FAIL audio idle: %s\n", why); std::fflush(stderr); std::_Exit(1); }
+}
+template<class F> bool Until(F predicate, std::chrono::milliseconds timeout = 2500ms) {
+  const auto end = std::chrono::steady_clock::now() + timeout;
+  while (!predicate()) { if (std::chrono::steady_clock::now() >= end) return false; std::this_thread::sleep_for(2ms); }
+  return true;
+}
+std::shared_ptr<Track> NewTrack(int stream = 3) {
+  TrackParams params;
+  params.format = PcmFormat::kFloat; params.channels = 1;
+  params.sample_rate = 48000; params.capacity_frames = 4800; params.stream_type = stream;
+  std::string error; auto track = CreateTrack(params, &error);
+  Check(track != nullptr, "track creation"); return track;
+}
+void Prime(const std::shared_ptr<Track>& track, float value = 0.25f) {
+  std::vector<float> pcm(960, value);
+  Check(track->Write(pcm.data(), pcm.size() * sizeof(float), false) == static_cast<ssize_t>(pcm.size() * sizeof(float)), "PCM priming accepts exact input");
+}
+void Idle() {
+  Check(Until([] { return idle_test::armed_timers == 0 && idle_test::critical_threads == 0; }), "last active/draining group disarms timer and priority");
+  const int ticks = fixture::ticks;
+  const int wakes = idle_test::wait_returns;
+  std::this_thread::sleep_for(150ms);
+  Check(fixture::ticks == ticks, "no idle mixer ticks");
+  Check(idle_test::wait_returns == wakes, "no idle timeout wakeups");
+}
+}
+int main(int argc, char**) {
+  auto* engine = Engine::Get();
+  @ROUTING_CASES@
+  if (std::getenv("GESHER_TEST_OUTPUT_TIMING")) {
+    GetOutputInfo();
+    auto track = NewTrack();
+    Check(track->LatencyMs() == 120, "before first playback Track latency includes discovered20ms sink");
+    fixture::timing = (uint64_t(44100) << 32) | 1323; fixture::Route();
+    const auto changed = GetOutputInfo();
+    Check(changed.sample_rate == 44100 && changed.latency_frames == 1323 && track->LatencyMs() == 130,
+          "stopped Track uses newly discovered rate and latency together");
+    Check(fixture::ticks == 0 && idle_test::armed_timers == 0,
+          "latency discovery starts neither mixing nor timer");
+    fixture::timing = (uint64_t(48000) << 32) | 960; fixture::Route(); GetOutputInfo();
+    Prime(track); track->Start();
+    Check(Until([&] { return track->Position() >= 960; }), "timestamp fixture plays actual Track PCM");
+    track->Pause(); Idle();
+    int64_t base_frames = 0, base_time = 0;
+    Check(track->Timestamp(&base_frames, &base_time), "played Track supplies timestamp");
+    fixture::timing = (uint64_t(96000) << 32) | 4800; fixture::Route(); GetOutputInfo();
+    int64_t frames = 0, timestamp = 0;
+    Check(track->LatencyMs() == 150 && track->Timestamp(&frames, &timestamp) && frames == base_frames &&
+          timestamp == base_time + 30000000, "idle route query updates Track latency and timestamp without rendering");
+    std::atomic<bool> stop{false}, coherent{true};
+    std::vector<std::thread> queries;
+    for (int i = 0; i < 3; ++i) queries.emplace_back([&] {
+      while (!stop) {
+        GetOutputInfo();
+        const uint32_t latency = track->LatencyMs();
+        int64_t f = 0, t = 0;
+        if ((latency != 120 && latency != 150) || !track->Timestamp(&f, &t) ||
+            f != base_frames || (t != base_time && t != base_time + 30000000)) coherent = false;
+      }
+    });
+    for (int i = 0; i < 1000; ++i) {
+      fixture::timing = (i % 2 == 0) ? (uint64_t(48000) << 32) | 960
+                                    : (uint64_t(96000) << 32) | 4800;
+      fixture::Metadata(); GetOutputInfo();
+    }
+    stop = true; for (auto& query : queries) query.join();
+    Check(coherent, "concurrent queries never combine one route rate with another latency");
+    Check(idle_test::armed_timers == 0 && idle_test::critical_threads == 0,
+          "concurrent timing queries leave renderer idle");
+    track->Release();
+    std::printf("audio output timing: %d checks\n", checks); std::fflush(stdout); std::_Exit(0);
+  }
+  if (std::getenv("GESHER_TEST_TIMER_FAILURE")) {
+    auto track = NewTrack(); Prime(track); track->Start();
+    std::atomic<bool> spam{true};
+    std::thread controls([&] { while (spam) { engine->Wake(); std::this_thread::sleep_for(1ms); } });
+    const bool progressed = Until([&] { return track->Position() >= 960; }, 500ms);
+    spam = false; controls.join();
+    Check(progressed, "timer failure fallback keeps absolute pacing despite frequent controls");
+    track->Release(); track.reset(); Idle();
+    std::printf("audio timer failure: %d checks\n", checks); std::fflush(stdout); std::_Exit(0);
+  }
+  if (std::getenv("GESHER_TEST_EVENT_FAILURE")) {
+    TrackParams params; std::string error;
+    Check(CreateTrack(params, &error) == nullptr && !error.empty(), "wake allocation failure rejects track with real error");
+    Check(!engine->started_, "wake allocation failure creates no unusable mixer");
+    std::printf("audio event failure: %d checks\n", checks); return 0;
+  }
+  if (argc > 1) {
+    const auto info = GetOutputInfo();
+    Check(!engine->started_, "metadata alone never creates mixer thread");
+    Check(fixture::capture_opens == 0, "capture metadata never opens/truncates output");
+    if (std::getenv("GESHER_AUDIO_CAPTURE")) Check(info.description == "capture configured (not opened)", "capture query reports configured software format");
+    else {
+      Check(GetOutputInfo().generation == info.generation, "uncached stable output keeps ports/patches generation consistent");
+      Check(fixture::opens == 2, "without notifications metadata is not cached forever");
+    }
+    std::printf("audio idle query: %d checks\n", checks); return 0;
+  }
+  const auto first = GetOutputInfo();
+  GetOutputInfo();
+  Check(!engine->started_ && fixture::ticks == 0, "query alone has no render loop");
+  Check(fixture::opens == 1, "same device generation uses cached real metadata");
+  Check(first.sample_rate == 48000 && first.latency_frames == 960, "probe preserves sink format and actual latency");
+  fixture::Route(); fixture::change_during_probe = true;
+  const auto changed = GetOutputInfo(); GetOutputInfo();
+  Check(fixture::opens == 3 && changed.generation > first.generation, "racing route change leaves probe stale and next query re-probes");
+
+  auto track = NewTrack(); Prime(track);
+  std::this_thread::sleep_for(40ms);
+  Check(fixture::ticks == 0 && idle_test::armed_timers == 0, "created/primed stopped track has no rendering");
+  Check(track->Start() == kOk, "start accepted");
+  Check(Until([&] { return track->Position() >= 960; }), "event start mixes original PCM");
+  const int render_instance = fixture::active_instance, render_closes = fixture::active_closes;
+  const int opens_before_metadata = fixture::opens;
+  for (int i = 0; i < 6; ++i) fixture::Metadata();
+  std::this_thread::sleep_for(50ms);
+  Check(fixture::opens == opens_before_metadata && fixture::active_instance == render_instance &&
+        fixture::active_closes == render_closes,
+        "metadata-only notifications retain active sink and its queued output ownership");
+  GetOutputInfo();
+  Check(fixture::active_instance == render_instance && fixture::active_closes == render_closes,
+        "metadata re-probe does not replace the active renderer");
+  track->Stop();
+  Check(Until([&] { return track->stopped(); }), "streaming stop drains its queued data");
+  Idle();
+  const uint32_t stopped_position = track->Position();
+  std::this_thread::sleep_for(80ms);
+  Check(track->Position() == stopped_position, "idle preserves playback position");
+
+  // Force a start into the narrow Wanted() -> wait race, not a probabilistic stress loop.
+  std::promise<void> entered, release;
+  auto gate = release.get_future().share();
+  { std::lock_guard<std::mutex> lock(idle_test::hook_mu);
+    idle_test::idle_hook = [&] { entered.set_value(); gate.wait(); }; }
+  engine->Wake();
+  Check(entered.get_future().wait_for(1s) == std::future_status::ready, "reached pre-wait idle boundary");
+  Prime(track, 0.5f); Check(track->Start() == kOk, "start while idle wait is entering");
+  release.set_value();
+  Check(Until([&] { return track->Position() >= 960; }, 500ms), "wake is retained across idle transition");
+  track->Pause();
+  const uint32_t paused = track->Position(); Prime(track, 0.75f);
+  Idle();
+  Check(track->Position() == paused && track->Queued() == 960, "pause preserves new queued PCM through idle");
+  const int before_route = fixture::opens;
+  fixture::Route(); std::this_thread::sleep_for(40ms);
+  Check(fixture::opens == before_route, "idle route notification does not start/reopen rendering");
+  Check(GetOutputInfo().device_name == "fixture-route-" + std::to_string(fixture::route.load()), "idle route change invalidates metadata");
+  track->Start();
+  Check(Until([&] { return track->Queued() == 0; }), "resume after idle consumes queued PCM");
+  Check(fixture::opens == before_route + 2, "resume opens updated endpoint after metadata probe");
+
+  auto alarm = NewTrack(4); Prime(alarm, 0.1f); alarm->Start();
+  track->Release(); track.reset();
+  Check(Until([&] { return alarm->Position() >= 960; }), "another stream group keeps rendering after first release");
+  Check(idle_test::armed_timers == 1, "timer remains armed for other playing track");
+  const int before_failure = fixture::opens;
+  fixture::fail_tick = true;
+  Check(Until([&] { return fixture::opens > before_failure; }), "active sink failure reopens output");
+  alarm->Stop(); alarm->Release(); alarm.reset(); Idle();
+
+  fixture::no_endpoint = true; fixture::Route();
+  auto fallback = NewTrack(); Prime(fallback); fallback->Start();
+  Check(Until([&] { return fallback->Position() >= 960; }), "unavailable endpoint retains null sink timing contract");
+  fixture::no_endpoint = false; fixture::Route();
+  Check(Until([&] { return GetOutputInfo().description == "WASAPI fixture"; }), "endpoint arrival wakes recovery");
+  fallback->Release(); fallback.reset(); Idle();
+  const int idle_opens = fixture::opens;
+  std::this_thread::sleep_for(150ms);
+  Check(fixture::opens == idle_opens, "no idle device-retry polling");
+  Check(fixture::idle_stops >= 4, "every active-to-idle transition tells sink to stop");
+  { std::lock_guard<std::mutex> lock(fixture::pcm_mu);
+    Check(!fixture::pcm[0].empty() && !fixture::pcm[2].empty(), "real mixer handled multiple groups"); }
+  std::printf("audio idle engine: %d checks (actual Engine/Track; isolated endpoints)\n", checks);
+  std::fflush(stdout);
+  // The production singleton intentionally owns process-lifetime waiting threads.
+  std::_Exit(0);
+}

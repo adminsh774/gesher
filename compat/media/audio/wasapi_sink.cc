@@ -21,10 +21,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
 #include "log.h"
+#include "endpoint_identity.h"
 #include "shared_state.h"
 #include "wasapi_sink.h"
 
@@ -200,9 +202,9 @@ bool WasapiAudioSink::Initialize(const WasapiSinkParams& params, std::string* er
   BuildWaveFormatExtensible(rate_, channels_, params.format, &format_ext_);
   BuildWaveFormatEx(rate_, channels_, params.format, &format_ex_);
 
-  // Allocate thread-safe ring buffer (holds ~250ms of audio)
-  size_t ring_capacity = rate_ * bytes_per_frame_ / 4;
-  ring_buffer_.assign(ring_capacity, 0);
+  // Preparation also serves output metadata queries. Allocate the software
+  // queue and create its feeder only when real playback is requested.
+  ring_buffer_.clear();
   ring_head_ = 0;
   ring_tail_ = 0;
   ring_count_ = 0;
@@ -215,7 +217,8 @@ bool WasapiAudioSink::Initialize(const WasapiSinkParams& params, std::string* er
   // Create event handles for event-driven buffering
   buffer_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (buffer_event_ == nullptr || stop_event_ == nullptr) {
+  control_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (buffer_event_ == nullptr || stop_event_ == nullptr || control_event_ == nullptr) {
     *error = "WASAPI: failed to create synchronization events";
     Close();
     return false;
@@ -244,9 +247,8 @@ bool WasapiAudioSink::Initialize(const WasapiSinkParams& params, std::string* er
 
   ApplyVolume();
 
-  // Start background feeder thread
   quit_ = false;
-  feeder_thread_ = std::thread(&WasapiAudioSink::FeedLoop, this);
+  failed_ = false;
 
   MEDIA_LOGI("WASAPI: initialized %s (%s, %u Hz, %u ch, buffer %u frames, period %u frames)",
              using_client3_ ? "IAudioClient3 (low-latency)" : "IAudioClient (event-driven)",
@@ -268,6 +270,12 @@ bool WasapiAudioSink::InitAudioClient(std::string* error) {
     *error = hr == static_cast<HRESULT>(0x80070490)
                  ? "WASAPI: no audio endpoint (" + HrToString(hr) + ")"
                  : "WASAPI: no default render endpoint (" + HrToString(hr) + ")";
+    return false;
+  }
+
+  hr = ReadEndpointId(device_, &device_id_);
+  if (FAILED(hr)) {
+    *error = "WASAPI: endpoint identity (" + HrToString(hr) + ")";
     return false;
   }
 
@@ -327,7 +335,10 @@ bool WasapiAudioSink::InitAudioClient(std::string* error) {
 }
 
 void WasapiAudioSink::Close() {
-  quit_ = true;
+  {
+    std::lock_guard<std::mutex> lock(ring_mu_);
+    quit_ = true;
+  }
   if (stop_event_ != nullptr) SetEvent(stop_event_);
   ring_cv_.notify_all();
 
@@ -351,6 +362,10 @@ void WasapiAudioSink::Close() {
     CloseHandle(stop_event_);
     stop_event_ = nullptr;
   }
+  if (control_event_ != nullptr) {
+    CloseHandle(control_event_);
+    control_event_ = nullptr;
+  }
   ClearOpenSLQueue();
 }
 
@@ -371,20 +386,33 @@ std::string WasapiAudioSink::Describe() const {
 }
 
 bool WasapiAudioSink::Start() {
+  std::lock_guard<std::mutex> lock(client_mu_);
+  if (client_ == nullptr || quit_ || failed_) return false;
   if (running_) return true;
-  if (client_ == nullptr) return false;
+  if (!feeder_thread_.joinable()) {
+    try {
+      feeder_thread_ = std::thread(&WasapiAudioSink::FeedLoop, this);
+    } catch (const std::system_error&) {
+      Fail();
+      return false;
+    }
+  }
   HRESULT hr = client_->Start();
   if (SUCCEEDED(hr)) {
     running_ = true;
+    SetEvent(control_event_);
     return true;
   }
+  Fail();
   return false;
 }
 
 void WasapiAudioSink::Stop() {
+  std::lock_guard<std::mutex> lock(client_mu_);
   if (!running_) return;
   if (client_ != nullptr) client_->Stop();
   running_ = false;
+  SetEvent(control_event_);
 }
 
 void WasapiAudioSink::Pause() {
@@ -400,9 +428,26 @@ void WasapiAudioSink::Flush() {
 }
 
 void WasapiAudioSink::Reset() {
-  Stop();
+  std::lock_guard<std::mutex> lock(client_mu_);
+  if (client_ != nullptr && running_) client_->Stop();
+  running_ = false;
+  SetEvent(control_event_);
   Flush();
   if (client_ != nullptr) client_->Reset();
+}
+
+void WasapiAudioSink::Fail() {
+  // Publish the terminal predicate under the writer's wait mutex, so failure
+  // cannot arrive between its predicate check and condition-variable wait.
+  {
+    std::lock_guard<std::mutex> lock(ring_mu_);
+    failed_ = true;
+  }
+  ring_cv_.notify_all();
+}
+
+void WasapiAudioSink::SetIdle(bool idle) {
+  if (idle && running_) Reset();
 }
 
 size_t WasapiAudioSink::WriteFrames(const void* data, size_t frame_count, bool blocking) {
@@ -418,12 +463,13 @@ size_t WasapiAudioSink::WriteBytes(const void* data, size_t byte_count, bool blo
   size_t total_written = 0;
 
   std::unique_lock<std::mutex> lock(ring_mu_);
-  while (total_written < byte_count && !quit_) {
+  if (ring_buffer_.empty()) ring_buffer_.resize(rate_ * bytes_per_frame_ / 4);
+  while (total_written < byte_count && !quit_ && !failed_) {
     size_t space = ring_buffer_.size() - ring_count_;
     if (space == 0) {
       if (!blocking) break;
-      ring_cv_.wait(lock, [this] { return quit_ || (ring_buffer_.size() - ring_count_) > 0; });
-      if (quit_) break;
+      ring_cv_.wait(lock, [this] { return quit_ || failed_ || (ring_buffer_.size() - ring_count_) > 0; });
+      if (quit_ || failed_) break;
       space = ring_buffer_.size() - ring_count_;
     }
 
@@ -438,10 +484,12 @@ size_t WasapiAudioSink::WriteBytes(const void* data, size_t byte_count, bool blo
     ring_tail_ = (ring_tail_ + to_write) % ring_buffer_.size();
     ring_count_ += to_write;
     total_written += to_write;
-  }
-
-  if (total_written > 0 && !running_) {
-    Start();
+    // Start before a blocking writer fills its entire first queue, and never
+    // invert the feeder's client -> ring lock order.
+    lock.unlock();
+    const bool started = Start();
+    lock.lock();
+    if (!started) break;
   }
   return total_written;
 }
@@ -518,8 +566,11 @@ size_t WasapiAudioSink::GetOpenSLQueueDepth() const {
 }
 
 bool WasapiAudioSink::Tick(Mixer* mixer) {
-  if (mixer == nullptr) return false;
-  if (!mixer->GroupWanted(params_.stream_group)) return true;
+  if (mixer == nullptr || failed_) return false;
+  if (!mixer->GroupWanted(params_.stream_group)) {
+    SetIdle(true);
+    return true;
+  }
 
   // Mix a period's worth of frames from the mixer into our ring buffer
   uint32_t frames_to_mix = period_frames_ > 0 ? period_frames_ : (rate_ / 100);
@@ -535,7 +586,7 @@ bool WasapiAudioSink::Tick(Mixer* mixer) {
       WriteBytes(pcm.data(), pcm.size() * sizeof(int16_t), false);
     }
   }
-  return true;
+  return !failed_;
 }
 
 void WasapiAudioSink::OnVolumesChanged() {
@@ -581,36 +632,46 @@ void WasapiAudioSink::ReadDeviceProperties() {
 }
 
 void WasapiAudioSink::FeedLoop() {
-  // Join Pro Audio / Audio MMCSS task via avrt.dll
+  const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   DWORD task_index = 0;
-  HANDLE avrt_handle = DynamicAvSetMmThreadCharacteristicsW(L"Pro Audio", &task_index);
-  if (avrt_handle == nullptr) {
-    avrt_handle = DynamicAvSetMmThreadCharacteristicsW(L"Audio", &task_index);
-  }
-
-  HANDLE wait_handles[2] = {stop_event_, buffer_event_};
+  HANDLE avrt_handle = nullptr;
+  HANDLE wait_handles[3] = {stop_event_, control_event_, buffer_event_};
 
   while (!quit_) {
-    DWORD wait_res = WaitForMultipleObjects(2, wait_handles, FALSE, 2000);
+    const bool active = running_;
+    if (active && avrt_handle == nullptr) {
+      avrt_handle = DynamicAvSetMmThreadCharacteristicsW(L"Pro Audio", &task_index);
+      if (avrt_handle == nullptr) {
+        avrt_handle = DynamicAvSetMmThreadCharacteristicsW(L"Audio", &task_index);
+      }
+    } else if (!active && avrt_handle != nullptr) {
+      DynamicAvRevertMmThreadCharacteristics(avrt_handle);
+      avrt_handle = nullptr;
+    }
+    // A stopped client can leave a stale buffer signal. Ignore its event
+    // entirely while idle; only control/shutdown may wake this thread.
+    DWORD wait_res = WaitForMultipleObjects(active ? 3 : 2, wait_handles, FALSE, INFINITE);
     if (wait_res == WAIT_OBJECT_0) {
-      // stop_event_ signaled
       break;
     }
-    if (wait_res != WAIT_OBJECT_0 + 1) {
-      // Timeout or error
-      continue;
+    if (wait_res == WAIT_OBJECT_0 + 1) continue;
+    if (wait_res != WAIT_OBJECT_0 + 2) {
+      Fail();
+      break;
     }
 
+    std::unique_lock<std::mutex> client_lock(client_mu_);
+    if (!running_) continue;
     UINT32 padding = 0;
     HRESULT hr = client_->GetCurrentPadding(&padding);
-    if (FAILED(hr)) break;
+    if (FAILED(hr)) { Fail(); break; }
 
     UINT32 frames_needed = (buffer_frames_ > padding) ? (buffer_frames_ - padding) : 0;
     if (frames_needed == 0) continue;
 
     BYTE* render_buf = nullptr;
     hr = render_->GetBuffer(frames_needed, &render_buf);
-    if (FAILED(hr) || render_buf == nullptr) continue;
+    if (FAILED(hr) || render_buf == nullptr) { Fail(); break; }
 
     size_t bytes_needed = frames_needed * bytes_per_frame_;
     size_t bytes_filled = 0;
@@ -663,18 +724,22 @@ void WasapiAudioSink::FeedLoop() {
       }
     }
 
-    render_->ReleaseBuffer(frames_needed, flags);
+    if (FAILED(render_->ReleaseBuffer(frames_needed, flags))) Fail();
+    client_lock.unlock();
     ring_cv_.notify_all();
 
     // Trigger OpenSL callbacks outside locks
     for (auto& cb : completed_callbacks) {
       cb.first(cb.second);
     }
+    if (failed_) break;
   }
 
   if (avrt_handle != nullptr) {
     DynamicAvRevertMmThreadCharacteristics(avrt_handle);
   }
+  ring_cv_.notify_all();
+  if (SUCCEEDED(initialized)) CoUninitialize();
 }
 
 std::unique_ptr<WasapiAudioSink> CreateWasapiAudioSink(const WasapiSinkParams& params,

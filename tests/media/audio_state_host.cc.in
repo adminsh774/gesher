@@ -72,8 +72,8 @@ class ObservedConditionVariable {
 class Engine {
  public:
   void Remove(Track*) {}
-  uint32_t out_rate() const { return 48000; }
-  uint32_t latency_frames() const { return 0; }
+  void Wake() {}
+  OutputTiming output_timing() const { return {48000, 0}; }
 };
 void PostEvent(std::function<void()> event) { event(); }
 @TRACK@

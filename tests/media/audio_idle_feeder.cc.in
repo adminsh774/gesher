@@ -1,0 +1,211 @@
+// Actual preparation/control/feed-loop bodies. COM endpoint calls are explicit fakes.
+#include <cstring>
+#include <deque>
+#include <future>
+#include <cmath>
+#include <system_error>
+#include "audio_idle_platform.h"
+#ifdef _WIN32
+#include <mmreg.h>
+#else
+using BYTE = unsigned char;
+using UINT32 = uint32_t;
+using LPCWSTR = const wchar_t*;
+using LPVOID = void*;
+struct WAVEFORMATEX {};
+struct WAVEFORMATEXTENSIBLE {};
+inline bool FAILED(HRESULT value) { return value < 0; }
+inline BOOL CloseHandle(HANDLE) { return TRUE; }
+#endif
+constexpr DWORD AUDCLNT_BUFFERFLAGS_SILENT = 2;
+namespace fixture {
+inline std::atomic<int> starts{0}, stops{0}, resets{0}, mmcss{0}, releases{0};
+inline std::atomic<bool> fail_padding{false}, invalid_overlap{false};
+inline std::mutex output_mu;
+inline std::mutex render_hook_mu;
+inline std::function<void()> render_hook;
+inline std::vector<float> output;
+struct FakeUnknown { virtual ~FakeUnknown() = default; void Release() { delete this; } };
+struct FakeVolume : FakeUnknown {};
+struct FakeSession : FakeUnknown { void SetDisplayName(LPCWSTR, void*) {} };
+struct FakeRender {
+  std::vector<BYTE> bytes;
+  std::atomic<bool> holding{false};
+  HRESULT GetBuffer(UINT32 frames, BYTE** out) {
+    holding = true; bytes.assign(frames * 8, 0); *out = bytes.data();
+    std::function<void()> hook;
+    { std::lock_guard<std::mutex> lock(render_hook_mu); hook = std::move(render_hook); }
+    if (hook) hook();
+    return 0;
+  }
+  HRESULT ReleaseBuffer(UINT32 frames, DWORD) {
+    std::lock_guard<std::mutex> lock(output_mu);
+    const auto* pcm = reinterpret_cast<const float*>(bytes.data());
+    output.insert(output.end(), pcm, pcm + frames * 2);
+    holding = false; ++releases; return 0;
+  }
+  void Release() { delete this; }
+};
+struct FakeClient {
+  FakeRender* render = nullptr;
+  HRESULT Start() { ++starts; return 0; }
+  HRESULT Stop() { if (render && render->holding) invalid_overlap = true; ++stops; return 0; }
+  HRESULT Reset() { if (render && render->holding) invalid_overlap = true; ++resets; return 0; }
+  HRESULT SetEventHandle(HANDLE) { return 0; }
+  HRESULT GetCurrentPadding(UINT32* value) {
+    if (fail_padding.exchange(false)) return -1;
+    *value = 0; return 0;
+  }
+  HRESULT GetService(int iid, void** out) {
+    if (iid == 1) *out = render = new FakeRender;
+    if (iid == 2) *out = new FakeVolume;
+    if (iid == 3) *out = new FakeSession;
+    return 0;
+  }
+  void Release() { delete this; }
+};
+}
+@ENGINE_HEADER@
+@SINK@
+@WASAPI_HEADER@
+namespace gesher::media {
+constexpr int kIidIAudioRenderClient = 1, kIidISimpleAudioVolume = 2, kIidIAudioSessionControl = 3;
+template<class T> void SafeRelease(T*& value) { if (value) { value->Release(); value = nullptr; } }
+std::string HrToString(HRESULT) { return "fixture error"; }
+HANDLE DynamicAvSetMmThreadCharacteristicsW(LPCWSTR, DWORD*) {
+  ++fixture::mmcss; return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(1));
+}
+BOOL DynamicAvRevertMmThreadCharacteristics(HANDLE) { --fixture::mmcss; return TRUE; }
+bool BuildWaveFormatEx(uint32_t, uint32_t, WasapiSampleFormat, WAVEFORMATEX*) { return true; }
+bool BuildWaveFormatExtensible(uint32_t, uint32_t, WasapiSampleFormat, WAVEFORMATEXTENSIBLE*) { return true; }
+bool WasapiAudioSink::InitAudioClient(std::string*) {
+  client_ = new fixture::FakeClient; buffer_frames_ = 480; period_frames_ = 240;
+  device_id_ = L"render-A";
+  return true;
+}
+void WasapiAudioSink::ApplyVolume() {}
+void WasapiAudioSink::ReadDeviceProperties() {}
+@PREPARE@
+@CONTROLS@
+@TICK@
+@FEED@
+class LegacyFixture {
+ public:
+  struct Group { fixture::FakeClient* client = nullptr; bool running = false; };
+  Group groups_[5];
+  @LEGACY_IDLE@
+};
+}
+namespace {
+using namespace gesher::media;
+int checks = 0;
+void Check(bool value, const char* why) {
+  ++checks;
+  if (!value) { std::fprintf(stderr, "FAIL audio feeder: %s\n", why); std::fflush(stderr); std::_Exit(1); }
+}
+template<class F> bool Until(F predicate, std::chrono::milliseconds timeout = 1000ms) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!predicate()) { if (std::chrono::steady_clock::now() >= deadline) return false; std::this_thread::sleep_for(2ms); }
+  return true;
+}
+class FixtureMixer : public Mixer {
+ public:
+  bool wanted = true; float value = 0.25f;
+  bool GroupWanted(int) override { return wanted; }
+  bool MixGroup(int, float* out, size_t frames) override {
+    std::fill(out, out + frames * 2, value); return true;
+  }
+};
+}
+int main() {
+  WasapiSinkParams params;
+  std::string error;
+  {
+    WasapiAudioSink probe;
+    Check(probe.Initialize(params, &error), "production synchronous preparation succeeds with isolated real-client boundary");
+    Check(!probe.feeder_thread_.joinable() && !probe.IsRunning(), "metadata preparation creates neither feeder nor running stream");
+    Check(probe.ring_buffer_.empty() && fixture::starts == 0 && fixture::mmcss == 0, "metadata has no render ring/MMCSS/start");
+    Check(probe.latency_frames() == 480, "prepared sink reports actual fake client's buffer/latency");
+    Check(probe.EndpointId() == L"render-A", "prepared sink retains actual opened endpoint identity");
+  }
+  Check(fixture::starts == 0, "closing metadata probe never starts rendering");
+  WasapiAudioSink sink;
+  Check(sink.Initialize(params, &error), "playback preparation");
+  FixtureMixer mixer;
+  Check(sink.Tick(&mixer), "first tick supplies PCM");
+  Check(Until([] { return fixture::mmcss == 1; }), "lazy feeder takes MMCSS for active rendering");
+  Check(sink.feeder_thread_.joinable() && sink.IsRunning(), "first supplied PCM starts feeder/client");
+  SetEvent(sink.buffer_event_);
+  Check(Until([] { return fixture::releases >= 1; }), "event-driven feeder renders queued frames");
+  { std::lock_guard<std::mutex> lock(fixture::output_mu);
+    Check(!fixture::output.empty() && fixture::output.front() == 0.25f, "first queued sample is preserved"); }
+  mixer.wanted = false;
+  Check(sink.Tick(&mixer), "unwanted group transitions to idle");
+  Check(Until([] { return fixture::mmcss == 0; }), "idle feeder releases MMCSS");
+  Check(!sink.IsRunning() && sink.ring_count_ == 0 && fixture::resets == 1, "idle stops/resets endpoint and stale queue");
+  SetEvent(sink.buffer_event_);  // Windows may leave a stale notification after Stop.
+  const int released = fixture::releases, wakes = idle_test::wait_returns;
+  std::this_thread::sleep_for(120ms);
+  Check(fixture::releases == released && idle_test::wait_returns == wakes, "idle ignores buffer signals and has no polling timeout");
+  mixer.wanted = true; mixer.value = 0.75f;
+  Check(sink.Tick(&mixer), "resume accepts new PCM");
+  Check(Until([&] { return fixture::releases > released; }), "retained buffer event feeds resumed stream");
+  Check(fixture::starts == 2, "resume restarts client exactly once");
+  { std::lock_guard<std::mutex> lock(fixture::output_mu);
+    Check(fixture::output[static_cast<size_t>(released) * 960] == 0.75f, "resume has new sample at first frame without replaying stale PCM"); }
+  std::promise<void> entered, leave;
+  auto gate = leave.get_future().share();
+  { std::lock_guard<std::mutex> lock(fixture::render_hook_mu);
+    fixture::render_hook = [&] { entered.set_value(); gate.wait(); }; }
+  SetEvent(sink.buffer_event_);
+  Check(entered.get_future().wait_for(1s) == std::future_status::ready, "forced control race inside real feed buffer pair");
+  auto stop = std::async(std::launch::async, [&] { sink.SetIdle(true); });
+  Check(stop.wait_for(20ms) == std::future_status::timeout, "idle waits for outstanding render buffer");
+  leave.set_value();
+  Check(stop.wait_for(1s) == std::future_status::ready, "render/idle lock order completes without deadlock");
+  stop.get();
+  Check(!fixture::invalid_overlap, "Stop/Reset never overlaps GetBuffer/ReleaseBuffer");
+  sink.Tick(&mixer);
+  fixture::fail_padding = true;
+  SetEvent(sink.buffer_event_);
+  Check(Until([&] { return sink.failed_.load(); }), "endpoint failure is retained");
+  Check(!sink.Tick(&mixer), "feeder failure requests Engine recovery instead of pretending success");
+  sink.Close();
+  Check(fixture::mmcss == 0 && !fixture::invalid_overlap, "failure close releases scheduling and serializes endpoint controls");
+
+  WasapiAudioSink writer;
+  Check(writer.Initialize(params, &error), "blocking writer preparation");
+  std::vector<float> large(48000, 0.2f);  // larger than the initial 250ms software queue
+  auto written = std::async(std::launch::async, [&] {
+    return writer.WriteBytes(large.data(), large.size() * sizeof(float), true);
+  });
+  Check(Until([&] { return writer.IsRunning(); }), "blocking first write starts feeder before queue wait");
+  Check(Until([&] {
+    SetEvent(writer.buffer_event_);
+    return written.wait_for(0ms) == std::future_status::ready;
+  }, 3000ms), "blocking writer makes progress through ring/endpoint lock order");
+  Check(written.get() == large.size() * sizeof(float), "blocking write retains every input byte");
+  writer.SetIdle(true); writer.Close();
+  Check(fixture::mmcss == 0, "blocking-writer close retires feeder scheduling");
+  WasapiAudioSink failing_writer;
+  Check(failing_writer.Initialize(params, &error), "failing writer preparation");
+  auto failed_write = std::async(std::launch::async, [&] {
+    return failing_writer.WriteBytes(large.data(), large.size() * sizeof(float), true);
+  });
+  Check(Until([&] { return failing_writer.IsRunning(); }), "failing writer reaches active queue wait");
+  fixture::fail_padding = true;
+  SetEvent(failing_writer.buffer_event_);
+  Check(failed_write.wait_for(1s) == std::future_status::ready, "terminal endpoint failure wakes a blocked writer");
+  Check(failed_write.get() < large.size() * sizeof(float), "failed write reports only bytes accepted before failure");
+  failing_writer.Close();
+
+  LegacyFixture legacy;
+  fixture::FakeClient first, second;
+  legacy.groups_[0] = {&first, true}; legacy.groups_[3] = {&second, true};
+  const int stopped = fixture::stops, reset = fixture::resets;
+  legacy.SetIdle(true);
+  Check(fixture::stops == stopped + 2 && fixture::resets == reset + 2, "fallback sink stops/resets every running group");
+  legacy.SetIdle(true); legacy.SetIdle(false);
+  Check(fixture::stops == stopped + 2 && !legacy.groups_[0].running && !legacy.groups_[3].running, "fallback idle transition is idempotent");
+  std::printf("audio idle feeder: %d checks (actual preparation/control/feed-loop; isolated COM endpoint)\n", checks);
+}

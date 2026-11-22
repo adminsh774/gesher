@@ -28,7 +28,8 @@ class Clock {
   Clock() : start_(gesher::MonotonicNanos()) {}
   uint64_t Due(uint32_t rate) const {
     const int64_t elapsed = gesher::MonotonicNanos() - start_;
-    return static_cast<uint64_t>(static_cast<__int128>(elapsed) * rate / 1000000000);
+    const uint64_t nanos = static_cast<uint64_t>(elapsed);
+    return (nanos / 1000000000) * rate + (nanos % 1000000000) * rate / 1000000000;
   }
 
  private:
@@ -41,7 +42,17 @@ class ClockedSink : public Sink {
   uint32_t channels() const override { return kChannels; }
   uint32_t latency_frames() const override { return kRate / 50; }  // 20 ms, as a device's
 
+  void SetIdle(bool idle) override {
+    if (idle_ && !idle) {
+      const uint64_t due = clock_.Due(kRate);
+      if (due > done_) SkipIdle(due - done_);
+      done_ = due;
+    }
+    idle_ = idle;
+  }
+
   bool Tick(Mixer* mixer) override {
+    if (idle_) return true;
     uint64_t due = clock_.Due(kRate);
     if (due <= done_) return true;
     size_t frames = static_cast<size_t>(due - done_);
@@ -58,9 +69,11 @@ class ClockedSink : public Sink {
 
  protected:
   virtual void Render(Mixer* mixer, size_t frames) = 0;
+  virtual void SkipIdle(uint64_t) {}
 
   Clock clock_;
   uint64_t done_ = 0;
+  bool idle_ = false;
 };
 
 class NullSink : public ClockedSink {
@@ -93,6 +106,21 @@ class CaptureSink : public ClockedSink {
   }
 
  protected:
+  void SkipIdle(uint64_t frames) override {
+    // Preserve silence between active intervals in the capture timeline, but
+    // never ask the mixer to consume newly queued PCM for time spent idle.
+    // No file writes or timer wakeups occur during the idle interval itself.
+    constexpr size_t kSilentFrames = 16384;
+    pcm_.assign(kSilentFrames * kChannels, 0);
+    while (frames != 0) {
+      const size_t count = static_cast<size_t>(std::min<uint64_t>(frames, kSilentFrames));
+      fwrite(pcm_.data(), sizeof(int16_t), count * kChannels, f_);
+      data_bytes_ += static_cast<uint32_t>(count * kChannels * sizeof(int16_t));
+      frames -= count;
+    }
+    WriteHeader();
+  }
+
   void Render(Mixer* mixer, size_t frames) override {
     sum_.assign(frames * kChannels, 0.0f);
     buf_.resize(frames * kChannels);

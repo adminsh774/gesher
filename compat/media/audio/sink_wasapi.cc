@@ -23,9 +23,11 @@
 #include <atomic>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "engine.h"
+#include "endpoint_identity.h"
 
 #include <gesher/perf_trace.h>
 #include "log.h"
@@ -130,9 +132,13 @@ class SessionEvents : public IAudioSessionEvents {
   int stream_;
 };
 
-// The default device changing (or going away).
+// Metadata notifications are broader than changes to the selected render route.
+// A legacy sink keeps its selected ID for its lifetime; the process watcher
+// separately resolves the current default route outside these callbacks.
 class DeviceEvents : public IMMNotificationClient {
  public:
+  explicit DeviceEvents(std::function<void()> wake = {}, std::wstring selected_id = {})
+      : wake_(std::move(wake)), selected_id_(std::move(selected_id)) {}
   virtual ~DeviceEvents() = default;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
     if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, kIidIMMNotificationClient)) {
@@ -149,25 +155,147 @@ class DeviceEvents : public IMMNotificationClient {
     if (r == 0) delete this;
     return r;
   }
-  HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { return S_OK; }
-  HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
-  HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { return S_OK; }
-  HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
-    if (flow == eRender && role == eConsole) changed = true;
+  HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR id, DWORD state) override {
+    Signal(IsSelected(id) && (state & DEVICE_STATE_ACTIVE) == 0);
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { Signal(false); return S_OK; }
+  HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR id) override { Signal(IsSelected(id)); return S_OK; }
+  HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR id) override {
+    Signal(flow == eRender && role == eConsole &&
+           (id == nullptr ? !selected_id_.empty() : selected_id_ != id));
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override {
+    // Friendly-name and other property notifications do not retire queued
+    // audio. A truly invalidated client reports its error through Tick().
+    Signal(false);
     return S_OK;
   }
 
   std::atomic<bool> changed{false};
+  std::atomic<uint64_t> generation{1};
 
  private:
   std::atomic<ULONG> refs_{1};
+  const std::function<void()> wake_;
+  const std::wstring selected_id_;
+
+  bool IsSelected(LPCWSTR id) const {
+    return id != nullptr && !selected_id_.empty() && selected_id_ == id;
+  }
+
+  void Signal(bool render_changed) {
+    if (render_changed) changed = true;
+    ++generation;
+    // MMDevice callbacks must not block or release/register COM objects.
+    if (wake_) wake_();
+  }
+};
+
+// Return a known current route, including the legitimate no-endpoint state.
+// A transient enumeration failure is not proof that a working client is gone.
+bool ReadDefaultRenderId(IMMDeviceEnumerator* enumerator, std::wstring* id) {
+  IMMDevice* device = nullptr;
+  const HRESULT found = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+  if (found == static_cast<HRESULT>(0x80070490)) { id->clear(); return true; }
+  if (FAILED(found) || device == nullptr) return false;
+  DWORD state = 0;
+  const HRESULT state_result = device->GetState(&state);
+  LPWSTR value = nullptr;
+  const HRESULT named = device->GetId(&value);
+  const bool known = SUCCEEDED(state_result) && SUCCEEDED(named) && value != nullptr;
+  if (known) *id = (state & DEVICE_STATE_ACTIVE) != 0 ? value : L"";
+  if (value != nullptr) CoTaskMemFree(value);
+  device->Release();
+  return known;
+}
+
+class RenderRoute {
+ public:
+  bool MatchesEndpoint(const std::wstring& id) const {
+    return known_ && endpoint_id_ == id;
+  }
+
+  uint64_t Refresh(IMMDeviceEnumerator* enumerator, uint64_t notification_generation) {
+    if (checked_generation_ == notification_generation) return generation_;
+    if (failed_attempts_ >= 2 && GetTickCount64() < next_retry_ms_) return generation_;
+    std::wstring id;
+    if (!ReadDefaultRenderId(enumerator, &id)) {
+      // Do not cache failure as a resolved route. One prompt retry is allowed
+      // on the next active pass; persistent errors are limited to 10 Hz. The
+      // Engine does not call Refresh while idle, so this adds no idle polling.
+      if (failed_attempts_ < 2) ++failed_attempts_;
+      if (failed_attempts_ >= 2) next_retry_ms_ = GetTickCount64() + 100;
+      return generation_;
+    }
+    checked_generation_ = notification_generation;
+    failed_attempts_ = 0;
+    next_retry_ms_ = 0;
+    if (!known_ || endpoint_id_ != id) {
+      endpoint_id_ = std::move(id);
+      known_ = true;
+      ++generation_;
+    }
+    return generation_;
+  }
+
+ private:
+  uint64_t checked_generation_ = 0;
+  uint64_t generation_ = 0;
+  uint64_t next_retry_ms_ = 0;
+  unsigned failed_attempts_ = 0;
+  bool known_ = false;
+  std::wstring endpoint_id_;
+};
+
+class DeviceWatcher : public OutputDeviceWatcher {
+ public:
+  ~DeviceWatcher() override {
+    if (registered_) enumerator_->UnregisterEndpointNotificationCallback(events_);
+    SafeRelease(events_);
+    SafeRelease(enumerator_);
+    if (mta_ != nullptr) CoDecrementMTAUsage(mta_);
+  }
+
+  bool Open(std::function<void()> wake) {
+    // Keep the MTA alive after a metadata caller balances CoInitializeEx. No
+    // application-owned polling/render thread is needed for notifications.
+    if (FAILED(CoIncrementMTAUsage(&mta_))) return false;
+    if (FAILED(CoCreateInstance(kClsidMMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                kIidIMMDeviceEnumerator,
+                                reinterpret_cast<void**>(&enumerator_)))) return false;
+    events_ = new DeviceEvents(std::move(wake));
+    registered_ = SUCCEEDED(enumerator_->RegisterEndpointNotificationCallback(events_));
+    return registered_;
+  }
+
+  uint64_t generation() const override { return events_->generation.load(); }
+  uint64_t render_generation() override { return route_.Refresh(enumerator_, generation()); }
+  bool matches_render_endpoint(const std::wstring& id) const override {
+    return route_.MatchesEndpoint(id);
+  }
+
+ private:
+  CO_MTA_USAGE_COOKIE mta_ = nullptr;
+  IMMDeviceEnumerator* enumerator_ = nullptr;
+  DeviceEvents* events_ = nullptr;
+  bool registered_ = false;
+  RenderRoute route_;
 };
 
 class WasapiSink : public Sink {
  public:
+  void SetIdle(bool idle) override {
+    if (!idle) return;
+    for (auto& group : groups_) {
+      if (group.client != nullptr && group.running) {
+        group.client->Stop();
+        group.client->Reset();
+        group.running = false;
+      }
+    }
+  }
   ~WasapiSink() override {
     for (auto& g : groups_) CloseGroup(g);
     if (enumerator_ != nullptr && device_events_ != nullptr) {
@@ -192,6 +320,11 @@ class WasapiSink : public Sink {
       *error = hr == static_cast<HRESULT>(0x80070490)
                    ? "WASAPI: no audio endpoint (" + Hr(hr) + ")"
                    : "WASAPI: no default render endpoint (" + Hr(hr) + ")";
+      return false;
+    }
+    hr = ReadEndpointId(device_, &device_id_);
+    if (FAILED(hr)) {
+      *error = "WASAPI: endpoint identity (" + Hr(hr) + ")";
       return false;
     }
     ReadDeviceProperties();
@@ -241,7 +374,7 @@ class WasapiSink : public Sink {
     // Open the media group now: a missing or broken endpoint shows here, not
     // at the first sound.
     if (!OpenGroup(groups_[0], 0, error)) return false;
-    device_events_ = new DeviceEvents();
+    device_events_ = new DeviceEvents({}, device_id_);
     enumerator_->RegisterEndpointNotificationCallback(device_events_);
     return true;
   }
@@ -252,6 +385,7 @@ class WasapiSink : public Sink {
 
   std::string DeviceName() const override { return device_name_; }
   int DeviceType() const override { return device_type_; }
+  const std::wstring& EndpointId() const override { return device_id_; }
 
   std::string Describe() const override {
     std::string s = "WASAPI shared mode on " + device_name_ + ", " + std::to_string(rate_) + " Hz, " +
@@ -427,6 +561,7 @@ class WasapiSink : public Sink {
 
   std::u16string app_name_;
   std::string device_name_ = "Windows default output";
+  std::wstring device_id_;
   int device_type_ = 0x2;
   IMMDeviceEnumerator* enumerator_ = nullptr;
   IMMDevice* device_ = nullptr;
@@ -443,6 +578,24 @@ class WasapiSink : public Sink {
 };
 
 }  // namespace
+
+std::unique_ptr<OutputDeviceWatcher> WatchOutputDevices(std::function<void()> wake) {
+  const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  if (initialized == RPC_E_CHANGED_MODE) {
+    // An STA metadata caller must not leave the notification enumerator tied
+    // to its apartment/message pump. Only this one-time setup uses a helper.
+    std::unique_ptr<OutputDeviceWatcher> result;
+    std::thread setup([&] { result = WatchOutputDevices(std::move(wake)); });
+    setup.join();
+    return result;
+  }
+  if (FAILED(initialized)) return nullptr;
+  auto watcher = std::make_unique<DeviceWatcher>();
+  const bool opened = watcher->Open(std::move(wake));
+  if (!opened) watcher.reset();
+  CoUninitialize();
+  return watcher;
+}
 
 std::unique_ptr<Sink> OpenWasapiSink(const std::u16string& app_name, std::string* error) {
   auto low_latency = OpenLowLatencyWasapiSink(app_name, error);

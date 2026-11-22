@@ -1,0 +1,71 @@
+if (const char* scenario = std::getenv("GESHER_TEST_ROUTE_SCENARIO")) {
+  const std::string name(scenario);
+  const bool empty = name == "no-endpoint" || name == "no-endpoint-lookup-failure";
+  fixture::no_endpoint = empty;
+  GetOutputInfo();
+  const int probes = fixture::opens;
+  int expected_route = empty ? 0 : 1;
+  int expected_closes = 0;
+  int expected_render_opens = 1;
+  if (name == "same-endpoint" || name == "changed-endpoint" ||
+      name == "changed-without-notification" || name == "no-endpoint-lookup-failure") {
+    fixture::route_failures = 1;
+  }
+  if (name == "repeated-failures") fixture::route_failures = 3;
+  if (name == "changed-endpoint" || name == "changed-without-notification") {
+    const bool notify = name == "changed-endpoint";
+    fixture::first_tick_hook = [notify] { ++fixture::route; if (notify) fixture::Metadata(); };
+    expected_route = 2; expected_closes = 1; expected_render_opens = 2;
+  } else if (name == "switch-during-open") {
+    fixture::open_hook = [] { ++fixture::route; fixture::Metadata(); };
+    expected_route = 2;
+  } else if (name == "notification-during-lookup") {
+    fixture::lookup_hook = [] { ++fixture::route; fixture::Metadata(); };
+    expected_route = 2;
+  } else if (name == "open-failure") {
+    fixture::open_failures = 1;
+    expected_closes = 1; expected_render_opens = 2;
+  }
+  auto track = NewTrack(); Prime(track); track->Start();
+  Check(Until([&] { return track->Position() >= 960; }), "actual Track PCM progresses during route discovery");
+  Check(Until([&] { return fixture::active_route == expected_route &&
+                          fixture::opens == probes + expected_render_opens; },
+              name == "open-failure" ? 6500ms : 2500ms), "renderer reaches the actual selected endpoint");
+  const int minimum_lookups = name == "repeated-failures" ? 4 :
+      (name == "same-endpoint" || name == "changed-endpoint" || name == "changed-without-notification" ||
+       name == "no-endpoint-lookup-failure" || name == "switch-during-open" ||
+       name == "notification-during-lookup") ? 2 : 1;
+  Check(Until([&] { return fixture::route_lookups >= minimum_lookups; }), "pending route discovery is resolved");
+  std::this_thread::sleep_for(50ms);
+  Check(fixture::active_closes == expected_closes && fixture::opens == probes + expected_render_opens,
+        "identity reconciliation never discards an unchanged opened sink or its queue");
+  const int instance = fixture::active_instance;
+  const int lookups = fixture::route_lookups;
+  std::this_thread::sleep_for(50ms);
+  Check(fixture::active_instance == instance && fixture::route_lookups == lookups,
+        "resolved stable route keeps exact sink instance and cached lookup");
+  { std::lock_guard<std::mutex> lock(fixture::pcm_mu);
+    Check(!fixture::pcm[0].empty() && fixture::pcm[0].front() == 0.25f,
+          "first queued PCM sample survives actual mixer startup"); }
+  if (empty) {
+    fixture::no_endpoint = false; ++fixture::route; fixture::Metadata();
+    Prime(track, 0.5f);
+    Check(Until([] { return fixture::active_route == 2; }), "real output arrival recovers from unavailable output");
+    Check(fixture::active_closes == 1 && fixture::opens == probes + 2,
+          "output arrival replaces only the prior null sink");
+  }
+  const int before_metadata = fixture::opens;
+  const int before_metadata_closes = fixture::active_closes;
+  const int before_metadata_lookups = fixture::route_lookups;
+  fixture::Metadata();
+  Check(Until([&] { return fixture::route_lookups > before_metadata_lookups; }), "metadata-only event traverses actual route resolver");
+  Check(fixture::opens == before_metadata && fixture::active_closes == before_metadata_closes,
+        "metadata-only re-resolution retains queued-output ownership");
+  track->Release(); track.reset(); Idle();
+  const int idle_lookups = fixture::route_lookups;
+  std::this_thread::sleep_for(120ms);
+  Check(fixture::route_lookups == idle_lookups, "ordinary idle performs no periodic route recovery");
+  std::printf("audio integrated routing %s: %d checks, lookups=%d, opens=%d, active_closes=%d\n",
+              scenario, checks, fixture::route_lookups.load(), fixture::opens.load(), fixture::active_closes.load());
+  std::fflush(stdout); std::_Exit(0);
+}

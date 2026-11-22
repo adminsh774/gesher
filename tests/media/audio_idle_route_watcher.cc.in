@@ -1,0 +1,20 @@
+// Isolated MMDevice boundary; routing state/retry logic below is actual production.
+struct RouteEnumerator {};
+bool ReadDefaultRenderId(RouteEnumerator*, std::wstring* id) {
+  ++fixture::route_lookups;
+  if (fixture::ConsumeFailure(fixture::route_failures)) return false;
+  *id = fixture::no_endpoint ? L"" : fixture::EndpointId(fixture::route);
+  auto hook = std::move(fixture::lookup_hook);
+  if (hook) hook();
+  return true;
+}
+@RENDER_ROUTE@
+class FixtureWatcher : public OutputDeviceWatcher {
+ public:
+  uint64_t generation() const override { return fixture::device_generation.load(); }
+  uint64_t render_generation() override { return route_.Refresh(&enumerator_, generation()); }
+  bool matches_render_endpoint(const std::wstring& id) const override { return route_.MatchesEndpoint(id); }
+ private:
+  RouteEnumerator enumerator_;
+  RenderRoute route_;
+};

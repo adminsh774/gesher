@@ -1,0 +1,239 @@
+// Actual MMDevice notification classification and selected-route refresh.
+// Only endpoint enumeration and the COM interface transport are isolated.
+#include <cstring>
+#include <cwchar>
+#include "audio_idle_platform.h"
+#ifdef _WIN32
+#include <mmdeviceapi.h>
+#else
+using ULONG = uint32_t;
+using LPCWSTR = const wchar_t*;
+using LPWSTR = wchar_t*;
+struct IID { uint32_t a; uint16_t b, c; unsigned char d[8]; };
+using REFIID = const IID&;
+inline const IID IID_IUnknown = {};
+inline bool IsEqualIID(REFIID a, REFIID b) { return std::memcmp(&a, &b, sizeof(IID)) == 0; }
+inline bool FAILED(HRESULT value) { return value < 0; }
+constexpr HRESULT S_OK = 0, E_NOINTERFACE = -2, E_POINTER = -3, E_UNEXPECTED = -4;
+constexpr DWORD DEVICE_STATE_ACTIVE = 1, DEVICE_STATE_DISABLED = 2;
+enum EDataFlow { eRender, eCapture, eAll };
+enum ERole { eConsole, eMultimedia, eCommunications };
+struct PROPERTYKEY { int value = 0; };
+#define STDMETHODCALLTYPE
+class IMMNotificationClient {
+ public:
+  virtual ~IMMNotificationClient() = default;
+  virtual HRESULT QueryInterface(REFIID, void**) = 0;
+  virtual ULONG AddRef() = 0;
+  virtual ULONG Release() = 0;
+  virtual HRESULT OnDeviceStateChanged(LPCWSTR, DWORD) = 0;
+  virtual HRESULT OnDeviceAdded(LPCWSTR) = 0;
+  virtual HRESULT OnDeviceRemoved(LPCWSTR) = 0;
+  virtual HRESULT OnDefaultDeviceChanged(EDataFlow, ERole, LPCWSTR) = 0;
+  virtual HRESULT OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) = 0;
+};
+inline void* CoTaskMemAlloc(size_t bytes) { return std::malloc(bytes); }
+inline void CoTaskMemFree(void* value) { std::free(value); }
+#endif
+namespace fixture {
+inline uint64_t route_clock_ms = 0;
+inline uint64_t RouteClockMs() { return route_clock_ms; }
+inline int freed_ids = 0;
+inline void FreeId(void* value) { ++freed_ids; CoTaskMemFree(value); }
+struct Device {
+  std::wstring id;
+  DWORD state;
+  HRESULT identity_result = S_OK;
+  bool null_identity = false;
+  HRESULT GetState(DWORD* out) { *out = state; return 0; }
+  HRESULT GetId(LPWSTR* out) {
+    if (null_identity) { *out = nullptr; return identity_result; }
+    const size_t bytes = (id.size() + 1) * sizeof(wchar_t);
+    *out = static_cast<LPWSTR>(CoTaskMemAlloc(bytes));
+    if (*out == nullptr) return -1;
+    std::memcpy(*out, id.c_str(), bytes); return identity_result;
+  }
+  void Release() { delete this; }
+};
+struct Enumerator {
+  std::wstring id = L"render-A";
+  DWORD state = DEVICE_STATE_ACTIVE;
+  bool absent = false, fail = false;
+  int lookups = 0;
+  HRESULT GetDefaultAudioEndpoint(EDataFlow flow, ERole role, Device** out) {
+    ++lookups; *out = nullptr;
+    if (fail || flow != eRender || role != eConsole) return -1;
+    if (absent) return static_cast<HRESULT>(0x80070490);
+    *out = new Device{id, state}; return 0;
+  }
+};
+}
+@ENDPOINT_ID@
+namespace gesher::media {
+@IID@
+@NOTIFICATIONS@
+#define GetTickCount64 fixture::RouteClockMs
+@ROUTE@
+#undef GetTickCount64
+}
+namespace {
+using namespace gesher::media;
+int checks = 0;
+void Check(bool value, const char* reason) {
+  ++checks;
+  if (!value) { std::fprintf(stderr, "FAIL audio notifications: %s\n", reason); std::exit(1); }
+}
+}
+int main() {
+  fixture::Device device{L"actual-render-device", DEVICE_STATE_ACTIVE};
+  std::wstring opened_id;
+  Check(ReadEndpointId(&device, &opened_id) == S_OK && opened_id == device.id,
+        "WASAPI open obtains actual persistent device identity");
+  Check(fixture::freed_ids == 1, "successful identity query releases COM allocation");
+  device.identity_result = static_cast<HRESULT>(-123);
+  Check(ReadEndpointId(&device, &opened_id) == device.identity_result && opened_id == L"actual-render-device",
+        "identity error is preserved without substituting or erasing a valid identity");
+  Check(fixture::freed_ids == 2, "failed identity query also releases any returned allocation");
+  device.identity_result = S_OK; device.null_identity = true;
+  Check(ReadEndpointId(&device, &opened_id) == E_UNEXPECTED && opened_id == L"actual-render-device",
+        "missing identity cannot become a successful hardware open");
+  device.null_identity = false; device.id.clear();
+  Check(ReadEndpointId(&device, &opened_id) == E_UNEXPECTED && opened_id == L"actual-render-device",
+        "empty identity cannot masquerade as the legitimate no-endpoint route");
+  Check(fixture::freed_ids == 3, "empty identity result is released");
+  Check(ReadEndpointId(nullptr, &opened_id) == E_POINTER && ReadEndpointId(&device, nullptr) == E_POINTER,
+        "invalid identity-query arguments fail explicitly");
+  int wakes = 0;
+  DeviceEvents watcher([&] { ++wakes; });
+  DeviceEvents legacy({}, L"render-A");
+  fixture::Enumerator enumerator;
+  RenderRoute route;
+  uint64_t rendered = route.Refresh(&enumerator, watcher.generation);
+  Check(rendered != 0, "initial selected endpoint is resolved");
+  const PROPERTYKEY property = {};
+  auto metadata_only = [&](auto notify, const char* reason) {
+    const uint64_t before = watcher.generation;
+    const int lookups = enumerator.lookups;
+    notify(watcher); notify(legacy);
+    Check(watcher.generation == before + 1 && enumerator.lookups == lookups,
+          "callback invalidates metadata without enumerating or blocking on COM");
+    Check(!legacy.changed.exchange(false), reason);
+    Check(route.Refresh(&enumerator, watcher.generation) == rendered,
+          "same selected render endpoint does not invalidate active sink");
+  };
+  metadata_only([&](DeviceEvents& e) { e.OnPropertyValueChanged(L"microphone-X", property); },
+                "unrelated input property does not fail fallback sink");
+  metadata_only([](DeviceEvents& e) { e.OnDeviceStateChanged(L"microphone-X", DEVICE_STATE_DISABLED); },
+                "unrelated input state does not fail fallback sink");
+  metadata_only([](DeviceEvents& e) { e.OnDeviceAdded(L"microphone-X"); },
+                "unrelated input addition does not fail fallback sink");
+  metadata_only([](DeviceEvents& e) { e.OnDeviceRemoved(L"microphone-X"); },
+                "unrelated input removal does not fail fallback sink");
+  metadata_only([&](DeviceEvents& e) { e.OnPropertyValueChanged(L"render-A", property); },
+                "benign selected output property does not fail fallback sink");
+  metadata_only([](DeviceEvents& e) { e.OnDeviceStateChanged(L"render-A", DEVICE_STATE_ACTIVE); },
+                "unchanged selected active state does not fail fallback sink");
+  metadata_only([](DeviceEvents& e) { e.OnDefaultDeviceChanged(eCapture, eConsole, L"microphone-Y"); },
+                "default capture change does not fail fallback sink");
+  metadata_only([](DeviceEvents& e) { e.OnDefaultDeviceChanged(eRender, eCommunications, L"render-B"); },
+                "unselected render role does not fail fallback sink");
+  metadata_only([](DeviceEvents& e) { e.OnDefaultDeviceChanged(eRender, eConsole, L"render-A"); },
+                "duplicate default route notification does not fail fallback sink");
+  Check(wakes == 9, "metadata notifications still wake the existing engine");
+
+  enumerator.id = L"render-B";
+  watcher.OnDefaultDeviceChanged(eRender, eConsole, L"render-B");
+  legacy.OnDefaultDeviceChanged(eRender, eConsole, L"render-B");
+  Check(legacy.changed.exchange(false), "true default render switch retires fallback sink");
+  Check(route.Refresh(&enumerator, watcher.generation) == ++rendered,
+        "true default render switch advances renderer generation");
+  DeviceEvents legacy_b({}, L"render-B");
+  enumerator.absent = true;
+  watcher.OnDeviceRemoved(L"render-B"); legacy_b.OnDeviceRemoved(L"render-B");
+  Check(legacy_b.changed.exchange(false), "selected output removal retires fallback sink");
+  Check(route.Refresh(&enumerator, watcher.generation) == ++rendered,
+        "selected output removal reaches genuine no-endpoint state");
+  watcher.OnDeviceAdded(L"microphone-Z");
+  Check(route.Refresh(&enumerator, watcher.generation) == rendered,
+        "input arrival while no output exists does not reopen null sink");
+  enumerator.absent = false; enumerator.id = L"render-C";
+  watcher.OnDeviceAdded(L"render-C");
+  Check(route.Refresh(&enumerator, watcher.generation) == ++rendered,
+        "real output arrival recovers from no output");
+  DeviceEvents legacy_c({}, L"render-C");
+  enumerator.state = DEVICE_STATE_DISABLED;
+  watcher.OnDeviceStateChanged(L"render-C", DEVICE_STATE_DISABLED);
+  legacy_c.OnDeviceStateChanged(L"render-C", DEVICE_STATE_DISABLED);
+  Check(legacy_c.changed.exchange(false), "selected output disabled state retires fallback sink");
+  Check(route.Refresh(&enumerator, watcher.generation) == ++rendered,
+        "selected output becoming unavailable invalidates rendering");
+  enumerator.state = DEVICE_STATE_ACTIVE;
+  watcher.OnDeviceStateChanged(L"render-C", DEVICE_STATE_ACTIVE);
+  Check(route.Refresh(&enumerator, watcher.generation) == ++rendered,
+        "selected output reactivation recovers rendering");
+  enumerator.fail = true;
+  watcher.OnPropertyValueChanged(L"microphone-Z", property);
+  Check(route.Refresh(&enumerator, watcher.generation) == rendered,
+        "failed metadata enumeration is not proof to discard working output");
+  enumerator.fail = false;
+  const int before_same_route_recovery = enumerator.lookups;
+  Check(route.Refresh(&enumerator, watcher.generation) == rendered,
+        "same-generation recovered enumeration retains unchanged output");
+  Check(enumerator.lookups == before_same_route_recovery + 1,
+        "failed unchanged-output resolution is retried without another notification");
+  const int stable_lookups = enumerator.lookups;
+  for (int i = 0; i < 1000; ++i) route.Refresh(&enumerator, watcher.generation);
+  Check(enumerator.lookups == stable_lookups, "successful stable generation stays cached");
+
+  enumerator.id = L"render-D"; enumerator.fail = true;
+  watcher.OnDefaultDeviceChanged(eRender, eConsole, L"render-D");
+  Check(route.Refresh(&enumerator, watcher.generation) == rendered,
+        "temporary default-switch lookup failure preserves prior valid route");
+  enumerator.fail = false;
+  const int before_switch_recovery = enumerator.lookups;
+  Check(route.Refresh(&enumerator, watcher.generation) == ++rendered &&
+        enumerator.lookups == before_switch_recovery + 1,
+        "actual switch recovers at same notification generation");
+
+  enumerator.id = L"render-E"; enumerator.fail = true;
+  watcher.OnDefaultDeviceChanged(eRender, eConsole, L"render-E");
+  const int before_persistent_failure = enumerator.lookups;
+  Check(route.Refresh(&enumerator, watcher.generation) == rendered &&
+        route.Refresh(&enumerator, watcher.generation) == rendered,
+        "initial lookup and one prompt retry retain old output during errors");
+  for (int i = 0; i < 1000; ++i) route.Refresh(&enumerator, watcher.generation);
+  Check(enumerator.lookups == before_persistent_failure + 2,
+        "persistent error cannot cause unbounded immediate lookup retries");
+  fixture::route_clock_ms = 99;
+  route.Refresh(&enumerator, watcher.generation);
+  Check(enumerator.lookups == before_persistent_failure + 2, "retry waits for its 100ms deadline");
+  fixture::route_clock_ms = 100;
+  route.Refresh(&enumerator, watcher.generation);
+  Check(enumerator.lookups == before_persistent_failure + 3, "one bounded persistent-failure retry at deadline");
+  enumerator.fail = false;
+  fixture::route_clock_ms = 199;
+  Check(route.Refresh(&enumerator, watcher.generation) == rendered,
+        "old valid route remains usable during retry backoff");
+  fixture::route_clock_ms = 200;
+  Check(route.Refresh(&enumerator, watcher.generation) == ++rendered,
+        "persistent failure recovery needs no new notification");
+  const int after_persistent_recovery = enumerator.lookups;
+  fixture::route_clock_ms = 1000;
+  route.Refresh(&enumerator, watcher.generation);
+  Check(enumerator.lookups == after_persistent_recovery, "resolved retry retires its lookup schedule");
+
+  enumerator.absent = true;
+  watcher.OnDeviceRemoved(L"render-E");
+  Check(route.Refresh(&enumerator, watcher.generation) == ++rendered,
+        "no-endpoint HRESULT resolves the unavailable route rather than a transient error");
+  const int no_endpoint_lookups = enumerator.lookups;
+  for (int i = 0; i < 1000; ++i) route.Refresh(&enumerator, watcher.generation);
+  Check(enumerator.lookups == no_endpoint_lookups, "successful no-endpoint result is cached");
+  enumerator.absent = false; enumerator.id = L"render-F";
+  watcher.OnDeviceAdded(L"render-F");
+  Check(route.Refresh(&enumerator, watcher.generation) == ++rendered,
+        "new output arrival still invalidates a resolved no-endpoint state");
+  legacy_c.OnDefaultDeviceChanged(eRender, eConsole, nullptr);
+  Check(legacy_c.changed.exchange(false), "null default render route retires selected fallback sink");
+  std::printf("audio notifications: %d checks (actual callback/route classification; isolated enumeration)\n", checks);
+}

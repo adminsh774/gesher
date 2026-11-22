@@ -16,6 +16,9 @@ imports, parcel transport or protected content. Other ImageReader formats retain
 the existing direct CameraFrames delivery path. See the
 [Otzaria regression evidence](research/otzaria-imagereader-validation-2026-11-07.json).
 
+The demand-driven output lifecycle and validation limits are documented in
+[audio idle lifecycle](audio-idle-lifecycle.md).
+
 ## Pieces
 
 | Piece | Where |

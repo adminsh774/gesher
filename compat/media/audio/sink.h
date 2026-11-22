@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -33,12 +34,36 @@ class Sink {
   // Android type (AUDIO_DEVICE_OUT_SPEAKER, ..._WIRED_HEADPHONE, ...).
   virtual std::string DeviceName() const { return "Gesher audio output"; }
   virtual int DeviceType() const { return 0x2; }
+  // The persistent ID of the device actually opened, not its friendly name.
+  // Software/no-endpoint sinks have an empty ID. Successful WASAPI opens must
+  // establish this identity before rendering, so route reconciliation is exact.
+  virtual const std::wstring& EndpointId() const {
+    static const std::wstring none;
+    return none;
+  }
   // One period: pull what the output needs now. Returns false when the
   // output is gone (the device was removed); the engine then opens another.
   virtual bool Tick(Mixer* mixer) = 0;
+  // Called on the mixer thread at a demand transition. Idle stops rendering
+  // and releases real-time scheduling; resuming must not consume new samples
+  // for the wall-clock time spent idle.
+  virtual void SetIdle(bool) {}
   // The shared stream volumes changed (shared_state.h).
   virtual void OnVolumesChanged() {}
 };
+
+// Notifications remain registered while no render thread is running. A null
+// watcher means discovery failed: callers must not cache metadata indefinitely.
+class OutputDeviceWatcher {
+ public:
+  virtual ~OutputDeviceWatcher() = default;
+  virtual uint64_t generation() const = 0;
+  // Called only on the renderer: refresh the actual selected render endpoint
+  // outside MMDevice callbacks. Metadata changes alone must not retire a sink.
+  virtual uint64_t render_generation() = 0;
+  virtual bool matches_render_endpoint(const std::wstring& id) const = 0;
+};
+std::unique_ptr<OutputDeviceWatcher> WatchOutputDevices(std::function<void()> wake);
 
 // WASAPI shared mode on the default render endpoint; null with `error` set
 // when there is none or it fails.

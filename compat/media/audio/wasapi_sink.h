@@ -72,7 +72,9 @@ class WasapiAudioSink : public Sink {
   std::string Describe() const override;
   std::string DeviceName() const override { return device_name_; }
   int DeviceType() const override { return device_type_; }
+  const std::wstring& EndpointId() const override { return device_id_; }
   bool Tick(Mixer* mixer) override;
+  void SetIdle(bool idle) override;
   void OnVolumesChanged() override;
 
   // Playback control
@@ -106,6 +108,7 @@ class WasapiAudioSink : public Sink {
 
  private:
   void FeedLoop();
+  void Fail();
   bool InitAudioClient(std::string* error);
   void ReadDeviceProperties();
   void ApplyVolume();
@@ -113,6 +116,7 @@ class WasapiAudioSink : public Sink {
   WasapiSinkParams params_;
   std::u16string app_name_;
   std::string device_name_ = "Windows Default Audio Output";
+  std::wstring device_id_;
   int device_type_ = 0x2;
 
   uint32_t rate_ = 48000;
@@ -126,6 +130,7 @@ class WasapiAudioSink : public Sink {
   bool using_client3_ = false;
   std::atomic<bool> running_{false};
   std::atomic<bool> quit_{false};
+  std::atomic<bool> failed_{false};
 
   IMMDeviceEnumerator* enumerator_ = nullptr;
   IMMDevice* device_ = nullptr;
@@ -136,7 +141,11 @@ class WasapiAudioSink : public Sink {
 
   HANDLE buffer_event_ = nullptr;
   HANDLE stop_event_ = nullptr;
+  HANDLE control_event_ = nullptr;
   std::thread feeder_thread_;
+  // Serialize Stop/Reset with a feeder's GetBuffer/ReleaseBuffer pair. Never
+  // acquire this mutex while holding ring_mu_ or opensl_mu_.
+  std::mutex client_mu_;
 
   WAVEFORMATEXTENSIBLE format_ext_ = {};
   WAVEFORMATEX format_ex_ = {};

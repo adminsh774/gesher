@@ -97,6 +97,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Audio demand lifecycle with real Win32 events and timers
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: python tools/test_audio_idle_contracts.py
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -304,6 +308,7 @@ jobs:
 
       - name: Timer, DNS and media lifetime contracts
         run: |
+          python3 tools/test_audio_idle_contracts.py --sanitize
           python3 tools/test_clock_domains.py --sanitize
           python3 tools/test_boottime_resume.py --sanitize
           python3 tools/test_timerfd_contracts.py --sanitize

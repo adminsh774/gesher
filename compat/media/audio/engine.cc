@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <system_error>
 #include <thread>
 
 #include "log.h"
@@ -184,11 +185,25 @@ class Engine : public Mixer {
     return engine;
   }
 
-  void Add(const std::shared_ptr<Track>& t) {
+  bool Add(const std::shared_ptr<Track>& t) {
     std::lock_guard<std::mutex> lock(mu_);
+    if (wake_ == nullptr) return false;
+    if (!started_) {
+      try {
+        std::thread([this] { Run(); }).detach();
+      } catch (const std::system_error&) {
+        return false;
+      }
+      started_ = true;
+    }
     tracks_.push_back(t);
-    StartLocked();
+    Wake();
+    return true;
   }
+
+  // Called with Track::mu_ held and from MMDevice notification callbacks.
+  // Never take mu_ here: GroupWanted takes the locks in the other order.
+  void Wake() { if (wake_ != nullptr) SetEvent(wake_); }
 
   void Remove(Track* t) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -198,6 +213,7 @@ class Engine : public Mixer {
                                    return s == nullptr || s.get() == t;
                                  }),
                   tracks_.end());
+    Wake();
   }
 
   void Post(std::function<void()> fn) {
@@ -213,9 +229,27 @@ class Engine : public Mixer {
   }
 
   OutputInfo Info() {
-    std::unique_lock<std::mutex> lock(mu_);
-    StartLocked();
-    ready_cv_.wait(lock, [this] { return ready_; });
+    EnsureWatcher();
+    std::lock_guard<std::mutex> lock(info_mu_);
+    const uint64_t device_generation = DeviceGeneration();
+    if (ready_ && watcher_ != nullptr && info_device_generation_ == device_generation) return info_;
+
+    // Discovery can initialize an unstarted WASAPI client to obtain its actual
+    // buffer/latency, but never starts the mixer, feeder or a capture file.
+    const wchar_t* capture = _wgetenv(L"GESHER_AUDIO_CAPTURE");
+    if (capture != nullptr && *capture != 0) {
+      SetOutputInfo({48000, 2, 480, 960, "capture configured (not opened)",
+                     "Gesher audio capture", 0x2, 0});
+    } else {
+      const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      auto probe = OpenSink(false);
+      SetInfo(probe.get());
+      probe.reset();
+      if (SUCCEEDED(initialized)) CoUninitialize();
+    }
+    ready_ = true;
+    // A notification during discovery deliberately leaves this entry stale.
+    info_device_generation_ = device_generation;
     return info_;
   }
 
@@ -224,12 +258,11 @@ class Engine : public Mixer {
     app_name_ = name;
   }
 
-  uint32_t latency_frames() const { return latency_frames_.load(); }
-  uint32_t out_rate() const { return out_rate_.load(); }
+  OutputTiming output_timing() const { return output_timing_.load(); }
 
   // Mixer.
   bool MixGroup(int group, float* out, size_t frames) override {
-    uint32_t ch = info_.channels;
+    uint32_t ch = render_channels_;
     std::fill(out, out + frames * ch, 0.0f);
     std::vector<std::shared_ptr<Track>> tracks;
     {
@@ -241,7 +274,7 @@ class Engine : public Mixer {
     }
     bool played = false;
     for (auto& t : tracks) {
-      if (t->MixInto(out, frames, info_.sample_rate, ch)) {
+      if (t->MixInto(out, frames, render_rate_, ch)) {
         played = true;
         group_last_ms_[group] = GetTickCount64();
         MarkStreamActive(t->params().stream_type, GetTickCount64() + 50);
@@ -255,7 +288,8 @@ class Engine : public Mixer {
   }
 
   bool GroupWanted(int group) override {
-    if (GetTickCount64() < group_last_ms_[group] + 1000) return true;
+    const uint64_t last = group_last_ms_[group];
+    if (last != 0 && GetTickCount64() - last < 1000) return true;
     std::lock_guard<std::mutex> lock(mu_);
     for (auto& w : tracks_) {
       auto t = w.lock();
@@ -267,12 +301,22 @@ class Engine : public Mixer {
   }
 
  private:
-  Engine() = default;
+  Engine() : wake_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
 
-  void StartLocked() {
-    if (started_) return;
-    started_ = true;
-    std::thread([this] { Run(); }).detach();
+  void EnsureWatcher() {
+    std::call_once(watcher_once_, [this] {
+      watcher_ = WatchOutputDevices([this] { Wake(); });
+    });
+  }
+
+  uint64_t DeviceGeneration() const { return watcher_ ? watcher_->generation() : 0; }
+  uint64_t RenderGeneration() { return watcher_ ? watcher_->render_generation() : 0; }
+
+  bool Wanted() {
+    for (int group = 0; group < kNumGroups; ++group) {
+      if (GroupWanted(group)) return true;
+    }
+    return false;
   }
 
   std::unique_ptr<Sink> OpenSink(bool first) {
@@ -292,15 +336,14 @@ class Engine : public Mixer {
     }
     auto s = OpenWasapiSink(name, &error);
     if (s != nullptr) return s;
-    if (first || error != last_error_) MEDIA_LOGW("audio output: %s", error.c_str());
-    last_error_ = error;
+    if (first) MEDIA_LOGW("audio output: %s", error.c_str());
     return OpenNullSink(error);
   }
 
   void Run() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    std::unique_ptr<Sink> sink = OpenSink(true);
+    EnsureWatcher();
+    std::unique_ptr<Sink> sink;
     bool wasapi_wanted = true;
     {
       const wchar_t* capture = _wgetenv(L"GESHER_AUDIO_CAPTURE");
@@ -309,30 +352,76 @@ class Engine : public Mixer {
         wasapi_wanted = false;
       }
     }
-    PublishInfo(sink.get());
-    MEDIA_LOGI("audio output: %s", sink->Describe().c_str());
-
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                           TIMER_ALL_ACCESS);
     if (timer == nullptr) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     LARGE_INTEGER due;
     due.QuadPart = -static_cast<LONGLONG>(kPeriodMs) * 10000;
-    SetWaitableTimer(timer, &due, kPeriodMs, nullptr, nullptr, FALSE);
-
     uint32_t generation = Generation() - 1;
-    uint64_t last_retry = GetTickCount64();
-    bool null_sink = sink->Describe().rfind("none", 0) == 0;
+    uint64_t last_retry = 0;
+    uint64_t sink_generation = 0;
+    uint64_t next_tick_ms = 0;
+    bool null_sink = false;
+    bool active = false;
+    bool armed = false;
+    bool tick = false;
     for (;;) {
-      WaitForSingleObject(timer, 100);
+      const bool wanted = Wanted();
+      if (!wanted) {
+        if (active) {
+          sink->SetIdle(true);
+          if (armed) CancelWaitableTimer(timer);
+          armed = false;
+          active = false;
+          SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+        }
+        // The auto-reset event retains a start/write/route signal even if it
+        // arrives between Wanted() and this wait. There is no idle timeout.
+        WaitForSingleObject(wake_, INFINITE);
+        tick = false;
+        continue;
+      }
+
+      const uint64_t render_generation = RenderGeneration();
+      bool replace = sink == nullptr;
+      if (!replace && wasapi_wanted && sink_generation != render_generation) {
+        // Discovery and opening are separate operations. Learning an initially
+        // unknown route, or catching up with a switch during OpenSink, must not
+        // discard a client already bound to that exact endpoint and its queue.
+        replace = !watcher_->matches_render_endpoint(sink->EndpointId());
+        sink_generation = render_generation;
+      }
+      if (replace) {
+        const uint64_t device_generation = DeviceGeneration();
+        sink = OpenSink(true);
+        sink_generation = render_generation;
+        null_sink = sink->Describe().rfind("none", 0) == 0;
+        PublishInfo(sink.get(), device_generation);
+        sink->OnVolumesChanged();
+        tick = true;
+        last_retry = GetTickCount64();
+        MEDIA_LOGI("audio output: %s", sink->Describe().c_str());
+      }
+      if (!active) {
+        sink->SetIdle(false);
+        active = true;
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        armed = timer != nullptr && SetWaitableTimer(timer, &due, kPeriodMs, nullptr, nullptr, FALSE);
+        next_tick_ms = GetTickCount64() + kPeriodMs;
+        tick = true;
+      }
+
       uint32_t g = Generation();
       if (g != generation) {
         generation = g;
         sink->OnVolumesChanged();
       }
-      bool ok = sink->Tick(this);
+      bool ok = !tick || sink->Tick(this);
       uint64_t now = GetTickCount64();
       if (!ok || (null_sink && wasapi_wanted && now - last_retry > 5000)) {
         last_retry = now;
+        const uint64_t next_render_generation = RenderGeneration();
+        const uint64_t next_generation = DeviceGeneration();
         auto next = OpenSink(false);
         bool next_null = next->Describe().rfind("none", 0) == 0;
         if (!ok || !next_null) {
@@ -340,28 +429,54 @@ class Engine : public Mixer {
           // keep their positions; the resamplers follow the new rate.
           sink = std::move(next);
           null_sink = next_null;
-          PublishInfo(sink.get());
+          sink_generation = next_render_generation;
+          PublishInfo(sink.get(), next_generation);
           MEDIA_LOGI("audio output: %s", sink->Describe().c_str());
           sink->OnVolumesChanged();
         }
       }
+
+      // Control events re-evaluate demand without advancing the audio clock.
+      // A ready timer wins over frequent writes, so they cannot starve mixing.
+      if (armed) {
+        HANDLE waits[] = {timer, wake_};
+        tick = WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0;
+      } else {
+        const uint64_t before = GetTickCount64();
+        const DWORD delay = before >= next_tick_ms ? 0 : static_cast<DWORD>(next_tick_ms - before);
+        WaitForSingleObject(wake_, delay);
+        const uint64_t after = GetTickCount64();
+        tick = after >= next_tick_ms;
+        if (tick) next_tick_ms = after + kPeriodMs;
+      }
     }
   }
 
-  void PublishInfo(Sink* sink) {
-    std::lock_guard<std::mutex> lock(mu_);
-    info_.sample_rate = sink->rate();
-    info_.channels = sink->channels();
-    info_.period_frames = sink->rate() * kPeriodMs / 1000;
-    info_.latency_frames = sink->latency_frames();
-    info_.description = sink->Describe();
-    info_.device_name = sink->DeviceName();
-    info_.device_type = sink->DeviceType();
-    info_.generation++;
-    latency_frames_ = sink->latency_frames();
-    out_rate_ = sink->rate();
+  void SetInfo(Sink* sink) {
+    SetOutputInfo({sink->rate(), sink->channels(), sink->rate() * kPeriodMs / 1000,
+                   sink->latency_frames(), sink->Describe(), sink->DeviceName(),
+                   sink->DeviceType(), 0});
+  }
+
+  void SetOutputInfo(OutputInfo next) {
+    const bool changed = !ready_ || next.sample_rate != info_.sample_rate ||
+        next.channels != info_.channels || next.period_frames != info_.period_frames ||
+        next.latency_frames != info_.latency_frames || next.description != info_.description ||
+        next.device_name != info_.device_name || next.device_type != info_.device_type;
+    // AudioManager reads ports and patches separately until generations match.
+    // Re-probing without notifications must not change a stable port forever.
+    next.generation = info_.generation + (changed ? 1 : 0);
+    info_ = std::move(next);
+    output_timing_ = OutputTiming{info_.sample_rate, info_.latency_frames};
+  }
+
+  void PublishInfo(Sink* sink, uint64_t device_generation) {
+    std::lock_guard<std::mutex> lock(info_mu_);
+    SetInfo(sink);
+    info_device_generation_ = device_generation;
+    render_rate_ = sink->rate();
+    render_channels_ = sink->channels();
     ready_ = true;
-    ready_cv_.notify_all();
   }
 
   void EventLoop() {
@@ -380,15 +495,19 @@ class Engine : public Mixer {
   static constexpr uint32_t kPeriodMs = 10;
 
   std::mutex mu_;
-  std::condition_variable ready_cv_;
+  const HANDLE wake_;
   bool started_ = false;
+  std::once_flag watcher_once_;
+  std::unique_ptr<OutputDeviceWatcher> watcher_;
+  std::mutex info_mu_;
   bool ready_ = false;
+  uint64_t info_device_generation_ = 0;
   OutputInfo info_{48000, 2, 480, 0, "", "", 0x2, 0};
+  uint32_t render_rate_ = 48000;
+  uint32_t render_channels_ = 2;
   std::vector<std::weak_ptr<Track>> tracks_;
   std::u16string app_name_;
-  std::string last_error_;
-  std::atomic<uint32_t> latency_frames_{0};
-  std::atomic<uint32_t> out_rate_{48000};
+  std::atomic<OutputTiming> output_timing_{OutputTiming{48000, 0}};
   std::atomic<uint64_t> group_last_ms_[kNumGroups] = {};
 
   std::mutex ev_mu_;
@@ -426,7 +545,10 @@ std::shared_ptr<Track> CreateTrack(const TrackParams& params, std::string* error
     return nullptr;
   }
   std::shared_ptr<Track> t(new Track(Engine::Get(), params));
-  Engine::Get()->Add(t);
+  if (!Engine::Get()->Add(t)) {
+    if (error != nullptr) *error = "cannot create audio mixer wake event/thread";
+    return nullptr;
+  }
   return t;
 }
 
@@ -440,7 +562,7 @@ Track::Track(Engine* engine, const TrackParams& params)
   buffer_frames_ = params.capacity_frames;
 }
 
-Track::~Track() = default;
+Track::~Track() { engine_->Wake(); }
 
 void Track::SetEvents(TrackEvents events) {
   std::lock_guard<std::mutex> lock(mu_);
@@ -474,6 +596,7 @@ int Track::Start() {
   drained_ = false;
   was_underrun_ = false;
   end_signalled_ = false;
+  engine_->Wake();
   room_.notify_all();
   return kOk;
 }
@@ -485,6 +608,7 @@ void Track::Pause() {
     ++write_interrupt_;
   }
   room_.notify_all();
+  engine_->Wake();
 }
 
 void Track::Stop() {
@@ -512,6 +636,7 @@ void Track::Stop() {
     rs_->Reset();
   }
   room_.notify_all();
+  engine_->Wake();
 }
 
 void Track::Flush() {
@@ -527,6 +652,7 @@ void Track::Flush() {
   next_update_ = 0;
   if (state_ == State::kStopping) state_ = State::kStopped;
   room_.notify_all();
+  engine_->Wake();
 }
 
 Track::State Track::state() const {
@@ -549,6 +675,7 @@ ssize_t Track::Write(const void* data, size_t bytes, bool blocking) {
     memcpy(data_.data(), src, n * frame_size_);
     static_frames_ = n;
     static_pos_ = 0;
+    if (state_ == State::kPlaying) engine_->Wake();
     return static_cast<ssize_t>(n * frame_size_);
   }
   size_t done = 0;
@@ -576,6 +703,7 @@ ssize_t Track::Write(const void* data, size_t bytes, bool blocking) {
     }
     written_ += n;
     done += n;
+    if (queued == 0 && state_ == State::kPlaying) engine_->Wake();
   }
   return static_cast<ssize_t>(done * frame_size_);
 }
@@ -630,9 +758,9 @@ bool Track::Timestamp(int64_t* frames, int64_t* time_ns) const {
   if (played_time_ns_ == 0) return false;
   *frames = static_cast<int64_t>(played_ - position_base_);
   // What was mixed last is heard after the sink's latency.
-  uint32_t out_rate = engine_->out_rate();
+  const OutputTiming timing = engine_->output_timing();
   *time_ns = played_time_ns_ +
-             (out_rate != 0 ? static_cast<int64_t>(engine_->latency_frames()) * 1000000000 / out_rate
+             (timing.sample_rate != 0 ? static_cast<int64_t>(timing.latency_frames) * 1000000000 / timing.sample_rate
                             : 0);
   return true;
 }
@@ -666,12 +794,14 @@ void Track::SetVolume(float left, float right) {
   std::lock_guard<std::mutex> lock(mu_);
   vol_left_ = std::clamp(left, 0.0f, 1.0f);
   vol_right_ = std::clamp(right, 0.0f, 1.0f);
+  engine_->Wake();
 }
 
 int Track::SetSampleRate(uint32_t rate) {
   std::lock_guard<std::mutex> lock(mu_);
   if (rate == 0 || rate > params_.sample_rate * 2 * 8) return kBadValue;
   rate_ = rate;
+  engine_->Wake();
   return kOk;
 }
 
@@ -683,6 +813,7 @@ uint32_t Track::sample_rate() const {
 void Track::SetSpeed(float speed) {
   std::lock_guard<std::mutex> lock(mu_);
   speed_ = std::clamp(speed, 0.01f, 16.0f);
+  engine_->Wake();
 }
 
 float Track::speed() const {
@@ -714,8 +845,9 @@ uint32_t Track::underrun_count() const {
 }
 
 uint32_t Track::LatencyMs() const {
-  uint32_t out_rate = engine_->out_rate();
-  uint32_t sink_ms = out_rate != 0 ? engine_->latency_frames() * 1000 / out_rate : 0;
+  const OutputTiming timing = engine_->output_timing();
+  uint32_t sink_ms = timing.sample_rate != 0
+      ? static_cast<uint32_t>(static_cast<uint64_t>(timing.latency_frames) * 1000 / timing.sample_rate) : 0;
   std::lock_guard<std::mutex> lock(mu_);
   uint32_t buffer_ms =
       params_.is_static ? 0 : static_cast<uint32_t>(buffer_frames_ * 1000 / std::max(rate_, 1u));
