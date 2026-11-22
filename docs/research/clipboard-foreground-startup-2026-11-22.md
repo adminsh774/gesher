@@ -61,3 +61,33 @@ Local LLVM-MinGW compilation and PowerShell parsing validate buildability and
 syntax only. Actual HWND, process-lifecycle, foreground and application behavior
 must be established by the Windows gates; local cross-compilation is not a
 Windows execution result.
+
+## Follow-up: visible foreground retirement
+
+The first PR run, [44979479728, Windows 2025 windowing job
+137079790085](https://github.com/gesher-runtime/gesher/actions/runs/44979479728/job/137079790085),
+reached the actual foreign foreground/clipboard-denial probe successfully, then
+failed its first helper's 10-second retirement bound. Its captured native phases
+ended at `receipt_ready`, with no `stop_received` or native error. The other
+three invocations retired normally, and both short host gates passed. This is
+a teardown failure after successful foreground/denial evidence; the logs do
+not identify a blocked Windows API or conclusively prove a modal loop caused it.
+
+The first helper used `DefWindowProc` directly. The shared foreground routine
+sends an Alt press/release. Windows documents that [Alt release can generate
+`SC_KEYMENU`](https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-syskeyup),
+and that [menu processing enters a modal
+loop](https://learn.microsoft.com/en-us/windows/win32/menurc/wm-entermenuloop).
+Such nested processing can bypass this fixture's outer-loop stop/parent checks.
+The actor now declines menu/move/size system commands and context menus; it
+needs only a real visible foreground HWND, and still uses normal Windows
+processing for its remaining messages, including the negative `WM_CLOSE` case.
+
+The short gate now foregrounds an actual owned HWND using the same shared
+Alt-assisted routine, sends real Alt input and each menu/move/size system
+command, requires the native command to return within one second, then requires
+normal retirement within the original 10-second bound. It checks retained
+foreground identity, HWND removal, and native command/stop/cleanup phases.
+The full application assertions and all startup/retirement bounds are unchanged.
+This covers a concrete nested-loop hazard; only the new Windows execution can
+establish whether the observed CI failure is resolved.

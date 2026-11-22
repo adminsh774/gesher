@@ -36,6 +36,8 @@ public static class NativeForegroundChecks {
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr window);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
   [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr window, uint message, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr window, int command);
+  [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SendMessageTimeoutW(IntPtr window, uint message, UIntPtr w, IntPtr l, uint flags, uint timeout, out UIntPtr result);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
   [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr process, out FileTime created, out FileTime exited, out FileTime kernel, out FileTime user);
   public static uint Owner(IntPtr window) { uint pid; GetWindowThreadProcessId(window, out pid); return pid; }
@@ -44,8 +46,14 @@ public static class NativeForegroundChecks {
     if (!GetProcessTimes(process.Handle, out c, out e, out k, out u)) throw new InvalidOperationException("GetProcessTimes failed");
     return ((ulong)c.High << 32) | c.Low;
   }
+  public static bool SystemCommand(IntPtr window, uint command, int argument) {
+    UIntPtr result;
+    return SendMessageTimeoutW(window, 0x112, new UIntPtr(command), new IntPtr(argument),
+        3 /* SMTO_BLOCK | SMTO_ABORTIFHUNG */, 1000, out result) != IntPtr.Zero;
+  }
 }
 '@
+Add-Type -Path "$PSScriptRoot/../ime/ImeInput.cs"
 
 $checks = 0
 function Assert-Foreground([bool] $Okay, [string] $Reason) {
@@ -97,6 +105,35 @@ for ($iteration = 0; $iteration -lt 4; $iteration++) {
   Assert-Foreground (-not [NativeForegroundChecks]::IsWindow($window)) 'Owned HWND survived normal retirement'
   $stdout = Get-Content -LiteralPath (Join-Path $folder 'stdout.log') -Raw
   Assert-Foreground ($stdout -match 'phase=receipt_ready' -and $stdout -match 'phase=window_destroyed' -and $stdout -match 'phase=class_unregistered' -and $stdout -match 'phase=complete') 'Missing native setup/cleanup evidence'
+}
+
+# The application test really foregrounds the window through an Alt-assisted
+# helper. A default window procedure can then enter a nested menu/move/size loop
+# and stop checking its outer-loop stop file. Exercise each command on an actual
+# visible foreground HWND, require the synchronous command to return promptly,
+# then require the same unchanged graceful-retirement bound and cleanup phases.
+foreach ($command in @(0xF100, 0xF090, 0xF010, 0xF000)) {
+  $folder = Join-Path $root "foreground-modal-$command"
+  [void][IO.Directory]::CreateDirectory($folder)
+  $receiptPath = Join-Path $folder 'window.json'
+  $helper = Start-GesherForegroundHelper $Executable $receiptPath (Join-Path $folder 'stop') $folder
+  $window = [IntPtr]::Zero
+  try {
+    $receipt = Wait-ForegroundReceipt $helper $receiptPath
+    $window = [IntPtr][long]$receipt.hwnd
+    Assert-Foreground ([NativeForegroundChecks]::Generation($helper.Process) -eq [ulong]$receipt.created -and [NativeForegroundChecks]::Owner($window) -eq $helper.Process.Id) 'Modal control must use the owned HWND generation'
+    [void][NativeForegroundChecks]::ShowWindowAsync($window, 5)
+    Assert-Foreground ([ImeInput]::Foreground($window) -and [NativeForegroundChecks]::IsWindowVisible($window)) 'Modal control needs the actual visible native foreground'
+    Assert-Foreground ([ImeInput]::Keys([ushort]0x12) -eq 2) 'Could not send real Alt press/release to the owned foreground'
+    # Space requests the actual system menu for SC_KEYMENU. The other commands
+    # normally start mouse menu/moving/sizing modal processing in DefWindowProc.
+    Assert-Foreground ([NativeForegroundChecks]::SystemCommand($window, $command, 32)) "System command $command entered a blocking modal loop"
+    Assert-Foreground ([ImeInput]::GetForegroundWindow() -eq $window -and -not $helper.Process.HasExited) 'Modal command changed owned foreground or process liveness'
+  } finally { $problems = @(Stop-GesherForegroundHelper $helper) }
+  Assert-Foreground ($problems.Count -eq 0) "Foreground/modal retirement failed: $problems"
+  Assert-Foreground (-not [NativeForegroundChecks]::IsWindow($window)) 'Modal control HWND survived retirement'
+  $stdout = Get-Content -LiteralPath (Join-Path $folder 'stdout.log') -Raw
+  Assert-Foreground ($stdout -match 'phase=modal_command_ignored' -and $stdout -match 'phase=stop_received' -and $stdout -match 'phase=window_destroyed' -and $stdout -match 'phase=complete') 'Missing modal-command/normal-retirement evidence'
 }
 
 # A live sentinel models a PID reused after a stale receipt was written. The
