@@ -160,6 +160,30 @@ foreground-admission host step actually executing, as well as the Windows/ART
 fixture and notification integration gates; a green run that omits the step is
 not evidence for this regression.
 
+### Integration after main's native/runtime update
+
+Main advanced to `1a3a5c244d643c7c93b621326857c6b8c858d5bb` while the PR was
+under validation. Integrating that main commit preserves all of its native,
+compiler, cancellation-receipt, CI and source-security changes. The only merge
+conflict was the immutable framework recipe pin. Main's recipe at `8b316aeb`
+and its checked-in `framework.yml` have the same blob
+`b84c63efb79aea8f97f484c9ac206921ac3c4627`; the retained reviewed `71ccbb7`
+recipe is exactly that file plus this round's foreground-admission step.
+
+Post-integration local verification rebuilt the complete application Java/DEX
+output and reran the production host fixture: 173 checks passed. CI YAML parsing,
+the six cache-policy tests and the diff check against current main passed.
+Structural comparison retains every other upstream-changed path byte-for-byte
+and leaves this round's production and fixture source unchanged.
+
+Before integration, exact head `b91a67213eb77fa0636ffad6a636441898b7a7f8`
+completed CI run `45020605907`: 74 successful jobs, six expected skips and the
+successful `ci-required` aggregate. The Linux 173-check gate and both Windows
+foreground-admission/notification fixtures actually passed. Those results
+qualify that prior source combination; the integrated head requires fresh CI.
+After another parallel permission PR merges, its additional framework gates
+must also be retained in a reviewed immutable recipe.
+
 ## Remaining F06 work and qualification limits
 
 - Type-specific runtime grants, AppOps, current while-in-use eligibility,
