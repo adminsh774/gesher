@@ -12,13 +12,22 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <cstdio>
 using namespace std::chrono_literals;
 namespace idle_test {
 inline std::atomic<int> armed_timers{0}, critical_threads{0}, wait_returns{0};
+inline std::atomic<int> thread_attempts{0}, thread_handles{0};
+inline std::atomic<bool> fail_next_thread{false};
 inline std::mutex hook_mu;
 inline std::function<void()> idle_hook;
+inline std::function<void()> thread_return_hook;
+inline void BeforeThreadReturn() {
+  std::function<void()> hook;
+  { std::lock_guard<std::mutex> lock(hook_mu); hook = std::move(thread_return_hook); }
+  if (hook) hook();
+}
 inline void BeforeIdleWait() {
   std::function<void()> hook;
   { std::lock_guard<std::mutex> lock(hook_mu); hook = std::move(idle_hook); }
@@ -33,6 +42,29 @@ using clockid_t = int;
 #ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC 1
 #endif
+namespace idle_test {
+inline std::mutex thread_handles_mu;
+inline std::unordered_set<HANDLE> owned_threads;
+}
+inline HANDLE TestCreateThread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack,
+                               LPTHREAD_START_ROUTINE start, LPVOID arg, DWORD flags, LPDWORD id) {
+  ++idle_test::thread_attempts;
+  if (idle_test::fail_next_thread.exchange(false)) return nullptr;
+  HANDLE thread = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(idle_test::thread_handles_mu);
+    thread = ::CreateThread(attributes, stack, start, arg, flags, id);
+    if (thread != nullptr) { idle_test::owned_threads.insert(thread); ++idle_test::thread_handles; }
+  }
+  if (thread != nullptr) idle_test::BeforeThreadReturn();
+  return thread;
+}
+inline BOOL TestCloseHandle(HANDLE handle) {
+  std::lock_guard<std::mutex> lock(idle_test::thread_handles_mu);
+  const BOOL closed = ::CloseHandle(handle);
+  if (closed && idle_test::owned_threads.erase(handle) != 0) --idle_test::thread_handles;
+  return closed;
+}
 inline HANDLE TestCreateEventW(LPSECURITY_ATTRIBUTES attributes, BOOL manual, BOOL initial, LPCWSTR name) {
   if (std::getenv("GESHER_TEST_EVENT_FAILURE")) return nullptr;
   return ::CreateEventW(attributes, manual, initial, name);
@@ -82,6 +114,8 @@ inline BOOL TestSetThreadPriority(HANDLE h, int value) {
 #define SetWaitableTimer TestSetWaitableTimer
 #define CancelWaitableTimer TestCancelWaitableTimer
 #define SetThreadPriority TestSetThreadPriority
+#define CreateThread TestCreateThread
+#define CloseHandle TestCloseHandle
 #else
 using DWORD = uint32_t;
 using BOOL = int;
@@ -98,6 +132,7 @@ inline HRESULT CoInitializeEx(void*, int) { return 0; }
 inline void CoUninitialize() {}
 struct TestHandle {
   bool manual = false, signaled = false, timer = false, armed = false;
+  bool thread = false, closed = false;
   int period = 0;
   std::chrono::steady_clock::time_point due;
 };
@@ -119,6 +154,22 @@ inline HANDLE CreateEventW(void*, BOOL manual, BOOL initial, void*) {
 inline BOOL SetEvent(HANDLE h) {
   { std::lock_guard<std::mutex> lock(idle_test::waits_mu); h->signaled = true; }
   idle_test::waits_cv.notify_all(); return TRUE;
+}
+inline HANDLE CreateThread(void*, size_t, DWORD (*start)(void*), void* arg, DWORD, DWORD*) {
+  ++idle_test::thread_attempts;
+  if (idle_test::fail_next_thread.exchange(false)) return nullptr;
+  HANDLE thread = NewTestHandle(); thread->manual = true; thread->thread = true;
+  ++idle_test::thread_handles;
+  std::thread([=] { start(arg); SetEvent(thread); }).detach();
+  idle_test::BeforeThreadReturn();
+  return thread;
+}
+inline BOOL CloseHandle(HANDLE handle) {
+  std::lock_guard<std::mutex> lock(idle_test::waits_mu);
+  if (handle == nullptr || handle->closed) return FALSE;
+  handle->closed = true;
+  if (handle->thread) --idle_test::thread_handles;
+  return TRUE;
 }
 inline HANDLE CreateWaitableTimerExW(void*, void*, int, int) {
   if (std::getenv("GESHER_TEST_TIMER_FAILURE")) return nullptr;

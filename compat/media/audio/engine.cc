@@ -11,7 +11,6 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
-#include <system_error>
 #include <thread>
 
 #include "log.h"
@@ -189,11 +188,14 @@ class Engine : public Mixer {
     std::lock_guard<std::mutex> lock(mu_);
     if (wake_ == nullptr) return false;
     if (!started_) {
-      try {
-        std::thread([this] { Run(); }).detach();
-      } catch (const std::system_error&) {
-        return false;
-      }
+      // Production disables C++ exceptions. Match the audio capture backend's
+      // explicit Win32 failure path; the process-lifetime mixer is detached.
+      HANDLE worker = CreateThread(nullptr, 0, [](void* value) -> DWORD {
+        static_cast<Engine*>(value)->Run();
+        return 0;
+      }, this, 0, nullptr);
+      if (worker == nullptr) return false;
+      CloseHandle(worker);
       started_ = true;
     }
     tracks_.push_back(t);

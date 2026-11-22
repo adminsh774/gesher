@@ -21,8 +21,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <system_error>
-#include <thread>
 #include <vector>
 
 #include "log.h"
@@ -335,15 +333,27 @@ bool WasapiAudioSink::InitAudioClient(std::string* error) {
 }
 
 void WasapiAudioSink::Close() {
+  HANDLE feeder = nullptr;
   {
-    std::lock_guard<std::mutex> lock(ring_mu_);
-    quit_ = true;
+    // Serialize ownership with Start, then release client_mu_ before joining:
+    // the feeder may still need it to finish an outstanding render buffer.
+    std::lock_guard<std::mutex> client_lock(client_mu_);
+    {
+      std::lock_guard<std::mutex> ring_lock(ring_mu_);
+      quit_ = true;
+    }
+    if (stop_event_ != nullptr) SetEvent(stop_event_);
+    feeder = feeder_thread_;
   }
-  if (stop_event_ != nullptr) SetEvent(stop_event_);
   ring_cv_.notify_all();
 
-  if (feeder_thread_.joinable()) feeder_thread_.join();
+  if (feeder != nullptr) WaitForSingleObject(feeder, INFINITE);
 
+  std::lock_guard<std::mutex> client_lock(client_mu_);
+  if (feeder_thread_ != nullptr) {
+    CloseHandle(feeder_thread_);
+    feeder_thread_ = nullptr;
+  }
   if (client_ != nullptr && running_) client_->Stop();
   running_ = false;
 
@@ -389,10 +399,12 @@ bool WasapiAudioSink::Start() {
   std::lock_guard<std::mutex> lock(client_mu_);
   if (client_ == nullptr || quit_ || failed_) return false;
   if (running_) return true;
-  if (!feeder_thread_.joinable()) {
-    try {
-      feeder_thread_ = std::thread(&WasapiAudioSink::FeedLoop, this);
-    } catch (const std::system_error&) {
+  if (feeder_thread_ == nullptr) {
+    feeder_thread_ = CreateThread(nullptr, 0, [](void* value) -> DWORD {
+      static_cast<WasapiAudioSink*>(value)->FeedLoop();
+      return 0;
+    }, this, 0, nullptr);
+    if (feeder_thread_ == nullptr) {
       Fail();
       return false;
     }

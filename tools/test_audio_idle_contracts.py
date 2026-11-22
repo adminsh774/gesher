@@ -149,7 +149,7 @@ def main() -> int:
                         '/D_USE_MATH_DEFINES', '/DNOMINMAX', '/D_CRT_SECURE_NO_WARNINGS', '/wd4100', '/wd4244', '/wd4267', '/I' + str(ROOT / 'tests/media'),
                         str(src), '/Fe:' + str(exe), 'ole32.lib', 'uuid.lib']
         else:
-            command += ['-std=c++20', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-pthread',
+            command += ['-std=c++20', '-O1', '-g', '-fno-exceptions', '-Wall', '-Wextra', '-Werror', '-pthread',
                         '-Wno-unused-const-variable',
                         '-I' + str(ROOT / 'tests/media'), str(src), '-o', str(exe)]
             if args.sanitize:
@@ -158,7 +158,7 @@ def main() -> int:
         env = os.environ.copy()
         for key in ('GESHER_AUDIO', 'GESHER_AUDIO_CAPTURE', 'GESHER_TEST_NO_WATCHER',
                     'GESHER_TEST_TIMER_FAILURE', 'GESHER_TEST_EVENT_FAILURE', 'GESHER_TEST_OUTPUT_TIMING',
-                    'GESHER_TEST_ROUTE_SCENARIO'):
+                    'GESHER_TEST_ROUTE_SCENARIO', 'GESHER_TEST_THREAD_FAILURE', 'GESHER_TEST_IDLE_OBSERVATION'):
             env.pop(key, None)
         if args.component == 'routing':
             for scenario in ('same-endpoint', 'changed-endpoint', 'changed-without-notification',
@@ -170,7 +170,8 @@ def main() -> int:
         for key, value in ([] if args.component != 'engine' else [
                 ('GESHER_AUDIO_CAPTURE', str(work / 'existing.wav')), ('GESHER_TEST_NO_WATCHER', '1'),
                 ('GESHER_TEST_TIMER_FAILURE', '1'), ('GESHER_TEST_EVENT_FAILURE', '1'),
-                ('GESHER_TEST_OUTPUT_TIMING', '1')]):
+                ('GESHER_TEST_OUTPUT_TIMING', '1'), ('GESHER_TEST_THREAD_FAILURE', '1'),
+                ('GESHER_TEST_IDLE_OBSERVATION', '1')]):
             sentinel = work / 'existing.wav'; sentinel.write_bytes(b'existing capture must not change')
             subprocess.run([str(exe), 'query'], check=True, env={**env, key: value}, timeout=10)
             if sentinel.read_bytes() != b'existing capture must not change':

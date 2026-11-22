@@ -6,7 +6,6 @@
 #include <cstring>
 #include <deque>
 #include <future>
-#include <system_error>
 #include "audio_idle_platform.h"
 @HEADER@
 @SINK@
@@ -118,8 +117,29 @@ void Prime(const std::shared_ptr<Track>& track, float value = 0.25f) {
 }
 void Idle() {
   Check(Until([] { return idle_test::armed_timers == 0 && idle_test::critical_threads == 0; }), "last active/draining group disarms timer and priority");
+  // Disarming precedes the idle wait. Release/destruction can leave a retained
+  // control signal at that point, especially after a long null-output retry.
+  // Send one known signal, let the real wait consume it, and acknowledge the
+  // following idle wait before observing quiescence. The first gate prevents
+  // an earlier release signal from being mistaken for this acknowledgement.
+  std::promise<void> sent, drained, resume;
+  auto sent_gate = sent.get_future().share();
+  auto resume_gate = resume.get_future().share();
+  auto drained_result = drained.get_future();
+  { std::lock_guard<std::mutex> lock(idle_test::hook_mu);
+    idle_test::idle_hook = [&, sent_gate, resume_gate] {
+      sent_gate.wait();
+      std::lock_guard<std::mutex> lock(idle_test::hook_mu);
+      idle_test::idle_hook = [&, resume_gate] { drained.set_value(); resume_gate.wait(); };
+      Engine::Get()->Wake();
+    }; }
+  Engine::Get()->Wake();
+  sent.set_value();
+  Check(drained_result.wait_for(1s) == std::future_status::ready,
+        "retained controls drain before the next infinite idle wait");
   const int ticks = fixture::ticks;
   const int wakes = idle_test::wait_returns;
+  resume.set_value();
   std::this_thread::sleep_for(150ms);
   Check(fixture::ticks == ticks, "no idle mixer ticks");
   Check(idle_test::wait_returns == wakes, "no idle timeout wakeups");
@@ -128,6 +148,43 @@ void Idle() {
 int main(int argc, char**) {
   auto* engine = Engine::Get();
   @ROUTING_CASES@
+  if (std::getenv("GESHER_TEST_IDLE_OBSERVATION")) {
+    auto track = NewTrack(); Prime(track); track->Start();
+    Check(Until([&] { return track->Position() >= 960; }), "PCM played before idle observation");
+    std::promise<void> entered, resume;
+    auto gate = resume.get_future().share();
+    auto arrival = entered.get_future();
+    { std::lock_guard<std::mutex> lock(idle_test::hook_mu);
+      idle_test::idle_hook = [&] { entered.set_value(); gate.wait(); }; }
+    track->Release();
+    Check(arrival.wait_for(2s) == std::future_status::ready, "actual mixer reaches idle pre-wait boundary");
+    Check(idle_test::armed_timers == 0 && idle_test::critical_threads == 0,
+          "timer and priority retire before a retained release control is consumed");
+    const int premature_baseline = idle_test::wait_returns;
+    track.reset();  // The actual destructor supplies its final control wake.
+    resume.set_value();
+    Check(Until([&] { return idle_test::wait_returns > premature_baseline; }),
+          "legitimate destruction signal returns from the first idle wait");
+    Idle();
+    std::printf("audio idle observation: %d checks\n", checks); std::fflush(stdout); std::_Exit(0);
+  }
+  if (std::getenv("GESHER_TEST_THREAD_FAILURE")) {
+    TrackParams params; std::string error;
+    params.capacity_frames = 4800;
+    idle_test::fail_next_thread = true;
+    Check(CreateTrack(params, &error) == nullptr && !error.empty(), "mixer thread creation failure rejects Track with an error");
+    Check(idle_test::thread_attempts == 1 && !engine->started_ && engine->tracks_.empty() && idle_test::thread_handles == 0 &&
+          fixture::opens == 0 && idle_test::armed_timers == 0,
+          "failed mixer startup publishes no Track, worker handle, sink or timer");
+    auto track = NewTrack(); Prime(track); track->Start();
+    Check(Until([&] { return track->Position() >= 960; }), "later Track retries worker creation and plays original PCM");
+    Check(idle_test::thread_attempts == 2 && idle_test::thread_handles == 0,
+          "one successful process-lifetime mixer closes its detached handle");
+    auto second = NewTrack();
+    Check(idle_test::thread_attempts == 2, "further Tracks reuse the existing mixer worker");
+    second->Release(); second.reset(); track->Release(); track.reset(); Idle();
+    std::printf("audio thread failure: %d checks\n", checks); std::fflush(stdout); std::_Exit(0);
+  }
   if (std::getenv("GESHER_TEST_OUTPUT_TIMING")) {
     GetOutputInfo();
     auto track = NewTrack();
@@ -183,8 +240,10 @@ int main(int argc, char**) {
   }
   if (std::getenv("GESHER_TEST_EVENT_FAILURE")) {
     TrackParams params; std::string error;
+    params.capacity_frames = 4800;
     Check(CreateTrack(params, &error) == nullptr && !error.empty(), "wake allocation failure rejects track with real error");
-    Check(!engine->started_, "wake allocation failure creates no unusable mixer");
+    Check(engine->wake_ == nullptr && !engine->started_ && idle_test::thread_attempts == 0,
+          "wake allocation failure creates no unusable mixer");
     std::printf("audio event failure: %d checks\n", checks); return 0;
   }
   if (argc > 1) {

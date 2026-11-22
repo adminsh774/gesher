@@ -16,7 +16,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "engine.h"
@@ -142,7 +141,7 @@ class WasapiAudioSink : public Sink {
   HANDLE buffer_event_ = nullptr;
   HANDLE stop_event_ = nullptr;
   HANDLE control_event_ = nullptr;
-  std::thread feeder_thread_;
+  HANDLE feeder_thread_ = nullptr;
   // Serialize Stop/Reset with a feeder's GetBuffer/ReleaseBuffer pair. Never
   // acquire this mutex while holding ring_mu_ or opensl_mu_.
   std::mutex client_mu_;

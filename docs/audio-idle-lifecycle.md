@@ -65,6 +65,10 @@ signal an auto-reset event. This signal takes no Engine or Track mutex, includin
 when called by a Track destructor or MMDevice callback. It therefore does not
 invert Engine-to-Track locking, and a signal arriving between the demand check
 and the infinite wait remains pending.
+The mixer uses nonthrowing Win32 thread creation, matching production's disabled
+C++ exceptions. A failed creation rejects that Track without publishing it, and
+a later Track can retry. The successful process-lifetime worker releases its
+detached thread handle immediately.
 
 The mixer arms its high-resolution 10 ms timer and takes its existing active
 priority only when some group is playing or draining. The existing one-second
@@ -82,6 +86,10 @@ stopped, ignoring stale buffer events, and releases its MMCSS task. It resumes
 MMCSS only during active rendering. Endpoint failures propagate to the Engine's
 existing output recovery path. The fallback WASAPI sink stops/resets all running
 groups at idle.
+The feeder retains an owned native thread handle. Close serializes with startup,
+signals shutdown, then joins without holding the client lock before releasing
+the client and handle. A failed worker creation wakes blocked writers and reports
+the sink failure without starting the client or taking MMCSS.
 
 The null/capture clock does not feed newly queued audio through elapsed idle time.
 On resume it advances its accounting across the gap. Capture writes the gap as
@@ -110,6 +118,12 @@ with unchanged or changed output; repeated failures; notifications racing route
 lookup or opening; no-output and open-failure recovery; and metadata-only events
 retaining the exact active sink. The shared identity-query helper is checked for
 real IDs, null/empty results, preserved errors and allocation cleanup.
+Worker-creation failures, Start/Close publication races and shutdown during an
+outstanding render buffer also execute the actual lifecycle methods. Idle
+observations acknowledge a retained control signal and the following infinite
+wait before asserting zero further ticks or wakeups; timer cancellation alone
+is earlier than that boundary. A deterministic release/destructor case covers
+that distinction. Non-MSVC fixture builds also disable C++ exceptions.
 
 On Linux the fixture substitutes only Win32 wait/timer transport and endpoint
 boundaries. CI also runs it on Windows 2022 and 2025 with real Win32 events,

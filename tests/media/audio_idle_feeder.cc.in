@@ -3,7 +3,6 @@
 #include <deque>
 #include <future>
 #include <cmath>
-#include <system_error>
 #include "audio_idle_platform.h"
 #ifdef _WIN32
 #include <mmreg.h>
@@ -15,11 +14,10 @@ using LPVOID = void*;
 struct WAVEFORMATEX {};
 struct WAVEFORMATEXTENSIBLE {};
 inline bool FAILED(HRESULT value) { return value < 0; }
-inline BOOL CloseHandle(HANDLE) { return TRUE; }
 #endif
 constexpr DWORD AUDCLNT_BUFFERFLAGS_SILENT = 2;
 namespace fixture {
-inline std::atomic<int> starts{0}, stops{0}, resets{0}, mmcss{0}, releases{0};
+inline std::atomic<int> starts{0}, stops{0}, resets{0}, mmcss{0}, releases{0}, clients{0};
 inline std::atomic<bool> fail_padding{false}, invalid_overlap{false};
 inline std::mutex output_mu;
 inline std::mutex render_hook_mu;
@@ -48,6 +46,8 @@ struct FakeRender {
 };
 struct FakeClient {
   FakeRender* render = nullptr;
+  FakeClient() { ++clients; }
+  ~FakeClient() { --clients; }
   HRESULT Start() { ++starts; return 0; }
   HRESULT Stop() { if (render && render->holding) invalid_overlap = true; ++stops; return 0; }
   HRESULT Reset() { if (render && render->holding) invalid_overlap = true; ++resets; return 0; }
@@ -123,18 +123,39 @@ int main() {
   {
     WasapiAudioSink probe;
     Check(probe.Initialize(params, &error), "production synchronous preparation succeeds with isolated real-client boundary");
-    Check(!probe.feeder_thread_.joinable() && !probe.IsRunning(), "metadata preparation creates neither feeder nor running stream");
+    Check(probe.feeder_thread_ == nullptr && !probe.IsRunning() && idle_test::thread_attempts == 0,
+          "metadata preparation creates neither feeder nor running stream");
     Check(probe.ring_buffer_.empty() && fixture::starts == 0 && fixture::mmcss == 0, "metadata has no render ring/MMCSS/start");
     Check(probe.latency_frames() == 480, "prepared sink reports actual fake client's buffer/latency");
     Check(probe.EndpointId() == L"render-A", "prepared sink retains actual opened endpoint identity");
   }
   Check(fixture::starts == 0, "closing metadata probe never starts rendering");
+  {
+    WasapiAudioSink unavailable_worker;
+    Check(unavailable_worker.Initialize(params, &error), "failed-feeder preparation still opens no worker");
+    idle_test::fail_next_thread = true;
+    std::vector<float> input(48000, 0.2f);
+    auto written = std::async(std::launch::async, [&] {
+      return unavailable_worker.WriteBytes(input.data(), input.size() * sizeof(float), true);
+    });
+    Check(written.wait_for(1s) == std::future_status::ready, "worker creation failure releases a blocking first writer");
+    Check(written.get() < input.size() * sizeof(float) && unavailable_worker.failed_ &&
+          unavailable_worker.feeder_thread_ == nullptr && !unavailable_worker.IsRunning(),
+          "failed worker reports partial write and terminal sink failure without a thread");
+    Check(fixture::starts == 0 && fixture::mmcss == 0 && idle_test::thread_handles == 0,
+          "failed worker starts no client or MMCSS and leaks no native thread handle");
+    unavailable_worker.Close(); unavailable_worker.Close();
+    Check(fixture::clients == 0 && unavailable_worker.stop_event_ == nullptr &&
+          unavailable_worker.control_event_ == nullptr && unavailable_worker.buffer_event_ == nullptr,
+          "failed-worker close is idempotent and releases endpoint/event ownership");
+  }
   WasapiAudioSink sink;
   Check(sink.Initialize(params, &error), "playback preparation");
   FixtureMixer mixer;
   Check(sink.Tick(&mixer), "first tick supplies PCM");
   Check(Until([] { return fixture::mmcss == 1; }), "lazy feeder takes MMCSS for active rendering");
-  Check(sink.feeder_thread_.joinable() && sink.IsRunning(), "first supplied PCM starts feeder/client");
+  Check(sink.feeder_thread_ != nullptr && sink.IsRunning() && idle_test::thread_handles == 1,
+        "first supplied PCM starts and owns exactly one feeder/client");
   SetEvent(sink.buffer_event_);
   Check(Until([] { return fixture::releases >= 1; }), "event-driven feeder renders queued frames");
   { std::lock_guard<std::mutex> lock(fixture::output_mu);
@@ -171,7 +192,8 @@ int main() {
   Check(Until([&] { return sink.failed_.load(); }), "endpoint failure is retained");
   Check(!sink.Tick(&mixer), "feeder failure requests Engine recovery instead of pretending success");
   sink.Close();
-  Check(fixture::mmcss == 0 && !fixture::invalid_overlap, "failure close releases scheduling and serializes endpoint controls");
+  Check(fixture::mmcss == 0 && !fixture::invalid_overlap && idle_test::thread_handles == 0,
+        "failure close joins worker, closes native handle and releases scheduling");
 
   WasapiAudioSink writer;
   Check(writer.Initialize(params, &error), "blocking writer preparation");
@@ -198,6 +220,47 @@ int main() {
   Check(failed_write.wait_for(1s) == std::future_status::ready, "terminal endpoint failure wakes a blocked writer");
   Check(failed_write.get() < large.size() * sizeof(float), "failed write reports only bytes accepted before failure");
   failing_writer.Close();
+
+  {
+    WasapiAudioSink starting;
+    Check(starting.Initialize(params, &error), "concurrent startup/close preparation");
+    std::promise<void> entered_start, release_start;
+    auto allow_start = release_start.get_future().share();
+    { std::lock_guard<std::mutex> lock(idle_test::hook_mu);
+      idle_test::thread_return_hook = [&] { entered_start.set_value(); allow_start.wait(); }; }
+    auto start = std::async(std::launch::async, [&] { return starting.Start(); });
+    Check(entered_start.get_future().wait_for(1s) == std::future_status::ready,
+          "actual Start is paused before newly created worker-handle publication");
+    auto close = std::async(std::launch::async, [&] { starting.Close(); });
+    Check(close.wait_for(20ms) == std::future_status::timeout && fixture::clients == 1,
+          "Close cannot miss a worker handle being published or release its client early");
+    release_start.set_value();
+    Check(start.wait_for(1s) == std::future_status::ready && start.get(), "owned startup can finish during close race");
+    Check(close.wait_for(1s) == std::future_status::ready, "Close joins the newly published worker without holding its client lock");
+    close.get();
+    Check(idle_test::thread_handles == 0 && fixture::clients == 0 && fixture::mmcss == 0 &&
+          starting.feeder_thread_ == nullptr && !starting.Start(),
+          "close race retires worker/client/MMCSS and rejects later restart");
+  }
+  {
+    WasapiAudioSink closing;
+    Check(closing.Initialize(params, &error) && closing.Tick(&mixer), "active close-race preparation");
+    std::promise<void> entered_close, release_buffer;
+    auto allow_buffer = release_buffer.get_future().share();
+    { std::lock_guard<std::mutex> lock(fixture::render_hook_mu);
+      fixture::render_hook = [&] { entered_close.set_value(); allow_buffer.wait(); }; }
+    SetEvent(closing.buffer_event_);
+    Check(entered_close.get_future().wait_for(1s) == std::future_status::ready,
+          "active worker is inside an outstanding render-buffer pair");
+    auto close = std::async(std::launch::async, [&] { closing.Close(); });
+    Check(close.wait_for(20ms) == std::future_status::timeout && fixture::clients == 1,
+          "destruction retains the client until outstanding worker use completes");
+    release_buffer.set_value();
+    Check(close.wait_for(1s) == std::future_status::ready, "active close completes after worker releases its buffer");
+    close.get(); closing.Close();
+    Check(idle_test::thread_handles == 0 && fixture::clients == 0 && fixture::mmcss == 0 && !fixture::invalid_overlap,
+          "active close joins and retires exactly one worker without endpoint-use overlap");
+  }
 
   LegacyFixture legacy;
   fixture::FakeClient first, second;
