@@ -1,6 +1,7 @@
 param([string] $PanelPath = (Join-Path $PSScriptRoot '../../../tools/package/gesher-control-panel.ps1'))
 
 $ErrorActionPreference = 'Stop'
+& (Join-Path $PSScriptRoot 'ControlPanelIdleCounterChecks.ps1') -FixturePath $PSCommandPath
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 $nativeCompile = [Diagnostics.Stopwatch]::StartNew()
 . (Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($PanelPath))) 'gesher-panel-native.ps1')
@@ -178,13 +179,15 @@ try {
     # dispatcher is blocked, and it must be coalesced before expensive refresh.
     $generation = $script:MetadataMonitor.Generation
     $callbacks = $script:Notifications
-    $draws = $script:Draws
+    # PowerShell variable names are case-insensitive: an unqualified $draws
+    # here would alias the script's live counter, not capture its current value.
+    $script:DrawsBeforeBurst = $script:Draws
     $shortcut = Join-Path $root 'data/data/fixture.beta/gesher-shell/shortcut.properties'
     for ($i = 0; $i -lt 100; $i++) { Write-Fixture $shortcut "label-$i" }
     Wait-ManagedNotification $generation
     Assert-Idle ($script:Notifications -eq $callbacks) 'A worker callback invoked PowerShell without WPF dispatch'
     Pump-Until { $script:ShownLabels -contains 'label-99' -and -not $script:LiveState.PendingSince } 'Debounced shortcut burst did not update the visible view'
-    Assert-Idle (($script:Draws - $draws) -le 3) 'Notification burst rebuilt the view without coalescing'
+    Assert-Idle (($script:Draws - $script:DrawsBeforeBurst) -le 3) 'Notification burst rebuilt the view without coalescing'
 
     $window.Hide()
     Pump-For 80
@@ -230,12 +233,12 @@ try {
     $script:LiveState.AppsStamp = Get-AppFilesStamp
     $script:LiveState.PendingSince = $null; $script:LiveState.PendingFirst = $null
     $script:LiveState.RecoveryAt = [DateTime]::UtcNow.AddSeconds(30)
-    $draws = $script:Draws
+    $script:DrawsBeforeRecovery = $script:Draws
     Write-Fixture $external[-1] 'missed event with changed length'
     Pump-For 100
-    Assert-Idle ($script:Draws -eq $draws) 'The over-budget path unexpectedly triggered a scan before recovery'
+    Assert-Idle ($script:Draws -eq $script:DrawsBeforeRecovery) 'The over-budget path unexpectedly triggered a scan before recovery'
     $script:LiveState.RecoveryAt = [DateTime]::MinValue
-    Pump-Until { $script:Draws -gt $draws } 'Visible missed-event recovery did not repair an unwatched file'
+    Pump-Until { $script:Draws -gt $script:DrawsBeforeRecovery } 'Visible missed-event recovery did not repair an unwatched file'
 
     # Retiring the watcher must release its actual OS directory handles and
     # suppress already queued callbacks when the WPF dispatcher resumes.
