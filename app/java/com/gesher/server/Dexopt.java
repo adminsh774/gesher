@@ -491,8 +491,8 @@ final class Dexopt {
         sBackground.setDaemon(true);
         sProfiles.start();
         sBackground.start();
-        SystemServer.log("dexopt: profile-driven background worker; idle=" + idleMs
-                + " ms, workers=1, heap=" + BACKGROUND_HEAP_MIB + " MiB, process="
+        SystemServer.log("dexopt: background dexopt runs once the device is idle for " + idleMs
+                + " ms; profile-driven worker, workers=1, heap=" + BACKGROUND_HEAP_MIB + " MiB, process="
                 + BACKGROUND_MEMORY_MIB + " MiB, cpu=" + BACKGROUND_CPU_RATE / 100 + "%");
     }
 
