@@ -1,6 +1,40 @@
 # PR 73: current-main integration and runtime repair
 
-## Current composition, 2026-11-22
+## Main refresh, 2026-11-22
+
+This refresh preserves the previously reviewed PR73 candidate
+`3db72444ee486eb68f93e124ec092b9a2cb6dc0a` (tree
+`f14267a28c2cae029fe2631fa6d1db2692635d1d`) and merges verified main
+`324dc7e41ea13ceedc3d52db3c8f7c2f3590e452`. The earlier review was against
+main `751d82310f7c4c470c098ccebfd5d2d04699a0cd`; this composition requires
+incremental review and its own exact-head CI results.
+
+Main advances by six merged changes across 49 files. None touches the four
+production files described below. Those files, the PR73 fixtures and workflow,
+and both shared-stdio qualification files are unchanged from the reviewed
+candidate. Of the 49 incoming files, 48 equal main byte-for-byte, including
+all incoming production code and `.github/workflows/ci.yml`.
+
+The only conflict is `tools/net-tcp-priority/test-selected-policy.py`. It retains
+main's exact memmem include/wrapper reversal, pinned helper and five additional
+mutation controls, alongside the unchanged PR73 shared-stdio transition. Removing
+only the prior PR73 additions reconstructs the complete new-main policy exactly;
+removing only main's memmem additions reconstructs the reviewed PR73 policy
+exactly. The memmem normalization applies to `shim.cc`, separately from the four
+stdio paths. The original OFD manifest, patch, 71 source digests and approval
+state remain unchanged; no existing qualification receipt is repinned.
+
+Focused checks pass: the new-main policy and its 20 mutation controls in a
+separate checkout; the combined policy with those same 20 controls plus the 23
+shared-stdio controls; and 426,273 production memmem contract/work checks under
+ASan/UBSan, with the comparison source verified against its original Git object.
+The changed shim compiles for x64 and ARM64 Windows, and the x64 ELF loader
+fixture relinks successfully; the unchanged stdio/OFD target remains up to date.
+The earlier stdio implementation and fixture checks are preserved evidence,
+not newly claimed executions. Windows/native3 runtime execution and the final
+tested merge identity remain CI requirements after incremental review.
+
+## Earlier frozen composition, 2026-11-22
 
 This round starts from published PR73 head
 `de1e43c391275137c7b7b25dc170892684d55b5e` and merges verified main
