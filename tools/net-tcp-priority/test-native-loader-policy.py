@@ -79,9 +79,31 @@ for name in manifest["paths"]:
 for name in ("compat/bionic/shim.cc", "compat/bionic/shim_internal.h"):
     mutated = (ROOT / name).read_bytes() + b'\n#include "unqualified_native_loader.h"\n'
     changed = copy.deepcopy(manifest)
-    changed["after_sha256"][name] = sha(mutated)
+    # The original namespace endpoint precedes main's later exact memmem edit.
+    endpoint = policy.preceding_memmem_source(mutated) if name == "compat/bionic/shim.cc" else mutated
+    changed["after_sha256"][name] = sha(endpoint)
     rejected("an undeclared include even with a repinned endpoint: " + name,
              {name: mutated}, "native-loader reverse endpoint", changed)
+
+# Both independently pinned transitions must be present. Their composition
+# cannot drop either feature or turn scoped lookup into an aggregate fallback.
+shim_path = "compat/bionic/shim.cc"
+shim = (ROOT / shim_path).read_bytes()
+rejected("the old namespace source without main's memmem change",
+         {shim_path: policy.preceding_memmem_source(shim)}, "exact reviewed memmem substitution changed")
+only_memmem = subprocess.check_output(["git", "-C", str(ROOT), "show",
+                                      policy.NATIVE_LOADER_BASE + ":" + shim_path])
+for before, after in policy.MEMMEM_REPLACEMENTS:
+    assert only_memmem.count(before) == 1
+    only_memmem = only_memmem.replace(before, after, 1)
+rejected("main's memmem source without the namespace ownership transition", {shim_path: only_memmem}, shim_path)
+scoped = b"return LookupOwnedSymbol(name, symbol);"
+assert shim.count(scoped) == 1
+unscoped = shim.replace(scoped, b"return LookupBionicSymbol(symbol);", 1)
+changed = copy.deepcopy(manifest)
+changed["after_sha256"][shim_path] = sha(policy.preceding_memmem_source(unscoped))
+rejected("aggregate lookup despite a repinned normalized endpoint", {shim_path: unscoped},
+         "exact patch application", changed)
 
 # The unchanged dependency is compared with independently named main bytes.
 name = policy.NATIVE_LOADER_UNCHANGED_PATHS[0]

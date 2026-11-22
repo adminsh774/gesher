@@ -266,6 +266,37 @@ RECEIPT_SOURCE_BLOCK=b'''  if ($null -ne $SourceIdentity) {
 # Coupled OFD/stdio/pipe source files are pinned by the same qualification.
 # No supplier, socket core, fixture predicate, deadline or DAG is exempted.
 OFD_QUALIFICATION_SHA256 = '1847217ffc744c9362c264f40d658ab2e7bf31510e0e83d4267bf24ae4640171'
+# Bionic's independently reviewed memmem search changes only this include and
+# complete wrapper. Restore those exact bytes before applying the UNCHANGED
+# OFD qualification digest. Pin the new pure-search helper separately: no other
+# shim byte, supplier, fixture, deadline or runtime gate is exempted.
+MEMMEM_HEADER='compat/bionic/memmem_search.h'
+MEMMEM_HEADER_SHA256='ae673530674a38f0fc9a0752ef138c8f9d22a2ba08cdf29a0032f6a622f3cdf0'
+MEMMEM_REPLACEMENTS=(
+ (b'#include "extra_bionic.h"\n\n#include <gesher/bionic_shim.h>\n',
+  b'#include "extra_bionic.h"\n#include "memmem_search.h"\n\n#include <gesher/bionic_shim.h>\n'),
+ (b'''void* BIONIC_SYSV Memmem(const void* h, size_t hn, const void* n, size_t nn) {
+  if (nn == 0) return const_cast<void*>(h);
+  auto hp = static_cast<const uint8_t*>(h);
+  for (size_t i = 0; i + nn <= hn; ++i) {
+    if (std::memcmp(hp + i, n, nn) == 0) return const_cast<uint8_t*>(hp + i);
+  }
+  return nullptr;
+}
+''',
+  b'''void* BIONIC_SYSV Memmem(const void* h, size_t hn, const void* n, size_t nn) {
+  if (nn == 0) return const_cast<void*>(h);
+  return const_cast<void*>(search::FindBytes(h, hn, n, nn));
+}
+'''),
+)
+def preceding_memmem_source(actual):
+ assert hashlib.sha256((ROOT/MEMMEM_HEADER).read_bytes()).hexdigest()==MEMMEM_HEADER_SHA256,MEMMEM_HEADER
+ for before,after in MEMMEM_REPLACEMENTS:
+  assert actual.count(after)==1 and before not in actual,'exact reviewed memmem substitution changed'
+  actual=actual.replace(after,before,1)
+ return actual
+
 # PR107 changes provider ownership and loader context in four files covered by
 # that qualification. Preserve its original receipt and every original digest:
 # reverse only this separately pinned transition to the independently checked
@@ -313,9 +344,14 @@ def preceding_native_loader_sources(qualification):
  assert hashlib.sha256(patch).hexdigest()==transition['patch_sha256'],'native-loader transition patch changed'
  assert [line for line in patch.splitlines() if line.startswith(b'diff --git ')]==[
      ('diff --git a/'+path+' b/'+path).encode() for path in paths],'native-loader patch paths changed'
- current={};baseline={}
+ observed={};current={};baseline={}
  for path in paths:
-  current[path]=(ROOT/path).read_bytes()
+  observed[path]=(ROOT/path).read_bytes()
+  # Main's later memmem transition has its own exact substitutions and helper
+  # pin above. Undo it before checking the UNCHANGED namespace endpoint. Neither
+  # the namespace manifest nor its patch is regenerated for this composition.
+  current[path]=(preceding_memmem_source(observed[path]) if path=='compat/bionic/shim.cc'
+                 else observed[path])
   assert hashlib.sha256(current[path]).hexdigest()==transition['after_sha256'][path],path
   baseline[path]=subprocess.check_output(['git','-C',str(ROOT),'show',NATIVE_LOADER_BASE+':'+path])
   assert hashlib.sha256(baseline[path]).hexdigest()==transition['before_sha256'][path],path
@@ -338,7 +374,13 @@ def preceding_native_loader_sources(qualification):
   subprocess.run(['git','apply','--unidiff-zero','--check','-'],input=patch,cwd=work,check=True,capture_output=True)
   subprocess.run(['git','apply','--unidiff-zero','-'],input=patch,cwd=work,check=True,capture_output=True)
   for path in paths:
-   assert (work/path).read_bytes()==current[path],('native-loader forward endpoint',path)
+   composed=(work/path).read_bytes()
+   assert composed==current[path],('native-loader forward endpoint',path)
+   if path=='compat/bionic/shim.cc':
+    for before,after in MEMMEM_REPLACEMENTS:
+     assert composed.count(before)==1 and after not in composed,'exact memmem forward substitution changed'
+     composed=composed.replace(before,after,1)
+   assert composed==observed[path],('composed native-loader/memmem endpoint',path)
  return {path:baseline[path] for path in NATIVE_LOADER_PROTECTED_PATHS}
 
 # Valid pipes can now fail a control operation explicitly. These two exact
@@ -564,6 +606,13 @@ def transition_negative_controls():
   ('compat/posix/src/winsock.cc',b'(flags & kMsgCmsgCloexec) != 0);',b'false);'),
   ('compat/posix/src/unix_rights.cc',b'AdoptFileDescription(h, shared, static_cast<DescriptorKind>(kind), close_on_exec)',b'AdoptFileDescription(h, shared, static_cast<DescriptorKind>(kind), false)'),
   ('probes/binder/binder_probe.cc',b'retained_files.size() == 9',b'retained_files.size() == 6'),
+  # The memmem normalization admits its exact reviewed delta only. The old
+  # whole-file digest must still reject any unrelated shim change afterwards.
+  ('compat/bionic/shim.cc',b'size_t n = std::strlen(s) + 1;',b'size_t n = std::strlen(s) + 2;'),
+  ('compat/bionic/shim.cc',b'return const_cast<void*>(search::FindBytes(h, hn, n, nn));',b'return const_cast<void*>(search::FindBytes(n, nn, h, hn));'),
+  ('compat/bionic/shim.cc',b'#include "memmem_search.h"\n',b''),
+  ('compat/bionic/shim.cc',b'#include "memmem_search.h"\n',b'#include "memmem_search.h"\n#include "memmem_search.h"\n'),
+  (MEMMEM_HEADER,b'if (needle_size == 0) return haystack_data;',b'if (needle_size == 0) return nullptr;'),
  ]
  for name,before,after in cases:
   target=ROOT/name

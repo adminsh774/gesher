@@ -60,6 +60,22 @@ function-sized exclusion, generated approval receipt, moving branch reference,
 or mechanism for accepting arbitrary new hashes. Changes to either endpoint
 require a new production and qualification review.
 
+## Composition with main's memmem transition
+
+Main `324dc7e41ea13ceedc3d52db3c8f7c2f3590e452` includes PR274's independently
+pinned `memmem` helper and two exact wrapper/include substitutions. The current
+shim contains both changes. Before checking the frozen namespace endpoint, the
+policy reverses the unchanged memmem substitutions and validates the unchanged
+helper digest. The namespace manifest and patch, their original baseline and
+all OFD/supplier receipts retain their reviewed bytes.
+
+After the namespace reverse/forward round trip, the policy reapplies both exact
+memmem substitutions and requires equality with the actual combined shim. A
+missing transition, unrelated provider change or extra source edit cannot be
+hidden by changing an endpoint hash. The original main memmem controls run
+alongside the namespace controls; composition does not grant an exemption to
+either feature.
+
 ## Reproduction and negative controls
 
 From a checkout with the pinned history available:
@@ -72,12 +88,14 @@ python3 tools/net-tcp-priority/test-selected-supplier.py
 python3 tools/host-pthread-authority/minimum_receipt.py selftest
 ```
 
-The native-loader policy test mutates only in-memory inputs. Its 28 controls
+The native-loader policy test mutates only in-memory inputs. Its 31 controls
 cover all nine admitted files, source/header edits despite an updated endpoint
 digest, an undeclared include, an unchanged coupled header, expanded file and
 header lists, an undeclared patch path, a modified before-hunk despite updated
 patch and manifest digests, changed baseline/feature/policy pins, four unrelated
-protected files and the original OFD receipt. Existing descriptor, socket,
+protected files and the original OFD receipt. The composition controls also
+reject either transition being missing and an aggregate-symbol fallback despite
+a repinned normalized endpoint. Existing descriptor, socket,
 stdio, vector and supplier negative controls remain separate and unchanged.
 
 The associated behavior gates include production ELF namespace/identity,
