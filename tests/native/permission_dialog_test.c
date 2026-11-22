@@ -115,13 +115,29 @@ static void CALLBACK InspectHostPrompt(HWND dialog, UINT message, UINT_PTR timer
   // The MessageBox icon kind shows the system icon, leading the text in reading order.
   HWND icon = GetDlgItem(dialog, GESHER_HOST_MESSAGE_ICON);
   if (prompt_icon != 0) {
-    RECT icon_bounds, text_bounds;
-    GetWindowRect(icon, &icon_bounds);
-    GetWindowRect(text, &text_bounds);
+    RECT icon_bounds = {0}, text_bounds = {0};
+    HICON image = icon ? (HICON)SendMessageW(icon, STM_GETICON, 0, 0) : NULL;
     Check(icon != NULL && (GetWindowLongW(icon, GWL_STYLE) & SS_TYPEMASK) == SS_ICON
-        && SendMessageW(icon, STM_GETICON, 0, 0) != 0, "host prompt shows its system icon");
-    Check(GesherUiRtl(language) ? icon_bounds.left >= text_bounds.right
-        : icon_bounds.right <= text_bounds.left, "host prompt icon leads the text in reading order");
+        && image != NULL, "host prompt shows its system icon");
+    if (icon != NULL) {
+      GetWindowRect(icon, &icon_bounds);
+      GetWindowRect(text, &text_bounds);
+      Check(GesherUiRtl(language) ? icon_bounds.left >= text_bounds.right
+          : icon_bounds.right <= text_bounds.left,
+          "host prompt icon leads the text in reading order");
+    }
+    // The icon is extracted at the window's DPI, not stretched from the system size.
+    ICONINFO info = {0};
+    BITMAP bitmap = {0};
+    HDC screen = GetDC(NULL);
+    int expected = MulDiv(32, GesherHostDpi(dialog, screen), 96);
+    ReleaseDC(NULL, screen);
+    if (image != NULL && GetIconInfo(image, &info)) {
+      GetObjectW(info.hbmColor ? info.hbmColor : info.hbmMask, sizeof(bitmap), &bitmap);
+      if (info.hbmColor) DeleteObject(info.hbmColor);
+      if (info.hbmMask) DeleteObject(info.hbmMask);
+    }
+    Check(bitmap.bmWidth == expected, "host prompt icon matches the window DPI");
   } else {
     Check(icon == NULL, "host prompt without an icon kind shows none");
   }
@@ -253,6 +269,14 @@ int main(void) {
   Check(GesherHostPrompt(GesherUiText(language, "brand"), prompt_message,
       GesherUiText(language, "cp_dialog_ok"), NULL, GesherUiRtl(language), NULL, prompt_icon),
       "oversized information popup is presented");
+  // A short message without an icon kind keeps the full-width static text.
+  prompt_message = L"com.example.app\r\nandroid.permission.CAMERA";
+  prompt_scrolls = FALSE;
+  prompt_truncated = FALSE;
+  prompt_icon = 0;
+  Check(GesherHostPrompt(GesherUiText(language, "brand"), prompt_message,
+      GesherUiText(language, "cp_dialog_ok"), NULL, GesherUiRtl(language), NULL, prompt_icon),
+      "short information popup without an icon is presented");
   UnhookWindowsHookEx(hook);
   SetThreadDesktop(original);
   CloseDesktop(desktop);

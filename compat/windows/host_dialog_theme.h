@@ -377,7 +377,9 @@ static inline INT_PTR CALLBACK GesherHostPromptProc(HWND dialog, UINT message,
             WS_TABSTOP | BS_OWNERDRAW, IDCANCEL, 134, 182, 86, 24) : NULL;
     HWND accept = GesherHostControl(dialog, 0, L"BUTTON", state->positive,
         WS_TABSTOP | BS_OWNERDRAW, state->negative ? IDYES : IDOK, 230, 182, 86, 24);
-    if (!heading || !details || !accept || (state->negative && !deny) || (has_icon && !icon)) {
+    /* The icon is decorative: a notice is still shown if only it fails. */
+    (void)icon;
+    if (!heading || !details || !accept || (state->negative && !deny)) {
       EndDialog(dialog, IDCANCEL);
       return FALSE;
     }
@@ -391,14 +393,18 @@ static inline INT_PTR CALLBACK GesherHostPromptProc(HWND dialog, UINT message,
       FlashWindowEx(&flash);
     }
     SetFocus(deny ? deny : accept);
-    /* The system sound MessageBox plays for the same icon kind. */
+    /* The system sound MessageBox plays for the same icon kind. Without an
+     * icon kind the prompt stays silent (no production caller uses that). */
     if (has_icon) MessageBeep(state->icon & MB_ICONMASK);
     return FALSE;
   }
   if (state == NULL) return FALSE;
   if (message == WM_DESTROY) {
     if (state->heading_font != NULL) DeleteObject(state->heading_font);
-    if (state->icon_image != NULL) DestroyIcon(state->icon_image);
+    if (state->icon_image != NULL) {
+      SendDlgItemMessageW(dialog, GESHER_HOST_MESSAGE_ICON, STM_SETICON, 0, 0);
+      DestroyIcon(state->icon_image);
+    }
     GesherHostThemeDispose(&state->theme);
     SetWindowLongPtrW(dialog, DWLP_USER, 0);
     return TRUE;
