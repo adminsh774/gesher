@@ -102,6 +102,16 @@ jobs:
         with:
           distribution: temurin
           java-version: '21.0.13'
+      - name: Build actual UIA query cancellation and lifecycle controls
+        if: ${{ !cancelled() }}
+        shell: cmd
+        run: cl /nologo /std:c++17 /EHsc /W4 /WX /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 compat\accessibility\query_pool.cc tests\windows\web3\query_pool_test.cc /Fe:query-pool-test.exe
+      - name: Run actual Windows UIA retirement, saturation and worker ownership controls
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          & .\query-pool-test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Actual UIA query pool lifecycle controls failed' }
       - name: Build actual app identity restart implementation
         shell: cmd
         run: cl /nologo /std:c++17 /EHsc /W4 /WX /D_WIN32_WINNT=0x0A00 compat\framework\services_zygote.cc tests\clipboard\standalone_restart_windows_test.cc /Fe:app-identity-restart.exe user32.lib
@@ -295,6 +305,7 @@ jobs:
           python3 tools/test_input_surface_callbacks.py --sanitize
           python3 tools/test_codec_lifecycle_contracts.py --sanitize
           python3 tools/test_dns_query_lifecycle.py --sanitize
+          python3 tools/test_uia_query_retirement.py --sanitize
 
       - name: Stream device identity across close and reopen
         run: python3 tools/test_stream_device_lifetime.py --sanitize
@@ -835,7 +846,7 @@ jobs:
   framework:
     needs: [source-identity]
     # Keep the complete reviewed recipe immutable and use hosted build runners.
-    uses: gesher-runtime/gesher/.github/workflows/framework.yml@2c096437d9474a59e4fd6f78d1670c9c7afc573f
+    uses: gesher-runtime/gesher/.github/workflows/framework.yml@7ba8eacb121bb935e9de9c60b4dd72d096e8c2ad
     with:
       local-runner: false
 
