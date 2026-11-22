@@ -5,12 +5,16 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 import benchmark
 import contract
+import failure_diagnostics
+from failure_diagnostics import runner_failure_diagnostics
 
 HERE = Path(__file__).resolve().parent
 
@@ -222,7 +226,129 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(contract.summarize(rows, ['baseline', 'candidate'], ['latency_ms'])['status'], 'failed')
 
 
+class DiagnosticsTests(unittest.TestCase):
+    def test_file_directory_and_root_links_do_not_expose_sibling_content(self):
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder); output = parent / 'output'; attempt = output / '00000-fixture'
+            attempt.mkdir(parents=True)
+            outside = parent / 'outside'; outside.mkdir()
+            (outside / 'stderr.log').write_text('OUTSIDE_DIAGNOSTIC_SENTINEL')
+            (output / 'summary.json').write_text('OWNED_POSITIVE')
+            (output / 'runs.json').symlink_to(outside / 'stderr.log')
+            (attempt / 'stderr.log').symlink_to(outside / 'stderr.log')
+            (output / '00001-linked').symlink_to(outside, target_is_directory=True)
+            details = runner_failure_diagnostics(output)
+            self.assertIn('OWNED_POSITIVE', details)
+            self.assertNotIn('OUTSIDE_DIAGNOSTIC_SENTINEL', details)
+            self.assertIn('Unsafe evidence', details)
+            self.assertIn('attempt directory omitted', details)
+            root_link = parent / 'linked-output'; root_link.symlink_to(output, target_is_directory=True)
+            self.assertIn('diagnostics unavailable', runner_failure_diagnostics(root_link))
+
+    def test_hard_link_is_omitted_but_owned_regular_file_is_read(self):
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder); output = parent / 'output'; output.mkdir()
+            outside = parent / 'outside'; outside.write_text('HARD_LINK_SENTINEL')
+            os.link(outside, output / 'runs.json')
+            (output / 'summary.json').write_text('OWNED_POSITIVE')
+            details = runner_failure_diagnostics(output)
+            self.assertIn('OWNED_POSITIVE', details)
+            self.assertNotIn('HARD_LINK_SENTINEL', details)
+            self.assertIn('Unsafe evidence', details)
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX FIFO boundary')
+    def test_fifo_is_rejected_without_opening_for_data(self):
+        with tempfile.TemporaryDirectory() as folder:
+            os.mkfifo(Path(folder) / 'runs.json')
+            # One disposable child contains any regression; run kills/reaps it
+            # on timeout. Call the actual collector, without its outer worker.
+            code = 'import sys; sys.path.insert(0,sys.argv[1]); from failure_diagnostics import _collect; print(_collect(sys.argv[2]))'
+            child = subprocess.run([sys.executable, '-c', code, str(HERE), folder],
+                                   capture_output=True, text=True, timeout=1, check=True)
+            self.assertIn('Unsafe evidence', child.stdout)
+
+    def test_directory_scan_stops_before_entry_65(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            for number in range(80):
+                (output / f'unrelated-{number}').touch()
+            original = os.scandir
+            visited = []
+            class Counted:
+                def __init__(self, path): self.entries = original(path)
+                def __enter__(self): return self
+                def __exit__(self, *_): self.entries.close()
+                def __iter__(self): return self
+                def __next__(self):
+                    if len(visited) == 64: raise AssertionError('Unbounded directory scan')
+                    entry = next(self.entries); visited.append(entry.name); return entry
+            with patch.object(failure_diagnostics.os, 'scandir', side_effect=Counted):
+                failure_diagnostics._collect(output)
+            self.assertEqual(len(visited), 64)
+
+    def test_held_attempt_cannot_be_redirected_to_another_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder); output = parent / 'output'; attempt = output / '00000-fixture'
+            attempt.mkdir(parents=True); (attempt / 'stderr.log').write_text('OWNED_POSITIVE')
+            outside = parent / 'outside'; outside.mkdir(); (outside / 'stderr.log').write_text('OUTSIDE_SENTINEL')
+            backend = failure_diagnostics._WindowsDirectory if os.name == 'nt' else failure_diagnostics._PosixDirectory
+            with backend.root(output) as root, root.directory(attempt.name) as held:
+                if os.name == 'nt':
+                    with self.assertRaises(OSError): attempt.rename(output / 'moved')
+                    with self.assertRaises(OSError): output.rename(parent / 'moved-output')
+                    c, k, _, _ = held.api
+                    writer = k.CreateFileW(held.path, 0x40000000, 7, None, 3, 0x02200000, None)
+                    error = c.get_last_error()
+                    if writer != c.c_void_p(-1).value: k.CloseHandle(writer)
+                    self.assertEqual(writer, c.c_void_p(-1).value)
+                    self.assertEqual(error, 32)  # Sharing violation prevents reparse mutation access.
+                else:
+                    attempt.rename(output / 'moved'); attempt.symlink_to(outside, target_is_directory=True)
+                    with self.assertRaises(OSError): root.directory(attempt.name)
+                self.assertEqual(held.read('stderr.log'), 'OWNED_POSITIVE')
+
+    @unittest.skipUnless(os.name == 'nt', 'Actual NTFS junction boundary')
+    def test_windows_junctions_are_not_traversed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder); output = parent / 'output'; output.mkdir()
+            outside = parent / 'outside'; outside.mkdir(); (outside / 'runs.json').write_text('JUNCTION_SENTINEL')
+            (outside / 'stderr.log').write_text('JUNCTION_SENTINEL')
+            (output / 'summary.json').write_text('OWNED_POSITIVE')
+            for link, target in [(output / '00000-junction', outside), (parent / 'junction-output', outside)]:
+                subprocess.run(['cmd.exe', '/d', '/c', 'mklink', '/J', str(link), str(target)],
+                               capture_output=True, timeout=5, check=True)
+            details = runner_failure_diagnostics(output)
+            self.assertIn('OWNED_POSITIVE', details)
+            self.assertNotIn('JUNCTION_SENTINEL', details)
+            self.assertIn('attempt directory omitted', details)
+            self.assertIn('diagnostics unavailable', runner_failure_diagnostics(parent / 'junction-output'))
+
+    def test_stalled_worker_is_reaped_and_original_assertion_survives(self):
+        original = subprocess.Popen
+        children = []
+        def started(*args, **kwargs):
+            child = original(*args, **kwargs); children.append(child); return child
+        with patch.object(failure_diagnostics, '_WORKER_SOURCE', 'import time; time.sleep(60)'), \
+                patch.object(failure_diagnostics, 'TIMEOUT_SECONDS', .1), \
+                patch.object(failure_diagnostics.subprocess, 'Popen', side_effect=started), \
+                patch.object(benchmark, 'run', return_value=1), self.assertRaises(AssertionError) as failed:
+            RunnerTests().assert_run_code(None, None, 2)
+        self.assertIn('1 != 2', str(failed.exception))
+        self.assertIn('TimeoutExpired', str(failed.exception))
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].poll())
+
+    def test_matching_return_does_not_read_diagnostic_files_or_launch_worker(self):
+        with patch.object(benchmark, 'run', return_value=2), patch.object(
+                failure_diagnostics.subprocess, 'run', side_effect=AssertionError('unexpected worker')):
+            RunnerTests().assert_run_code(None, None, 2)
+
+
 class RunnerTests(unittest.TestCase):
+    def assert_run_code(self, plan, output, expected):
+        actual = benchmark.run(plan, output)
+        self.assertEqual(actual, expected, runner_failure_diagnostics(output) if actual != expected else None)
+
     def plan(self, root, mode='success'):
         fixture = HERE / 'fixture_workload.py'
         value = {'schema_version': 1, 'workload': {'id': 'fixture', 'kind': 'command',
@@ -237,7 +363,7 @@ class RunnerTests(unittest.TestCase):
     def test_actual_successful_subprocess_and_directory_ownership(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); plan = self.plan(root); out = root / 'out'
-            self.assertEqual(benchmark.run(plan, out), 2)
+            self.assert_run_code(plan, out, 2)
             report = contract.read_json(out / 'summary.json')
             self.assertEqual(report['failed_or_incomplete_attempts_including_warmups'], 0)
             self.assertFalse(report['gate_passed'])
@@ -250,7 +376,7 @@ class RunnerTests(unittest.TestCase):
         for mode in ['exit', 'failure', 'missing', 'stale', 'nan', 'missing_metric', 'outside_window']:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder); out = root / 'out'
-                self.assertEqual(benchmark.run(self.plan(root, mode), out), 1)
+                self.assert_run_code(self.plan(root, mode), out, 1)
                 rows = contract.read_json(out / 'runs.json')['attempts']
                 self.assertEqual(rows[0]['status'], 'passed')
                 self.assertEqual(rows[1]['status'], 'failed')
@@ -261,10 +387,43 @@ class RunnerTests(unittest.TestCase):
             root = Path(folder); plan = self.plan(root, 'timeout')
             value = contract.read_json(plan); value['measurement']['timeout_seconds'] = 1
             contract.write_json(plan, value)
-            self.assertEqual(benchmark.run(plan, root / 'out'), 1)
+            self.assert_run_code(plan, root / 'out', 1)
             rows = contract.read_json(root / 'out/runs.json')['attempts']
             self.assertEqual(rows[1]['status'], 'timed_out')
             self.assertTrue((root / 'out' / rows[1]['directory'] / 'stdout.log').exists())
+
+    def test_unexpected_return_preserves_real_failure_evidence_after_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); out = root / 'out'
+            with self.assertRaises(AssertionError) as failure:
+                self.assert_run_code(self.plan(root, 'exit'), out, 2)
+            details = str(failure.exception)
+            self.assertIn('1 != 2', details)
+            self.assertIn('Workload exited with code 17', details)
+            self.assertIn('"status": "passed"', details)
+            self.assertIn('"status": "failed"', details)
+            self.assertIn('attempt.json', details)
+            self.assertIn('isolated fixture candidate', details)
+        self.assertFalse(out.exists())
+        self.assertIn('Workload exited with code 17', str(failure.exception))
+
+    def test_failure_diagnostics_bound_output_and_tolerate_missing_or_malformed_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'runs.json').write_bytes(b'{invalid-json-\xff')
+            for number in range(5):
+                attempt = root / f'{number:05d}-fixture'
+                attempt.mkdir()
+                for name in ('attempt.json', 'stderr.log', 'stdout.log', 'phase.json', 'ack.json', 'result.json'):
+                    (attempt / name).write_bytes(b'BEGIN-' + b'x' * 65536 + b'-END')
+            details = runner_failure_diagnostics(root)
+            self.assertLessEqual(len(details), 32768)
+            self.assertIn('{invalid-json-', details)
+            self.assertIn('FileNotFoundError', details)  # Missing summary cannot mask the assertion.
+            self.assertIn('bytes omitted', details)
+            self.assertIn('BEGIN-', details); self.assertIn('-END', details)
+            self.assertIn('remaining diagnostic output omitted', details)
+            self.assertNotIn('00004-fixture', details)
 
     def test_plan_rejects_bool_numbers_duplicate_variants_empty_metrics(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -293,7 +452,7 @@ class RunnerTests(unittest.TestCase):
                 receipt.write_text('changed!')
                 return raw
             with patch.object(benchmark, 'run_attempt', side_effect=actual_attempt):
-                self.assertEqual(benchmark.run(plan_path, root / 'out'), 1)
+                self.assert_run_code(plan_path, root / 'out', 1)
             rows = contract.read_json(root / 'out/runs.json')['attempts']
             self.assertEqual([row['status'] for row in rows], ['failed', 'failed'])
             attempt = root / 'out' / rows[0]['directory']
