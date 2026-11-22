@@ -121,6 +121,22 @@ jobs:
         if: ${{ !cancelled() }}
         shell: pwsh
         run: tests/windows/test-process-reader-handles.ps1
+      - name: Build native clipboard foreground actor before timed startup
+        if: ${{ !cancelled() }}
+        shell: cmd
+        run: cl /nologo /std:c++17 /EHsc /W4 /WX /D_WIN32_WINNT=0x0A00 tests\windows\clipboard\foreground_helper.cc /Fe:clipboard_foreground.exe user32.lib
+      - name: Native foreground HWND ownership, failure and parent-death cleanup
+        if: ${{ !cancelled() }}
+        timeout-minutes: 3
+        shell: pwsh
+        run: tests/windows/clipboard/ForeignForegroundChecks.ps1 -Executable ./clipboard_foreground.exe
+      - name: Preserve native foreground fixture evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clipboard-foreground-${{ matrix.os }}
+          path: ${{ runner.temp }}/clipboard-foreground-contract-*/**
+          if-no-files-found: warn
       - name: Release updater and control panel contracts on Windows PowerShell 5.1
         if: ${{ !cancelled() }}
         shell: powershell
@@ -2043,6 +2059,8 @@ jobs:
             dist/realtime-signals-evidence/**/*.json
             ${{ runner.temp }}/gesher-root/devsvc-toast-*-projection.jsonl
             ${{ runner.temp }}/gesher-root/logs/system_server.log
+            ${{ runner.temp }}/clipboard-foreground-*/*.log
+            ${{ runner.temp }}/clipboard-foreground-*/*.json
           if-no-files-found: error
 
   test:
