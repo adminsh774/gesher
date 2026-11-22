@@ -90,3 +90,5 @@ Assert-Stderr ($prefix.LastIndexOf("`$ErrorActionPreference = 'Continue'") -gt $
 Assert-Stderr ($dex.Substring($run).Contains('if ($null -eq $global:LASTEXITCODE)')) 'gesher.ps1 fails when the VM cannot start'
 
 Write-Host "Native stderr checks passed ($script:checks)."
+# The probes above leave non-zero native exit codes; this script's result is its checks.
+exit 0
