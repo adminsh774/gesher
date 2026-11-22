@@ -614,7 +614,17 @@ final class ActiveServices {
                 && type != ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE) {
             type &= ~ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE;
         }
-        if (targetSdk < android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return type;
+        // These AOSP compatibility changes are queried by UID, unlike the base P
+        // permission above. PlatformCompat requires the change to be enabled for
+        // every installed package sharing that UID; one older sibling keeps the
+        // legacy behavior. Read the current immutable package snapshot, not a cache
+        // that could retain an older target after update/removal of that sibling.
+        for (ApkPackage member : mPm.packages()) {
+            if (member.uid() == owner.uid()
+                    && member.parsed.getTargetSdkVersion() < android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                return type;
+            }
+        }
         if (type == ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE) {
             if (requestedType == ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST) {
                 throw new android.app.MissingForegroundServiceTypeException(

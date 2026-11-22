@@ -29,6 +29,7 @@ The contract reference is AOSP `frameworks/base` tag `android-16.0.0_r4`, matchi
 | [ForegroundServiceTypePolicy.java](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/core/java/android/app/ForegroundServiceTypePolicy.java) | `355f331afd2bcc216d6ea79eb36dc7b771ef4d1e` | Target 34 compatibility changes; normal type permissions; registered default policies |
 | [Service.java](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/core/java/android/app/Service.java) | `9f09e1d8713e994f5b91f65dc08c9aaf9f65db97` | Public promotion overloads and MANIFEST/NONE distinction |
 | [ServiceInfo.java](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/core/java/android/content/pm/ServiceInfo.java) | `184b16e37cb2d064a7fab50291696381f85b62a2` | Type constants and public type meaning |
+| [PlatformCompat.java](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/services/core/java/com/android/server/compat/PlatformCompat.java) | `8ed1b537bf7ef25a41d16f8173ad6641429efeb2` | UID compatibility changes require every installed UID member to meet its target threshold |
 
 Public documentation: [launching a foreground service](https://developer.android.com/develop/background-work/services/fgs/launch)
 and [Android 14 foreground-service types](https://developer.android.com/about/versions/14/changes/fgs-types-required).
@@ -57,6 +58,13 @@ foreground-service state and a notification despite these missing prerequisites.
 | Hidden FILE_MANAGEMENT | It is unregistered in the pinned default policy, so it follows the unknown-type rule |
 | `stopForeground` / notification ID zero | No promotion permission/type checks; existing foreground state and start eligibility are cleared |
 | Failed promotion/update | Existing ID, type, capabilities and notification publication remain unchanged |
+
+The target-34 type-policy compatibility changes are evaluated **per UID**: all
+installed members must target 34 or later. An older shared-UID sibling preserves
+legacy type behavior even for a newer service owner. The current package snapshot
+is used on every promotion, so replacing or removing that sibling updates the
+gate. The base target-28 permission requirement remains per owning application,
+as in AOSP; permission grants themselves use the UID union.
 
 The manifest permission check uses the installed service UID, including the
 existing shared-UID permission policy. A server/system caller cannot lend its
@@ -98,14 +106,15 @@ Local implementation checks, before independent review:
 | Complete current app Java compilation and DEX build | Passed |
 | Complete services-test DEX compilation | Passed |
 | Updated `devsvc.apk` resource, Java, DEX and alignment build | Passed |
-| Foreground admission host fixture | 147 checks passed |
+| Foreground admission host fixture | 173 checks passed |
 | Original-base negative control | Fails at target-28 missing base permission being accepted |
 | Separate original-base type/permission/normalization controls | Fail respectively at missing manifest type, missing data-sync permission and unstripped SHORT_SERVICE |
+| Pre-review candidate shared-UID control | Fails because a target-34 owner with a target-33 sibling incorrectly rejects NONE |
 | Existing AppOps production host contracts | 482 checks passed |
 | Existing service rebinding production host contracts | 431 checks passed |
 
 The host runner accepts `--source-ref` and individual `--scenario` values
-(`base`, `types`, `permissions`, `normalization`) to establish pre-fix regression
+(`base`, `types`, `permissions`, `normalization`, `shared-uid`) to establish pre-fix regression
 sensitivity. It does not replace production methods with a reimplementation.
 
 CI now runs the host fixture in `.github/workflows/framework.yml` and the same
@@ -122,6 +131,14 @@ candidate Windows runtime executed. The minimal local AOSP source tree also
 produces only the local-source compatibility table entries, so these local
 outputs are not release artifacts. The full CI build uses its own pinned AOSP
 sources and complete generated compatibility table.
+
+Independent review of the first candidate identified the distinction between
+owner-target base-permission enforcement and UID-wide type compatibility.
+The correction adds installed shared-UID metadata, real PM replacement/removal
+publication, normal-permission union checks, and an unrelated-UID control.
+The new shared-UID scenario reproduces the first candidate's rejection before
+passing with the corrected production path. Final independent review and CI are
+still separate gates.
 
 ## Remaining F06 work and qualification limits
 

@@ -73,6 +73,14 @@ public final class ForegroundServiceAdmissionTest {
         try { return c.newInstance(args); }
         catch (InvocationTargetException error) { throw new AssertionError("Fixture construction failed", error.getCause()); }
     }
+    private static Object call(Object obj, String name, Class<?>[] types, Object... args) throws Exception {
+        var method = obj.getClass().getDeclaredMethod(name, types); method.setAccessible(true);
+        try { return method.invoke(obj, args); }
+        catch (InvocationTargetException error) {
+            if (error.getCause() instanceof Exception cause) throw cause;
+            throw new AssertionError("Fixture publication failed", error.getCause());
+        }
+    }
     private static void rejects(Class<? extends Throwable> type, Work work, String message) throws Exception {
         try { work.run(); }
         catch (Throwable failure) {
@@ -89,21 +97,27 @@ public final class ForegroundServiceAdmissionTest {
         };
     }
     private static ApkPackage code(int targetSdk, int manifestType, String... permissions) throws Exception {
-        PackageImpl parsed = (PackageImpl) PackageImpl.forTesting(OWNER, "/fixture/foreground/base.apk");
+        return code(OWNER, UID, targetSdk, manifestType, permissions);
+    }
+    private static ApkPackage code(String name, int uid, int targetSdk, int manifestType,
+            String... permissions) throws Exception {
+        String path = "/fixture/foreground/" + name + "/base.apk";
+        PackageImpl parsed = (PackageImpl) PackageImpl.forTesting(name, path);
         parsed.setEnabled(true); parsed.setTargetSdkVersion(targetSdk);
+        parsed.setSharedUserId("fixture.foreground.shared." + uid);
         for (String permission : permissions) {
             parsed.addUsesPermission(new ParsedUsesPermissionImpl(permission, 0, java.util.Set.of()));
         }
         parsed.addUsesPermission(new ParsedUsesPermissionImpl(Manifest.permission.POST_NOTIFICATIONS,
                 0, java.util.Set.of()));
         ParsedServiceImpl service = new ParsedServiceImpl();
-        service.setPackageName(OWNER); service.setName(SERVICE.getClassName());
-        service.setEnabled(true); service.setExported(false); service.setProcessName(OWNER);
+        service.setPackageName(name); service.setName(name + ".ForegroundService");
+        service.setEnabled(true); service.setExported(false); service.setProcessName(name);
         service.setForegroundServiceType(manifestType);
         parsed.addService(service); parsed.hideAsFinal();
         ApkPackage code = (ApkPackage) UNSAFE.allocateInstance(ApkPackage.class);
-        set(code, "packageName", OWNER); set(code, "parsed", parsed); set(code, "mUid", UID);
-        set(code, "apkPath", "/fixture/foreground/base.apk"); set(code, "mDataDir", "/fixture/foreground/data");
+        set(code, "packageName", name); set(code, "parsed", parsed); set(code, "mUid", uid);
+        set(code, "apkPath", path); set(code, "mDataDir", "/fixture/foreground/" + name + "/data");
         set(code, "sharedLibraries", field(type("SharedLibraryGraph"), "EMPTY").get(null));
         set(code, "mSigningIdentityChecked", true);
         set(code, "mVerifiedSignatures", new android.content.pm.Signature[]{
@@ -126,11 +140,15 @@ public final class ForegroundServiceAdmissionTest {
         final NotificationManagerService notifications;
         final AppThread thread = new AppThread();
         final AtomicInteger posts = new AtomicInteger();
-        @SuppressWarnings("unchecked")
         Harness(int target, int manifestType, String... permissions) throws Exception {
+            this(target, manifestType, List.of(), permissions);
+        }
+        @SuppressWarnings("unchecked")
+        Harness(int target, int manifestType, List<ApkPackage> siblings, String... permissions) throws Exception {
             owner = code(target, manifestType, permissions);
+            List<ApkPackage> installed = new ArrayList<>(siblings); installed.add(owner);
             pm = (PackageManagerService) make(PackageManagerService.class,
-                    new Class<?>[]{Collection.class, boolean.class}, List.of(owner), false);
+                    new Class<?>[]{Collection.class, boolean.class}, installed, false);
             set(pm, "mPackageEventSender", (java.util.function.Consumer<Intent>) event -> {});
             if (!binder) {
                 // Only the host AssetManager boundary: actual Android normal-permission
@@ -310,6 +328,51 @@ public final class ForegroundServiceAdmissionTest {
                 "A foreign caller may not use another application's service token");
         combinedService.unchanged(1, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK, 0, 1);
     }
+    private static void sharedUidTargets() throws Exception {
+        String sibling = "fixture.foreground.sibling";
+        int media = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK;
+        ApkPackage legacy = code(sibling, UID, 33, 0, BASE);
+        Harness shared = new Harness(34, media, List.of(legacy));
+        check(shared.pm.getPackagesForUid(UID).length == 2,
+                "Shared-UID fixture must expose both installed packages through PackageManager");
+        shared.start(false);
+        shared.promote(1, 0);
+        shared.promote(2, media);
+        check(shared.selected() == media && shared.posts.get() == 2,
+                "A target-33 shared sibling keeps NONE and type permissions permissive for a target-34 service");
+        // Use actual PM replacement publication rather than modifying admitted metadata.
+        call(shared.pm, "add", new Class<?>[]{ApkPackage.class}, code(sibling, UID, 34, 0, BASE));
+        rejects(InvalidForegroundServiceTypeException.class, () -> shared.promote(3, 0),
+                "All UID members reaching target 34 must enable NONE rejection");
+        rejects(SecurityException.class, () -> shared.promote(3, media),
+                "All UID members reaching target 34 must enable normal type permission checks");
+        shared.unchanged(2, media, 0, 2);
+        call(shared.pm, "add", new Class<?>[]{ApkPackage.class}, code(sibling, UID, 34, 0, BASE, MEDIA));
+        shared.promote(3, media);
+        check(shared.selected() == media && shared.posts.get() == 3,
+                "The service receives real normal permissions granted to its shared UID sibling");
+        call(shared.pm, "remove", new Class<?>[]{String.class}, sibling);
+        rejects(SecurityException.class, () -> shared.promote(4, media),
+                "Removing the only permission-requesting sibling must remove its UID grant");
+        shared.unchanged(3, media, 0, 3);
+
+        Harness removal = new Harness(34, 0, List.of(code(sibling, UID, 33, 0)), BASE);
+        removal.start(false); removal.promote(1, ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST);
+        call(removal.pm, "remove", new Class<?>[]{String.class}, sibling);
+        rejects(MissingForegroundServiceTypeException.class,
+                () -> removal.promote(2, ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST),
+                "Removing a legacy sibling must recompute the current UID compatibility gate");
+        removal.unchanged(1, 0, 0, 1);
+
+        Harness unrelated = new Harness(34, 0, List.of(code(sibling, UID + 1, 27, 0)), BASE);
+        unrelated.start(false);
+        rejects(InvalidForegroundServiceTypeException.class, () -> unrelated.promote(1, 0),
+                "An older package under another UID must not weaken type checks");
+        Harness ownerP = new Harness(28, 0, List.of(code(sibling, UID, 27, 0)));
+        ownerP.start(false);
+        rejects(SecurityException.class, () -> ownerP.promote(1, 0),
+                "The P base permission gate remains tied to the owning app, not the UID minimum target");
+    }
     public static int run(boolean parcel, String scenario) throws Exception {
         binder = parcel; checks = 0;
         try (FixtureServiceContext.Scope owned = new FixtureServiceContext.Scope()) {
@@ -318,6 +381,7 @@ public final class ForegroundServiceAdmissionTest {
             if (scenario.equals("all") || scenario.equals("types")) typeBoundaries();
             if (scenario.equals("all") || scenario.equals("permissions")) manifestPermissions();
             if (scenario.equals("all") || scenario.equals("normalization")) normalizationAndStop();
+            if (scenario.equals("all") || scenario.equals("shared-uid")) sharedUidTargets();
         } finally { contexts = null; }
         return checks;
     }
