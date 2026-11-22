@@ -1,0 +1,249 @@
+// Copyright 2026 The Gesher Authors
+// SPDX-License-Identifier: Apache-2.0
+// Production socket types, registry, reservation, registration, adoption and
+// delivery. Only the Win32/CRT/Winsock/OFD boundaries below are substituted.
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <new>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <unordered_map>
+#include "socket_internal.h"
+#define FLAG_REGISTRATION @FLAG_REGISTRATION@
+
+using HANDLE=void*;
+using DWORD=unsigned long;
+constexpr unsigned GENERIC_READ=1, GENERIC_WRITE=2, FILE_SHARE_READ=1, FILE_SHARE_WRITE=2, OPEN_EXISTING=3;
+constexpr unsigned HANDLE_FLAG_INHERIT=1;
+constexpr int _O_RDWR=O_RDWR, _O_NOINHERIT=O_CLOEXEC;
+const HANDLE INVALID_HANDLE_VALUE=reinterpret_cast<HANDLE>(-1);
+static int ToFd(HANDLE h) { return static_cast<int>(reinterpret_cast<intptr_t>(h))-1; }
+static HANDLE ToHandle(int fd) { return fd<0?INVALID_HANDLE_VALUE:reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd)+1); }
+enum class HandleKind { kNone,kNul,kSocket,kOther };
+static std::array<HandleKind,16384> handles{};
+static std::array<bool,16384> owners{};
+static int live_handles,live_owners,flags_calls,checks,failures;
+enum class Failure { kNone,kStartup,kNonblock,kReserve,kCrt,kFlags,kOfd,kConfigure };
+static Failure failure;
+static DWORD last_error;
+static bool Fail(Failure point) {
+  if(failure!=point)return false;
+  failure=Failure::kNone;return true;
+}
+static void Check(bool good,const char* what) {
+  ++checks;if(!good){++failures;std::printf("FAIL socket receive: %s (errno=%d)\n",what,errno);}
+}
+static HANDLE Track(int fd,HandleKind kind) {
+  if(fd>=0){handles.at(fd)=kind;++live_handles;}return ToHandle(fd);
+}
+bool CloseHandle(HANDLE h) {
+  int fd=ToFd(h);
+  if(fd<0||static_cast<size_t>(fd)>=handles.size()||handles[fd]==HandleKind::kNone)return errno=EBADF,false;
+  if(::close(fd)!=0)return false;
+  handles[fd]=HandleKind::kNone;--live_handles;return true;
+}
+HANDLE CreateFileW(const wchar_t*,unsigned,unsigned,void*,unsigned,unsigned,void*) {
+  if(Fail(Failure::kReserve)){last_error=EMFILE;return INVALID_HANDLE_VALUE;}
+  return Track(::open("/dev/null",O_RDWR|O_CLOEXEC),HandleKind::kNul);
+}
+int _open_osfhandle(intptr_t raw,int flags) {
+  if(Fail(Failure::kCrt))return errno=ENFILE,-1;
+  int fd=ToFd(reinterpret_cast<HANDLE>(raw));
+  // CRT ownership does not grant HANDLE_FLAG_INHERIT to a private Win32 handle.
+  if(flags&_O_NOINHERIT)::fcntl(fd,F_SETFD,FD_CLOEXEC);
+  return fd;
+}
+int _close(int fd) { return CloseHandle(ToHandle(fd))?0:-1; }
+bool SetHandleInformation(HANDLE h,DWORD mask,DWORD flags) {
+  Check(mask==HANDLE_FLAG_INHERIT,"only the descriptor inheritance bit changes");
+  ++flags_calls;
+  if(Fail(Failure::kFlags)){last_error=EACCES;return false;}
+  return ::fcntl(ToFd(h),F_SETFD,flags&HANDLE_FLAG_INHERIT?0:FD_CLOEXEC)==0;
+}
+DWORD GetLastError(){return last_error;}
+
+namespace gesher {
+namespace record_locks {
+static std::recursive_mutex mutex;
+struct DescriptorGuard { std::lock_guard<std::recursive_mutex> lock{mutex}; };
+}
+enum class DescriptorKind { kFile=0,kZero=1,kRandom=2,kUnshareable=3 };
+constexpr uint32_t kTransferredSocket=1;
+constexpr uint64_t kTransferredCompletedFence=4;
+namespace wire { constexpr unsigned kRightsMaxInFlight=8192,kSocketFileDescription=4,kNativeFenceFileDescription=5; }
+int FailWithLastError(){return errno=static_cast<int>(last_error),-1;}
+int ErrnoFromWin32(DWORD error){return static_cast<int>(error);}
+int CrtResult(int value){return value;}
+int SetDescriptorKind(int fd,DescriptorKind kind) {
+  Check(kind==DescriptorKind::kUnshareable,"socket placeholder remains unshareable");
+  if(Fail(Failure::kOfd))return errno=ENOMEM,-1;
+  Check(!owners.at(fd),"reservation creates exactly one OFD owner");
+  owners[fd]=true;++live_owners;return 0;
+}
+void ForgetOfd(int fd){if(owners.at(fd)){owners[fd]=false;--live_owners;}}
+@DECLARATIONS@
+namespace ws {
+bool Startup(){return Fail(Failure::kStartup)?(errno=EPROTONOSUPPORT,false):true;}
+int SetNonBlocking(Socket socket,bool on) {
+  if(Fail(Failure::kNonblock))return errno=EIO,-1;
+  return ::fcntl(ToFd(reinterpret_cast<HANDLE>(socket)),F_SETFL,on?O_NONBLOCK:0);
+}
+int Close(Socket socket,const std::shared_ptr<SocketDescription>&,bool) {
+  return CloseHandle(reinterpret_cast<HANDLE>(socket))?0:-1;
+}
+Provider ClassifyProvider(Socket){return Provider::kOther;}
+int ConfigureOwnedDatagram(Socket){return Fail(Failure::kConfigure)?(errno=ENOBUFS,-1):0;}
+}
+@REGISTRY@
+@REGISTRATION@
+}
+
+namespace ws=gesher::ws;
+using gesher::SocketFd;
+namespace {
+@SOCKET@
+}
+@ADOPTION@
+
+namespace gesher {
+// Non-socket adopters are explicit boundaries for this socket-only fixture;
+// native_fence_receive and OFD fixtures independently execute their real bodies.
+int AdoptNativeFence(HANDLE h,uint64_t,bool){CloseHandle(h);return errno=EOPNOTSUPP,-1;}
+int AdoptFileDescription(HANDLE h,HANDLE shared,DescriptorKind,bool){CloseHandle(h);CloseHandle(shared);return errno=EOPNOTSUPP,-1;}
+@RECEIVE@
+template<class T> void Put(Reply& reply,T value) {
+  auto* p=reinterpret_cast<unsigned char*>(&value);reply.bytes.insert(reply.bytes.end(),p,p+sizeof(value));
+}
+struct NativePair {
+  HANDLE owned=INVALID_HANDLE_VALUE;
+  int peer=-1;
+  explicit NativePair(bool sender_cloexec=true) {
+    int pair[2];
+    if(::socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,pair)==0) {
+      owned=Track(pair[0],HandleKind::kSocket);peer=pair[1];
+      ::fcntl(pair[0],F_SETFD,sender_cloexec?FD_CLOEXEC:0);
+    }
+    Check(owned!=INVALID_HANDLE_VALUE,"real host socketpair prerequisite");
+    if(owned==INVALID_HANDLE_VALUE)std::exit(77);
+  }
+  ~NativePair(){if(peer>=0)::close(peer);}
+};
+Reply Incoming(HANDLE owned,uint64_t metadata=1,HANDLE shared=nullptr,unsigned kind=4) {
+  Reply reply;Put<int32_t>(reply,0);Put<uint32_t>(reply,1);
+  Put<uint64_t>(reply,reinterpret_cast<uintptr_t>(owned));Put<uint64_t>(reply,metadata);
+  Put<uint64_t>(reply,reinterpret_cast<uintptr_t>(shared));Put<uint32_t>(reply,kind);return reply;
+}
+void Retire(int fd) {
+  SocketFd state;bool last=false;
+  Check(Remove(fd,&state,&last),"actual registry removes the owned descriptor");
+  if(last)Check(ws::Close(state.socket)==0,"last descriptor retires the actual endpoint");
+  ForgetOfd(fd);Check(_close(fd)==0,"private CRT reservation retires");
+}
+void Clean(int before,int ofds,size_t registered) {
+  Check(live_handles==before,"every native handle is owned or closed");
+  Check(live_owners==ofds,"all OFD reservations retire");
+  Check(table.size()==registered && socket_count.load()==registered,"actual registry has no stale socket owner");
+}
+void ReceiveFlags() {
+  for(bool sender:{false,true})for(bool requested:{false,true})for(bool nonblocking:{false,true}) {
+    int before=live_handles,ofds=live_owners;size_t registered=table.size();
+    NativePair pair(sender);
+    uint64_t metadata=kTransferredSocket|kTransferUnixStream|kTransferPassCredentials|
+                      kTransferPeerCredentials|(uint64_t{123}<<32)|(uint64_t{25}<<kTransferPidShift);
+    if(nonblocking)metadata|=kTransferNonBlocking;
+    Reply reply=Incoming(pair.owned,metadata);std::vector<int> fds;
+    Check(ReadDelivered(reply,&fds,true,requested)&&fds.size()==1&&fds[0]>=0,"actual socket delivery succeeds");
+    if(fds.size()==1&&fds[0]>=0) {
+      int fd=fds[0];SocketFd state;
+      Check((::fcntl(fd,F_GETFD)&FD_CLOEXEC)==(requested?FD_CLOEXEC:0),"receiver alone chooses FD_CLOEXEC");
+      Check(LookupSocket(fd,&state),"actual socket registry owns the received endpoint");
+      Check(state.socket==reinterpret_cast<uintptr_t>(pair.owned),"same native endpoint is retained");
+      Check(state.description->nonblocking.load()==nonblocking &&
+            bool(::fcntl(ToFd(pair.owned),F_GETFL)&O_NONBLOCK)==nonblocking,"logical and native nonblocking state survive");
+      Check(state.description->unix_stream_pair.load()&&state.description->pass_credentials.load()&&
+            state.description->has_peer_credentials&&state.description->peer_pid==100&&
+            state.description->peer_uid==123&&state.description->peer_gid==123,"framing and peer credentials survive");
+      uintptr_t exported=0;uint64_t outgoing=0;
+      Check(TransferSocket(fd,&exported,&outgoing)&&exported==state.socket&&outgoing==metadata,"actual socket export preserves transfer metadata");
+      char byte=0;
+      Check(::send(pair.peer,"x",1,MSG_NOSIGNAL)==1&&::recv(ToFd(pair.owned),&byte,1,0)==1&&byte=='x',"received native endpoint remains usable");
+      Retire(fd);
+    }
+    Clean(before,ofds,registered);
+  }
+  int before=live_handles,ofds=live_owners,calls=flags_calls;size_t registered=table.size();
+  NativePair pair;
+  int fd=AdoptSocket(reinterpret_cast<uintptr_t>(pair.owned),kTransferredSocket);
+  Check(fd>=0&&(::fcntl(fd,F_GETFD)&FD_CLOEXEC),"direct and Binder two-argument default remains CLOEXEC");
+  Check(flags_calls==calls,"default adoption introduces no native inheritance mutation");
+  if(fd>=0)Retire(fd);
+  Clean(before,ofds,registered);
+}
+void FailureOwnership() {
+  const std::pair<Failure,int> modes[]={{Failure::kStartup,EPROTONOSUPPORT},{Failure::kNonblock,EIO},
+    {Failure::kReserve,EMFILE},{Failure::kCrt,ENFILE},{Failure::kFlags,EACCES},
+    {Failure::kOfd,ENOMEM},{Failure::kConfigure,ENOBUFS}};
+  for(auto [mode,error]:modes) {
+    int before=live_handles,ofds=live_owners;size_t registered=table.size();
+    NativePair pair;Reply reply=Incoming(pair.owned);std::vector<int> fds;
+    failure=mode;
+    Check(ReadDelivered(reply,&fds,true,false)&&fds==std::vector<int>{-1},"failure never publishes a successful socket fd");
+    Check(errno==error,"original error survives private CRT and native endpoint cleanup");
+    failure=Failure::kNone;
+    for(int fd:fds)if(fd>=0)Retire(fd);
+    Clean(before,ofds,registered);
+    // A mutation control may deliberately omit retirement; quarantine it in
+    // the test after the leak assertion so following controls remain bounded.
+    if(handles[ToFd(pair.owned)]!=HandleKind::kNone)CloseHandle(pair.owned);
+  }
+  int before=live_handles,ofds=live_owners;size_t registered=table.size();
+  NativePair pair;
+  int first=AdoptSocket(reinterpret_cast<uintptr_t>(pair.owned),kTransferredSocket);
+  Check(first>=0,"alias failure source adopts");
+  if(first>=0) {
+    SocketFd state;Check(LookupSocket(first,&state),"alias captures actual shared owner");
+    for(Failure mode:{Failure::kReserve,Failure::kCrt,Failure::kOfd
+#if FLAG_REGISTRATION
+      ,Failure::kFlags
+#endif
+    }) {
+      failure=mode;
+      // The conditional call lets immutable old declarations compile unchanged.
+      int alias=RegisterSocket(state
+#if FLAG_REGISTRATION
+        ,false
+#endif
+      );
+      Check(alias<0,"failed alias registration reports failure");
+      failure=Failure::kNone;
+      if(alias>=0)Retire(alias);
+      Check(state.description->descriptor_refs==1&&handles[ToFd(pair.owned)]==HandleKind::kSocket,
+            "failed alias keeps the surviving socket and exact descriptor refcount");
+      Clean(before+2,ofds+1,registered+1);
+    }
+    Retire(first);
+  }
+  Clean(before,ofds,registered);
+}
+void RejectAndDiscard() {
+  for(unsigned variant=0;variant<4;++variant) {
+    int before=live_handles,ofds=live_owners;size_t registered=table.size();NativePair pair;
+    HANDLE shared=variant==1?Track(::open("/dev/null",O_RDWR|O_CLOEXEC),HandleKind::kOther):nullptr;
+    Reply reply=Incoming(pair.owned,variant==0?0:1,shared,variant==2?6:4);
+    std::vector<int> fds;
+    Check(ReadDelivered(reply,variant==3?nullptr:&fds,variant!=3,false),"bounded invalid/discarded reply is consumed");
+    if(variant!=3)Check(fds==std::vector<int>{-1},"wrong socket metadata, shared handle or kind is rejected");
+    for(int fd:fds)if(fd>=0)Retire(fd);
+    Clean(before,ofds,registered);
+  }
+}
+}
+int main() {
+  gesher::ReceiveFlags();gesher::FailureOwnership();gesher::RejectAndDiscard();
+  std::printf("SOCKET_RECEIVE checks=%d failures=%d (declared Linux Win32/CRT/Winsock boundaries)\n",checks,failures);
+  return failures?1:0;
+}

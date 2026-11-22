@@ -125,13 +125,22 @@ int ReadDevice(Device device, void* buf, unsigned int count) {
 
 }  // namespace
 
-int ReserveFd() {
+int ReserveFd(bool close_on_exec) {
   HANDLE h = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                          nullptr, OPEN_EXISTING, 0, nullptr);
   if (h == INVALID_HANDLE_VALUE) return FailWithLastError();
   record_locks::DescriptorGuard descriptor_guard;
-  int fd = CrtResult(_open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDWR | _O_NOINHERIT));
+  int fd = CrtResult(_open_osfhandle(reinterpret_cast<intptr_t>(h),
+                                    _O_RDWR | (close_on_exec ? _O_NOINHERIT : 0)));
   if (fd < 0) CloseHandle(h);
+  else if (!close_on_exec &&
+           !SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+    // No OFD or virtual-resource owner is published until the receiver's flag
+    // is established. Failure consumes this private CRT slot only.
+    const int error = ErrnoFromWin32(GetLastError());
+    _close(fd);
+    return errno = error, -1;
+  }
   else if (SetDescriptorKind(fd, DescriptorKind::kUnshareable) < 0) {
     int error = errno;
     _close(fd);
@@ -140,9 +149,9 @@ int ReserveFd() {
   return fd;
 }
 
-int RegisterSocket(const SocketFd& state) {
+int RegisterSocket(const SocketFd& state, bool close_on_exec) {
   record_locks::DescriptorGuard descriptor_guard;
-  int fd = ReserveFd();
+  int fd = ReserveFd(close_on_exec);
   if (fd < 0) {
     int saved = errno;
     // An alias registration failure must not close the shared native socket.

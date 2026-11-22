@@ -326,6 +326,7 @@ jobs:
         run: |
           python3 tools/test_egl_fence_contracts.py --sanitize
           python3 tools/test_native_fence_receive.py --sanitize
+          python3 tools/test_socket_receive.py --sanitize --linux-reference
 
       - name: Freopen contracts against the pinned glibc reference
         run: bash tools/ci/test-freopen-reference.sh

@@ -1,0 +1,130 @@
+diff --git a/compat/posix/src/fd.cc b/compat/posix/src/fd.cc
+index c001fa73858150fd30ef0ca0ee6622df057f5a99..3883b33cd4882cd3b9c61844771ed11fddf8e576 100644
+--- a/compat/posix/src/fd.cc
++++ b/compat/posix/src/fd.cc
+@@ -125,13 +125,22 @@ int ReadDevice(Device device, void* buf, unsigned int count) {
+ 
+ }  // namespace
+ 
+-int ReserveFd() {
++int ReserveFd(bool close_on_exec) {
+   HANDLE h = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          nullptr, OPEN_EXISTING, 0, nullptr);
+   if (h == INVALID_HANDLE_VALUE) return FailWithLastError();
+   record_locks::DescriptorGuard descriptor_guard;
+-  int fd = CrtResult(_open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDWR | _O_NOINHERIT));
++  int fd = CrtResult(_open_osfhandle(reinterpret_cast<intptr_t>(h),
++                                    _O_RDWR | (close_on_exec ? _O_NOINHERIT : 0)));
+   if (fd < 0) CloseHandle(h);
++  else if (!close_on_exec &&
++           !SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
++    // No OFD or virtual-resource owner is published until the receiver's flag
++    // is established. Failure consumes this private CRT slot only.
++    const int error = ErrnoFromWin32(GetLastError());
++    _close(fd);
++    return errno = error, -1;
++  }
+   else if (SetDescriptorKind(fd, DescriptorKind::kUnshareable) < 0) {
+     int error = errno;
+     _close(fd);
+@@ -140,9 +149,9 @@ int ReserveFd() {
+   return fd;
+ }
+ 
+-int RegisterSocket(const SocketFd& state) {
++int RegisterSocket(const SocketFd& state, bool close_on_exec) {
+   record_locks::DescriptorGuard descriptor_guard;
+-  int fd = ReserveFd();
++  int fd = ReserveFd(close_on_exec);
+   if (fd < 0) {
+     int saved = errno;
+     // An alias registration failure must not close the shared native socket.
+diff --git a/compat/posix/src/internal.h b/compat/posix/src/internal.h
+index 8ce83721208bb9f8da14a73ee07349b5cb98994e..42041a8d75db94868b4778993edd474e5c5f34d1 100644
+--- a/compat/posix/src/internal.h
++++ b/compat/posix/src/internal.h
+@@ -140,7 +140,7 @@ std::string WindowsZoneId();
+ 
+ // A new CRT fd open on NUL (fd.cc), which reserves a number for an fd that
+ // gesher-base serves itself: a socket, eventfd or epoll.
+-int ReserveFd();
++int ReserveFd(bool close_on_exec = true);
+ 
+ // Roll back a private, unpublished duplication while another guarded user
+ // alias survives. Retires actual virtual resources/bookkeeping without
+@@ -185,8 +185,9 @@ inline constexpr uint32_t kTransferredSocket = 0x1;
+ // False if fd is not a socket; else its handle and description's metadata.
+ bool TransferSocket(int fd, uintptr_t* socket, uint64_t* metadata);
+ // A new fd for `socket`, this process's own handle (taken over, closed on
+-// failure), with the description `metadata` describes; -1 with errno.
+-int AdoptSocket(uintptr_t socket, uint64_t metadata);
++// failure), with the description `metadata` describes; -1 with errno. Binder
++// and direct adoption retain CLOEXEC; SCM_RIGHTS supplies the receiver's choice.
++int AdoptSocket(uintptr_t socket, uint64_t metadata, bool close_on_exec = true);
+ // dup/dup2/F_DUPFD: `to` is a memfd exactly when `from` is.
+ void CopyMemfdRegistration(int from, int to);
+ // fcntl F_GET_SEALS / F_ADD_SEALS: -1 with errno (EINVAL for another file).
+diff --git a/compat/posix/src/socket.cc b/compat/posix/src/socket.cc
+index 6683c8c5a898fdfc3f0f11e0251544e66f799599..b464310b78394c900d3462d5f01a744b5c5fb33b 100644
+--- a/compat/posix/src/socket.cc
++++ b/compat/posix/src/socket.cc
+@@ -46,7 +46,7 @@ bool Lookup(int fd, SocketFd* state) {
+   return false;
+ }
+ 
+-int RegisterNew(ws::Socket s, bool nonblocking) {
++int RegisterNew(ws::Socket s, bool nonblocking, bool close_on_exec = true) {
+   // accept does not inherit O_NONBLOCK on Linux. Normalize both directions
+   // before publishing the new open description and its shared status flag.
+   if (ws::SetNonBlocking(s, nonblocking) < 0) {
+@@ -58,7 +58,7 @@ int RegisterNew(ws::Socket s, bool nonblocking) {
+   SocketFd state;
+   state.socket = s;
+   state.initial_nonblocking = nonblocking;
+-  return gesher::RegisterSocket(state);
++  return gesher::RegisterSocket(state, close_on_exec);
+ }
+ 
+ // Lifecycle controls invalidate a completed-refusal readiness classification
+@@ -1130,13 +1130,13 @@ bool gesher::TransferSocket(int fd, uintptr_t* socket, uint64_t* metadata) {
+   return true;
+ }
+ 
+-int gesher::AdoptSocket(uintptr_t socket, uint64_t metadata) {
++int gesher::AdoptSocket(uintptr_t socket, uint64_t metadata, bool close_on_exec) {
+   if (!ws::Startup()) {
+     int saved = errno;
+     ws::Close(socket);
+     return errno = saved, -1;
+   }
+-  int fd = RegisterNew(socket, (metadata & kTransferNonBlocking) != 0);
++  int fd = RegisterNew(socket, (metadata & kTransferNonBlocking) != 0, close_on_exec);
+   if (fd < 0) return -1;
+   SocketFd end;
+   if (gesher::LookupSocket(fd, &end)) {
+diff --git a/compat/posix/src/socket_internal.h b/compat/posix/src/socket_internal.h
+index b715fa5c720d575e7f676fd3eb4aaabd0b25a900..ad427799a4eac1340d145c81c80de50ce372cf82 100644
+--- a/compat/posix/src/socket_internal.h
++++ b/compat/posix/src/socket_internal.h
+@@ -364,7 +364,7 @@ uint64_t AdvanceStream(uint16_t port, bool sent, uint64_t bytes);
+ 
+ // Takes ownership of `state.socket`: returns its new fd, or -1 with errno set
+ // (the socket is then closed).
+-int RegisterSocket(const SocketFd& state);
++int RegisterSocket(const SocketFd& state, bool close_on_exec = true);
+ // False if fd is not a socket.
+ bool LookupSocket(int fd, SocketFd* state);
+ 
+diff --git a/compat/posix/src/unix_rights.cc b/compat/posix/src/unix_rights.cc
+index 9adb8023e59edc4cdf903ea4f8d29f49a6debe3f..60a1313cd4e0ffc67825fca13e0b19fcf8ee893a 100644
+--- a/compat/posix/src/unix_rights.cc
++++ b/compat/posix/src/unix_rights.cc
+@@ -178,7 +178,7 @@ bool ReadDelivered(Reply& reply, std::vector<int>* fds, bool adopt, bool close_o
+       continue;
+     }
+     if (socket) {
+-      fds->push_back(AdoptSocket(reinterpret_cast<uintptr_t>(h), metadata));
++      fds->push_back(AdoptSocket(reinterpret_cast<uintptr_t>(h), metadata, close_on_exec));
+     } else if (fence) {
+       // Adoption consumes the handle and admits only an immutable, signaled,
+       // read-only Gesher completion event (native_fence.cc).

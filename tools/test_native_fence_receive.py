@@ -26,7 +26,8 @@ def main():
     parser.add_argument('--sanitize', action='store_true')
     args = parser.parse_args()
     paths = ['compat/posix/src/native_fence.cc', 'compat/posix/src/native_fence_internal.h',
-             'compat/posix/src/fd.cc', 'compat/posix/src/unix_rights.cc']
+             'compat/posix/src/fd.cc', 'compat/posix/src/unix_rights.cc',
+             'compat/posix/src/internal.h']
     sources = {path: (subprocess.check_output(['git', 'show', args.source_ref + ':' + path],
                     cwd=ROOT).decode() if args.source_ref else (ROOT / path).read_text())
                for path in paths}
@@ -41,7 +42,7 @@ def main():
 
     fence = paths[0]
     pieces = {
-        'reserve': section(paths[2], 'int ReserveFd() {', '\nint RegisterSocket('),
+        'reserve': section(paths[2], 'int ReserveFd(', '\nint RegisterSocket('),
         'class': section(fence, 'class NativeFence {', '\nnamespace {'),
         'registry': section(fence, 'constexpr size_t kDescriptorCapacity', '\nbool MaybeFence('),
         'membership': section(fence, 'bool MaybeFence(', '\n// A wait registration'),
@@ -56,12 +57,17 @@ def main():
     if len(declaration) != 1 or not declaration[0].endswith(';'):
         raise ValueError('native-fence adoption declaration changed')
     pieces['declaration'] = declaration[0]
+    reserve_declaration = [line for line in sources[paths[4]].splitlines()
+                           if line.startswith('int ReserveFd(')]
+    if len(reserve_declaration) != 1 or not reserve_declaration[0].endswith(';'):
+        raise ValueError('descriptor reservation declaration changed')
+    pieces['reserve_declaration'] = reserve_declaration[0]
     print('NATIVE_FENCE_RECEIVE_PRODUCTION ' + ' '.join(
         name + '=' + hashlib.sha256(value.encode()).hexdigest()
         for name, value in pieces.items()), flush=True)
     template = (ROOT / 'tests/native/native_fence_receive_host.cc.in').read_text()
     bodies = '\n'.join(pieces[key] for key in (
-        'reserve', 'class', 'registry', 'membership', 'register', 'lookup_retire',
+        'reserve_declaration', 'reserve', 'class', 'registry', 'membership', 'register', 'lookup_retire',
         'declaration', 'adopt', 'reply', 'receive'))
     if template.count('@PRODUCTION@') != 1:
         raise ValueError('native-fence fixture marker changed')

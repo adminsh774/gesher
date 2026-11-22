@@ -140,7 +140,7 @@ std::string WindowsZoneId();
 
 // A new CRT fd open on NUL (fd.cc), which reserves a number for an fd that
 // gesher-base serves itself: a socket, eventfd or epoll.
-int ReserveFd();
+int ReserveFd(bool close_on_exec = true);
 
 // Roll back a private, unpublished duplication while another guarded user
 // alias survives. Retires actual virtual resources/bookkeeping without
@@ -185,8 +185,9 @@ inline constexpr uint32_t kTransferredSocket = 0x1;
 // False if fd is not a socket; else its handle and description's metadata.
 bool TransferSocket(int fd, uintptr_t* socket, uint64_t* metadata);
 // A new fd for `socket`, this process's own handle (taken over, closed on
-// failure), with the description `metadata` describes; -1 with errno.
-int AdoptSocket(uintptr_t socket, uint64_t metadata);
+// failure), with the description `metadata` describes; -1 with errno. Binder
+// and direct adoption retain CLOEXEC; SCM_RIGHTS supplies the receiver's choice.
+int AdoptSocket(uintptr_t socket, uint64_t metadata, bool close_on_exec = true);
 // dup/dup2/F_DUPFD: `to` is a memfd exactly when `from` is.
 void CopyMemfdRegistration(int from, int to);
 // fcntl F_GET_SEALS / F_ADD_SEALS: -1 with errno (EINVAL for another file).

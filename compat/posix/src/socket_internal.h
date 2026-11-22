@@ -364,7 +364,7 @@ uint64_t AdvanceStream(uint16_t port, bool sent, uint64_t bytes);
 
 // Takes ownership of `state.socket`: returns its new fd, or -1 with errno set
 // (the socket is then closed).
-int RegisterSocket(const SocketFd& state);
+int RegisterSocket(const SocketFd& state, bool close_on_exec = true);
 // False if fd is not a socket.
 bool LookupSocket(int fd, SocketFd* state);
 

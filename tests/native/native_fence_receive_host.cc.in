@@ -113,7 +113,7 @@ bool CompletedEvent(HANDLE h) {
 void WakePollers() {}
 // Ordinary-file and socket adoption are declared boundaries here. The Windows
 // mixed SCM test below exercises the genuine production implementations.
-int AdoptSocket(uintptr_t owned,uint64_t) { CloseHandle(reinterpret_cast<HANDLE>(owned)); return errno=EOPNOTSUPP,-1; }
+int AdoptSocket(uintptr_t owned,uint64_t,bool = true) { CloseHandle(reinterpret_cast<HANDLE>(owned)); return errno=EOPNOTSUPP,-1; }
 int AdoptFileDescription(HANDLE file,HANDLE shared,DescriptorKind,bool close_on_exec) {
   CloseHandle(shared);
   int fd=ToFd(file);

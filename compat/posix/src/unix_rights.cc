@@ -178,7 +178,7 @@ bool ReadDelivered(Reply& reply, std::vector<int>* fds, bool adopt, bool close_o
       continue;
     }
     if (socket) {
-      fds->push_back(AdoptSocket(reinterpret_cast<uintptr_t>(h), metadata));
+      fds->push_back(AdoptSocket(reinterpret_cast<uintptr_t>(h), metadata, close_on_exec));
     } else if (fence) {
       // Adoption consumes the handle and admits only an immutable, signaled,
       // read-only Gesher completion event (native_fence.cc).

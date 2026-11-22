@@ -411,7 +411,7 @@ void Transfer(EGLDisplay display) {
   CloseHandle(proceed);
 }
 
-ssize_t SendRights(int socket, const std::array<int, 2>& descriptors) {
+ssize_t SendRights(int socket, const std::array<int, 3>& descriptors) {
   alignas(cmsghdr) char control[CMSG_SPACE(sizeof(descriptors))]{};
   char byte = 'F';
   iovec data{&byte, 1};
@@ -426,7 +426,7 @@ ssize_t SendRights(int socket, const std::array<int, 2>& descriptors) {
 }
 
 std::vector<int> ReceiveRights(int socket, bool close_on_exec) {
-  alignas(cmsghdr) char control[CMSG_SPACE(2 * sizeof(int))]{};
+  alignas(cmsghdr) char control[CMSG_SPACE(3 * sizeof(int))]{};
   char byte = 0;
   iovec data{&byte, 1};
   msghdr message{};
@@ -534,6 +534,45 @@ void DescriptorOperations(int fd) {
         "failed native export and launch leave the original fence usable");
 }
 
+void SocketDescriptorLimits(int fd) {
+  uintptr_t native = 0; uint64_t metadata = 0;
+  Check(gesher::TransferSocket(fd, &native, &metadata), "received socket retains its typed native transfer route");
+  HANDLE duplicate = nullptr;
+  if (native && DuplicateHandle(GetCurrentProcess(), reinterpret_cast<HANDLE>(native),
+                               GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+    int adopted = gesher::AdoptSocket(reinterpret_cast<uintptr_t>(duplicate), metadata);
+    Check(adopted >= 0 && fcntl(adopted, F_GETFD) == FD_CLOEXEC,
+          "real direct socket adoption retains Binder's two-argument CLOEXEC default");
+    if (adopted >= 0) close(adopted);
+  } else Check(false, "direct socket adoption control duplicates the actual native endpoint");
+  auto snapshot = gesher::CaptureDescriptor(fd);
+  Check(snapshot && snapshot->kind == gesher::DescriptorKind::kUnshareable,
+        "received non-CLOEXEC socket remains unshareable by the generic startup format");
+  if (!snapshot) return;
+  gesher::NativeFileDescriptionExport exported;
+  errno = 0;
+  Check(exported.Prepare(snapshot) == -1 && errno == EOPNOTSUPP,
+        "raw-file export rejects a socket reservation instead of substituting NUL");
+  std::array<wchar_t, 32768> path{};
+  DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+  Check(length > 0 && length < path.size(), "socket startup control resolves its actual executable");
+  if (!length || length >= path.size()) return;
+  gesher::exec::Launch launch{path.data(), L"", "exe"};
+  gesher::exec::AppendQuoted(&launch.command_line, launch.application);
+  launch.command_line += L" --unexpected-socket-inherit";
+  PROCESS_INFORMATION child{};
+  DWORD error = gesher::exec::SpawnWithFds(launch, nullptr, L"", {{37, snapshot->handle, snapshot}}, &child);
+  Check(error == ERROR_NOT_SUPPORTED && !child.hProcess && !child.hThread,
+        "unsupported socket startup inheritance fails before creating a child");
+  if (child.hProcess) {
+    TerminateProcess(child.hProcess, 1); WaitForSingleObject(child.hProcess, 1000); CloseHandle(child.hProcess);
+  }
+  if (child.hThread) CloseHandle(child.hThread);
+  uintptr_t retained = 0; uint64_t retained_metadata = 0;
+  Check(gesher::TransferSocket(fd, &retained, &retained_metadata) && retained == native && retained_metadata == metadata,
+        "failed generic export and launch preserve the actual socket owner");
+}
+
 void MalformedAdoption(int fd) {
   uintptr_t value = 0;
   uint64_t metadata = 0;
@@ -572,7 +611,7 @@ void RightsTransfers(EGLDisplay display) {
   const int before = failures.load();
   for (int type : {SOCK_STREAM, SOCK_DGRAM}) for (bool sender_cloexec : {false, true})
       for (bool receiver_cloexec : {false, true}) {
-    int sockets[2]{-1, -1}, pipefd[2]{-1, -1};
+    int sockets[2]{-1, -1}, pipefd[2]{-1, -1}, endpoint[2]{-1, -1};
     Check(socketpair(AF_UNIX, type, 0, sockets) == 0, "real SCM stream/datagram socketpair is created");
     if (sockets[0] < 0) continue;
     int error = EGL_SUCCESS;
@@ -582,32 +621,39 @@ void RightsTransfers(EGLDisplay display) {
     Check(fence >= 0 && fcntl(fence, F_GETFD) == FD_CLOEXEC,
           "new native fence exports retain their existing CLOEXEC default");
     Check(pipe(pipefd) == 0, "mixed SCM batch includes a real ordinary pipe");
-    if (fence < 0 || pipefd[0] < 0) {
+    Check(socketpair(AF_UNIX, SOCK_STREAM, 0, endpoint) == 0, "mixed SCM batch includes a real transferable socket");
+    if (fence < 0 || pipefd[0] < 0 || endpoint[0] < 0) {
       if (fence >= 0) close(fence);
-      for (int owned : {pipefd[0], pipefd[1], sockets[0], sockets[1]}) if (owned >= 0) close(owned);
+      for (int owned : {pipefd[0], pipefd[1], sockets[0], sockets[1], endpoint[0], endpoint[1]}) if (owned >= 0) close(owned);
       continue;
     }
     Check(fcntl(fence, F_SETFD, sender_cloexec ? FD_CLOEXEC : 0) == 0 &&
-              fcntl(pipefd[0], F_SETFD, sender_cloexec ? FD_CLOEXEC : 0) == 0,
+              fcntl(pipefd[0], F_SETFD, sender_cloexec ? FD_CLOEXEC : 0) == 0 &&
+              fcntl(endpoint[1], F_SETFD, sender_cloexec ? FD_CLOEXEC : 0) == 0,
           "sender descriptors have the deliberately selected independent flags");
-    bool sent = SendRights(sockets[0], {fence, pipefd[0]}) == 1;
-    Check(sent, "real broker accepts the native-fence and ordinary-file batch");
-    close(fence); close(pipefd[0]); completion.reset();
+    bool sent = SendRights(sockets[0], {fence, pipefd[0], endpoint[1]}) == 1;
+    Check(sent, "real broker accepts the native-fence, ordinary-file and socket batch");
+    close(fence); close(pipefd[0]); close(endpoint[1]); completion.reset();
     Check(!gesher::LookupNativeFence(fence), "sender close retires its local fence before the receiver adopts it");
     Check(write(pipefd[1], "P", 1) == 1, "ordinary pipe data is written after sender descriptors close");
     close(pipefd[1]);
     auto received = sent ? ReceiveRights(sockets[1], receiver_cloexec) : std::vector<int>{};
-    Check(received.size() == 2, "real SCM receive returns both independently owned descriptors");
-    if (received.size() == 2) {
+    Check(received.size() == 3, "real SCM receive returns all three independently owned descriptors");
+    if (received.size() == 3) {
       for (int owned : received)
         Check(fcntl(owned, F_GETFD) == (receiver_cloexec ? FD_CLOEXEC : 0),
-              "MSG_CMSG_CLOEXEC alone selects both fence and ordinary receiver flags");
+              "MSG_CMSG_CLOEXEC alone selects fence, ordinary and socket receiver flags");
       pollfd ready{received[0], POLLIN, 0};
       Check(gesher::LookupNativeFence(received[0]) && poll(&ready, 1, 5000) == 1 && (ready.revents & POLLIN),
             "real received native completion survives all sender references closing");
       char byte = 0;
       Check(read(received[1], &byte, 1) == 1 && byte == 'P' && read(received[1], &byte, 1) == 0,
             "mixed ordinary pipe retains its contents and EOF after sender closure");
+      if (type == SOCK_STREAM && !sender_cloexec && !receiver_cloexec) SocketDescriptorLimits(received[2]);
+      pollfd socket_ready{received[2], POLLIN, 0};
+      Check(write(endpoint[0], "S", 1) == 1 && poll(&socket_ready, 1, 5000) == 1 &&
+                (socket_ready.revents & POLLIN) && read(received[2], &byte, 1) == 1 && byte == 'S',
+            "mixed received socket preserves its actual endpoint after source closure and export controls");
       if (type == SOCK_STREAM && !sender_cloexec && !receiver_cloexec) {
         MalformedAdoption(received[0]);
         DescriptorOperations(received[0]);
@@ -617,7 +663,7 @@ void RightsTransfers(EGLDisplay display) {
       Check(close(owned) == 0 && !gesher::LookupNativeFence(owned),
             "SCM receiver close retires every descriptor and fence membership");
     }
-    close(sockets[0]); close(sockets[1]);
+    close(sockets[0]); close(sockets[1]); close(endpoint[0]);
   }
   Check(failures.load() == before, "SCM native-fence receiver flags and ownership passed");
 }

@@ -296,6 +296,47 @@ def preceding_memmem_source(actual):
   assert actual.count(after)==1 and before not in actual,'exact reviewed memmem substitution changed'
   actual=actual.replace(after,before,1)
  return actual
+# The socket receiver flag is another exact transition above the independently
+# reviewed fence correction. Restore all five complete files to the published common baseline first;
+# then retain the fence roundtrip, all 71 original OFD pins and every supplier
+# authority check. A digest update without the exact reversible delta fails.
+SOCKET_RECEIVE_BASE='f8800806ffd3a52c3e28256c2d6dfd5129ef8e2e'
+SOCKET_RECEIVE_POLICY_SHA256='bea6798aa2adb9d44a6ff5a69bfb0bfdb1116b398d0197413aa3c1329d118d47'
+SOCKET_RECEIVE_QUALIFICATION_SHA256='5f68a81b51d351f6537fc2cf60590737b04dee43c788151c7c9ede457c8f9b32'
+SOCKET_RECEIVE_PATHS=['compat/posix/src/fd.cc','compat/posix/src/internal.h',
+                      'compat/posix/src/socket.cc','compat/posix/src/socket_internal.h',
+                      'compat/posix/src/unix_rights.cc']
+def preceding_socket_receive_sources():
+ folder=ROOT/'tools/net-tcp-priority/qualified'
+ raw=(folder/'socket-receive-source.json').read_bytes()
+ assert hashlib.sha256(raw).hexdigest()==SOCKET_RECEIVE_QUALIFICATION_SHA256,'socket receive qualification changed'
+ qualification=json.loads(raw)
+ assert qualification['baseline']==SOCKET_RECEIVE_BASE
+ assert qualification['baseline_policy_sha256']==SOCKET_RECEIVE_POLICY_SHA256
+ assert qualification['ofd_qualification_sha256']==OFD_QUALIFICATION_SHA256
+ assert qualification['fence_receive_qualification_sha256']==FENCE_RECEIVE_QUALIFICATION_SHA256
+ assert qualification['paths']==SOCKET_RECEIVE_PATHS
+ assert list(qualification['before_sha256'])==list(qualification['after_sha256'])==SOCKET_RECEIVE_PATHS
+ original_policy=subprocess.check_output(['git','show',SOCKET_RECEIVE_BASE+':tools/net-tcp-priority/test-selected-policy.py'],cwd=ROOT)
+ assert hashlib.sha256(original_policy).hexdigest()==SOCKET_RECEIVE_POLICY_SHA256,'socket baseline policy changed'
+ patch=(folder/'socket-receive-source.patch').read_bytes()
+ assert hashlib.sha256(patch).hexdigest()==qualification['patch_sha256'],'socket receive patch changed'
+ assert [line.decode().split(' b/',1)[1] for line in patch.splitlines() if line.startswith(b'diff --git ')]==SOCKET_RECEIVE_PATHS
+ current={path:(ROOT/path).read_bytes() for path in SOCKET_RECEIVE_PATHS}
+ previous={path:subprocess.check_output(['git','show',SOCKET_RECEIVE_BASE+':'+path],cwd=ROOT) for path in SOCKET_RECEIVE_PATHS}
+ for path in SOCKET_RECEIVE_PATHS:
+  assert hashlib.sha256(current[path]).hexdigest()==qualification['after_sha256'][path],path
+  assert hashlib.sha256(previous[path]).hexdigest()==qualification['before_sha256'][path],path
+ with tempfile.TemporaryDirectory(prefix='gesher-socket-receive-qualification-') as temporary:
+  work=Path(temporary)
+  for path in SOCKET_RECEIVE_PATHS:
+   (work/path).parent.mkdir(parents=True,exist_ok=True)
+   (work/path).write_bytes(current[path])
+  for direction,expected in [(['--reverse'],previous),([],current)]:
+   subprocess.run(['git','apply',*direction,'--check','-'],input=patch,cwd=work,check=True,capture_output=True)
+   subprocess.run(['git','apply',*direction,'-'],input=patch,cwd=work,check=True,capture_output=True)
+   assert {path:(work/path).read_bytes() for path in SOCKET_RECEIVE_PATHS}==expected,'socket receive exact roundtrip changed'
+ return previous
 # The receiver-selected fence flag is an exact, separately bounded transition.
 # Restore all three coupled files to the complete main972 bytes in both
 # directions before the UNCHANGED 71-file OFD qualification runs. The original
@@ -307,7 +348,7 @@ FENCE_RECEIVE_QUALIFICATION_SHA256='a34d606deb33143e43d67b6b21eef5eee1ae66780aac
 FENCE_RECEIVE_PATHS=['compat/posix/src/native_fence.cc',
                      'compat/posix/src/native_fence_internal.h',
                      'compat/posix/src/unix_rights.cc']
-def preceding_fence_receive_sources():
+def preceding_fence_receive_sources(socket_previous):
  folder=ROOT/'tools/net-tcp-priority/qualified'
  raw=(folder/'native-fence-receive-source.json').read_bytes()
  assert hashlib.sha256(raw).hexdigest()==FENCE_RECEIVE_QUALIFICATION_SHA256,'fence receive qualification changed'
@@ -322,7 +363,7 @@ def preceding_fence_receive_sources():
  patch=(folder/'native-fence-receive-source.patch').read_bytes()
  assert hashlib.sha256(patch).hexdigest()==qualification['patch_sha256'],'fence receive patch changed'
  assert [line.decode().split(' b/',1)[1] for line in patch.splitlines() if line.startswith(b'diff --git ')]==FENCE_RECEIVE_PATHS
- current={path:(ROOT/path).read_bytes() for path in FENCE_RECEIVE_PATHS}
+ current={path:socket_previous.get(path,(ROOT/path).read_bytes()) for path in FENCE_RECEIVE_PATHS}
  previous={path:subprocess.check_output(['git','show',FENCE_RECEIVE_BASE+':'+path],cwd=ROOT) for path in FENCE_RECEIVE_PATHS}
  for path in FENCE_RECEIVE_PATHS:
   assert hashlib.sha256(current[path]).hexdigest()==qualification['after_sha256'][path],path
@@ -355,7 +396,9 @@ PIPE_POLL_ERROR_REPLACEMENTS = (
 '''),
 )
 def preceding_ofd_sources():
- fence_previous=preceding_fence_receive_sources()
+ socket_previous=preceding_socket_receive_sources()
+ fence_previous=preceding_fence_receive_sources(socket_previous)
+ normalized={**socket_previous,**fence_previous}
  folder=ROOT/'tools/net-tcp-priority/qualified'
  raw=(folder/'ofd-stream-source.json').read_bytes()
  assert hashlib.sha256(raw).hexdigest()==OFD_QUALIFICATION_SHA256,'OFD source qualification changed'
@@ -367,14 +410,14 @@ def preceding_ofd_sources():
  assert qualification['paths']==paths
  assert [line.decode().split(' b/',1)[1] for line in patch.splitlines() if line.startswith(b'diff --git ')]==paths
  for path,digest in qualification['source_sha256'].items():
-  actual=fence_previous[path] if path in fence_previous else (ROOT/path).read_bytes()
+  actual=normalized.get(path,(ROOT/path).read_bytes())
   if path=='compat/bionic/shim.cc':actual=preceding_memmem_source(actual)
   assert hashlib.sha256(actual).hexdigest()==digest,path
  with tempfile.TemporaryDirectory(prefix='gesher-ofd-qualification-') as temporary:
   work=Path(temporary)
   for path in paths:
    (work/path).parent.mkdir(parents=True,exist_ok=True)
-   (work/path).write_bytes((ROOT/path).read_bytes())
+   (work/path).write_bytes(normalized.get(path,(ROOT/path).read_bytes()))
   subprocess.run(['git','apply','--reverse','--unidiff-zero','--check','-'],input=patch,cwd=work,check=True,capture_output=True)
   subprocess.run(['git','apply','--reverse','--unidiff-zero','-'],input=patch,cwd=work,check=True,capture_output=True)
   previous={path:(work/path).read_bytes() for path in paths}
@@ -581,6 +624,20 @@ def transition_negative_controls():
   ('tools/net-tcp-priority/qualified/native-fence-receive-source.json',FENCE_RECEIVE_POLICY_SHA256.encode(),b'0'*64),
   ('tools/net-tcp-priority/qualified/native-fence-receive-source.json',b'"compat/posix/src/native_fence_internal.h"',b'"compat/posix/src/unqualified.h"'),
   ('tools/net-tcp-priority/qualified/native-fence-receive-source.json',OFD_QUALIFICATION_SHA256.encode(),b'0'*64),
+  ('compat/posix/src/unix_rights.cc',b'AdoptSocket(reinterpret_cast<uintptr_t>(h), metadata, close_on_exec)',b'AdoptSocket(reinterpret_cast<uintptr_t>(h), metadata, true)'),
+  ('compat/posix/src/unix_rights.cc',b'AdoptSocket(reinterpret_cast<uintptr_t>(h), metadata, close_on_exec)',b'AdoptSocket(reinterpret_cast<uintptr_t>(h), metadata, false)'),
+  ('compat/posix/src/fd.cc',b'int fd = ReserveFd(close_on_exec);',b'int fd = ReserveFd(true);'),
+  ('compat/posix/src/fd.cc',b'else if (!close_on_exec &&',b'else if (close_on_exec &&'),
+  ('compat/posix/src/socket.cc',b'RegisterNew(socket, (metadata & kTransferNonBlocking) != 0, close_on_exec)',b'RegisterNew(socket, (metadata & kTransferNonBlocking) != 0, true)'),
+  ('compat/posix/src/internal.h',b'int AdoptSocket(uintptr_t socket, uint64_t metadata, bool close_on_exec = true);',b'int AdoptSocket(uintptr_t socket, uint64_t metadata, bool close_on_exec = false);'),
+  ('compat/posix/src/socket_internal.h',b'const SocketFd& state, bool close_on_exec = true',b'const SocketFd& state, bool close_on_exec = false'),
+  ('tools/net-tcp-priority/qualified/socket-receive-source.patch',b'@@',b'@x'),
+  ('tools/net-tcp-priority/qualified/socket-receive-source.json',SOCKET_RECEIVE_BASE.encode(),b'0'*40),
+  ('tools/net-tcp-priority/qualified/socket-receive-source.json',SOCKET_RECEIVE_POLICY_SHA256.encode(),b'0'*64),
+  ('tools/net-tcp-priority/qualified/socket-receive-source.json',FENCE_RECEIVE_QUALIFICATION_SHA256.encode(),b'0'*64),
+  ('tools/net-tcp-priority/qualified/socket-receive-source.json',OFD_QUALIFICATION_SHA256.encode(),b'0'*64),
+  ('tools/net-tcp-priority/qualified/socket-receive-source.json',b'"compat/posix/src/internal.h"',b'"compat/posix/src/unqualified.h"'),
+  ('tools/net-tcp-priority/qualified/ofd-stream-source.json',b'"native_runtime_approval": false',b'"native_runtime_approval": true'),
  ]
  for name,before,after in cases:
   target=ROOT/name
@@ -626,6 +683,55 @@ def transition_negative_controls():
    except (AssertionError,subprocess.CalledProcessError):rejected=True
   assert rejected,'fence receive current-digest repin accepted: '+name
  print('FENCE_RECEIVE_REPIN_NEGATIVE_CONTROLS_PASS cases=2')
+ for name,value in [('SOCKET_RECEIVE_BASE','0'*40),
+                    ('SOCKET_RECEIVE_POLICY_SHA256','0'*64),
+                    ('SOCKET_RECEIVE_QUALIFICATION_SHA256','0'*64),
+                    ('SOCKET_RECEIVE_PATHS',SOCKET_RECEIVE_PATHS[:-1])]:
+  rejected=False
+  with patch.dict(globals(),{name:value}):
+   try:check()
+   except (AssertionError,subprocess.CalledProcessError):rejected=True
+  assert rejected,'socket receive authority pin accepted: '+name
+ print('SOCKET_RECEIVE_PIN_NEGATIVE_CONTROLS_PASS cases=4')
+ socket_manifest=ROOT/'tools/net-tcp-priority/qualified/socket-receive-source.json'
+ socket_patch=ROOT/'tools/net-tcp-priority/qualified/socket-receive-source.patch'
+ def socket_repin_rejected(overrides,manifest,pins=None):
+  forged=(json.dumps(manifest,indent=2)+'\n').encode()
+  overrides={**overrides,socket_manifest:forged}
+  changes={'SOCKET_RECEIVE_QUALIFICATION_SHA256':hashlib.sha256(forged).hexdigest(),**(pins or {})}
+  def changed(path):return overrides[path] if path in overrides else original(path)
+  rejected=False
+  with patch.object(Path,'read_bytes',changed),patch.dict(globals(),changes):
+   try:check()
+   except (AssertionError,subprocess.CalledProcessError):rejected=True
+  assert rejected,'coherent socket receive repin accepted'
+ for name,before,after in [
+   ('compat/posix/src/fd.cc',b'else if (!close_on_exec &&',b'else if (close_on_exec &&'),
+   ('compat/posix/src/internal.h',b'bool close_on_exec = true',b'bool close_on_exec = false'),
+   ('compat/posix/src/socket.cc',b'if (!ws::Startup()) {',b'if (false) {')]:
+  target=ROOT/name; current=original(target); assert before in current,name
+  modified=current.replace(before,after,1)
+  manifest=json.loads(original(socket_manifest))
+  manifest['after_sha256'][name]=hashlib.sha256(modified).hexdigest()
+  socket_repin_rejected({target:modified},manifest)
+ manifest=json.loads(original(socket_manifest))
+ manifest['before_sha256'][SOCKET_RECEIVE_PATHS[0]]='0'*64
+ socket_repin_rejected({},manifest)
+ manifest=json.loads(original(socket_manifest))
+ modified=original(socket_patch).replace(b'b/compat/posix/src/internal.h',b'b/compat/posix/src/unqualified.h',1)
+ manifest['patch_sha256']=hashlib.sha256(modified).hexdigest()
+ socket_repin_rejected({socket_patch:modified},manifest)
+ # Even a coherently narrowed path list/patch cannot omit the coupled header:
+ # the unchanged 71-file qualification then sees its unnormalized new bytes.
+ manifest=json.loads(original(socket_manifest)); omitted='compat/posix/src/internal.h'
+ paths=[path for path in SOCKET_RECEIVE_PATHS if path!=omitted]
+ manifest['paths']=paths
+ for key in ['before_sha256','after_sha256']:del manifest[key][omitted]
+ blocks=original(socket_patch).split(b'diff --git ')[1:]
+ modified=b''.join(b'diff --git '+block for block in blocks if not block.startswith(('a/'+omitted+' b/').encode()))
+ manifest['patch_sha256']=hashlib.sha256(modified).hexdigest()
+ socket_repin_rejected({socket_patch:modified},manifest,{'SOCKET_RECEIVE_PATHS':paths})
+ print('SOCKET_RECEIVE_REPIN_NEGATIVE_CONTROLS_PASS cases=6')
  print('TCP_SELECTED_TRANSITION_NEGATIVE_CONTROLS_PASS cases='+str(len(cases)))
 if __name__=='__main__':
  import sys

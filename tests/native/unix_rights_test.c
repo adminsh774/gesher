@@ -279,6 +279,8 @@ static void test_stream_order(void) {
   close(sv[0]);
 }
 
+#include "socket_receive_flags_test.inc"
+
 int gesher_selftest(void) {
   printf("unix_rights: SCM_RIGHTS through the descriptor broker\n");
   const char* device = getenv("GESHER_BINDER");
@@ -302,6 +304,7 @@ int gesher_selftest(void) {
   test_pair(SOCK_STREAM, "SOCK_STREAM");
   test_discard();
   test_stream_order();
+  test_socket_receive_flags();
   if (failures == 0) printf("unix_rights: all passed\n");
   else printf("unix_rights: %d check(s) failed\n", failures);
   fflush(stdout);

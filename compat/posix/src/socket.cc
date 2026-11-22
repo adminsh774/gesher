@@ -46,7 +46,7 @@ bool Lookup(int fd, SocketFd* state) {
   return false;
 }
 
-int RegisterNew(ws::Socket s, bool nonblocking) {
+int RegisterNew(ws::Socket s, bool nonblocking, bool close_on_exec = true) {
   // accept does not inherit O_NONBLOCK on Linux. Normalize both directions
   // before publishing the new open description and its shared status flag.
   if (ws::SetNonBlocking(s, nonblocking) < 0) {
@@ -58,7 +58,7 @@ int RegisterNew(ws::Socket s, bool nonblocking) {
   SocketFd state;
   state.socket = s;
   state.initial_nonblocking = nonblocking;
-  return gesher::RegisterSocket(state);
+  return gesher::RegisterSocket(state, close_on_exec);
 }
 
 // Lifecycle controls invalidate a completed-refusal readiness classification
@@ -1130,13 +1130,13 @@ bool gesher::TransferSocket(int fd, uintptr_t* socket, uint64_t* metadata) {
   return true;
 }
 
-int gesher::AdoptSocket(uintptr_t socket, uint64_t metadata) {
+int gesher::AdoptSocket(uintptr_t socket, uint64_t metadata, bool close_on_exec) {
   if (!ws::Startup()) {
     int saved = errno;
     ws::Close(socket);
     return errno = saved, -1;
   }
-  int fd = RegisterNew(socket, (metadata & kTransferNonBlocking) != 0);
+  int fd = RegisterNew(socket, (metadata & kTransferNonBlocking) != 0, close_on_exec);
   if (fd < 0) return -1;
   SocketFd end;
   if (gesher::LookupSocket(fd, &end)) {
