@@ -58,6 +58,8 @@ inline DWORD next_pid = 100;
 inline uint64_t next_birth = 1000;
 inline uint64_t next_user = 123456789, next_kernel = 23456789;
 inline Process* current = nullptr;
+inline Process thread{2, 0, 2000, 3456789, 987654};
+inline std::atomic<unsigned> process_time_calls{0}, thread_time_calls{0};
 inline FILETIME Time(uint64_t v) { return {static_cast<DWORD>(v), static_cast<DWORD>(v >> 32)}; }
 inline HANDLE Spawn(DWORD code) {
   auto p = std::make_unique<Process>();
@@ -81,7 +83,7 @@ inline void Finish(HANDLE h) {
 inline DWORD GetLastError() { return boundary::error; }
 inline DWORD GetCurrentProcessId() { return 1; }
 inline HANDLE GetCurrentProcess() { return boundary::current; }
-inline HANDLE GetCurrentThread() { return GetCurrentProcess(); }
+inline HANDLE GetCurrentThread() { return &boundary::thread; }
 inline DWORD GetProcessId(HANDLE h) {
   if (!h || h == INVALID_HANDLE_VALUE) { boundary::error = ERROR_INVALID_HANDLE; return 0; }
   return static_cast<boundary::Process*>(h)->pid;
@@ -98,15 +100,20 @@ inline BOOL CloseHandle(HANDLE h) {
   if (!h || h == INVALID_HANDLE_VALUE || !static_cast<boundary::Process*>(h)->handles.fetch_sub(1)) std::abort();
   return 1;
 }
-inline BOOL GetProcessTimes(HANDLE h, FILETIME* created, FILETIME* exited, FILETIME* kernel, FILETIME* user) {
+inline BOOL FixtureTimes(HANDLE h, FILETIME* created, FILETIME* exited, FILETIME* kernel, FILETIME* user) {
   auto* p = static_cast<boundary::Process*>(h);
   if (!p || !p->handles || p->fail_sample) { boundary::error = ERROR_ACCESS_DENIED; return FALSE; }
   *created = boundary::Time(p->birth); *exited = boundary::Time(p->live ? 0 : p->birth + 1);
   *kernel = boundary::Time(p->kernel); *user = boundary::Time(p->user);
   return 1;
 }
+inline BOOL GetProcessTimes(HANDLE h, FILETIME* a, FILETIME* b, FILETIME* c, FILETIME* d) {
+  ++boundary::process_time_calls;
+  return FixtureTimes(h, a, b, c, d);
+}
 inline BOOL GetThreadTimes(HANDLE h, FILETIME* a, FILETIME* b, FILETIME* c, FILETIME* d) {
-  return GetProcessTimes(h, a, b, c, d);
+  ++boundary::thread_time_calls;
+  return FixtureTimes(h, a, b, c, d);
 }
 inline BOOL GetProcessMemoryInfo(HANDLE, PROCESS_MEMORY_COUNTERS*, DWORD) { return FALSE; }
 inline DWORD WaitForSingleObject(HANDLE h, DWORD timeout) {

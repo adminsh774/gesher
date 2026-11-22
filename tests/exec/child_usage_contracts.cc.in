@@ -101,6 +101,35 @@ void Queries(cu::Cpu expected) {
           "POSIX and guest queries see the same native/Java total");
 }
 
+cu::Cpu SelfSample(int who) {
+  FILETIME c{}, e{}, k{}, u{};
+  BOOL sampled = who == 1 ? GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)
+                         : GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+  Require(sampled != 0, "oracle reads the requested self/thread CPU");
+  return {Ticks(u), Ticks(k)};
+}
+void SelfQueries() {
+  for (int who : {0, 1}) {
+    cu::Cpu before = SelfSample(who);
+    guest::LinuxRusage usage{};
+    Require(guest::Getrusage(who, &usage) == 0, "SELF/THREAD succeeds only with an actual OS sample");
+    cu::Cpu after = SelfSample(who);
+    uint64_t user = Micros(usage.ru_utime), kernel = Micros(usage.ru_stime);
+    Require(user >= before.user_100ns / 10 && user <= after.user_100ns / 10 &&
+            kernel >= before.kernel_100ns / 10 && kernel <= after.kernel_100ns / 10,
+            "SELF/THREAD CPU is bounded by the matching OS queries");
+  }
+  for (int who : {-2, 2, INT_MIN, INT_MAX}) {
+    guest::LinuxRusage usage; std::memset(&usage, 0x5a, sizeof(usage));
+    guest::LinuxRusage original = usage;
+    Require(guest::Getrusage(who, &usage) == -1 && errno == 22 &&
+            !std::memcmp(&usage, &original, sizeof(usage)),
+            "invalid selector fails before publishing any CPU or zero fallback");
+  }
+  for (int who : {-1, 0, 1})
+    Require(guest::Getrusage(who, nullptr) == -1 && errno == 14, "valid selector still rejects a null output");
+}
+
 struct Worker { HANDLE process; HANDLE ready = nullptr, finish = nullptr; };
 #ifdef _WIN32
 int ChildMain(int argc, char** argv) {
@@ -286,6 +315,31 @@ void Java() {
 }
 
 #if @HOST_ONLY@
+void SelfFailures() {
+  cu::Cpu children = Snapshot();
+  for (int who : {0, 1}) {
+    auto* subject = who == 1 ? &boundary::thread : boundary::current;
+    unsigned process_calls = boundary::process_time_calls;
+    unsigned thread_calls = boundary::thread_time_calls;
+    subject->fail_sample = true;
+    guest::LinuxRusage usage; std::memset(&usage, 0x5a, sizeof(usage));
+    guest::LinuxRusage original = usage;
+    Require(guest::Getrusage(who, &usage) == -1 && errno == 22 &&
+            !std::memcmp(&usage, &original, sizeof(usage)),
+            "failed SELF/THREAD sampling preserves caller output and reports an error");
+    Require(boundary::process_time_calls == process_calls + (who == 0 ? 1u : 0u) &&
+            boundary::thread_time_calls == thread_calls + (who == 1 ? 1u : 0u),
+            "failed selector uses exactly its own OS API without fallback");
+    subject->fail_sample = false;
+  }
+  boundary::current->fail_sample = true;
+  guest::LinuxTms ticks{11, 22, 33, 44}, original = ticks;
+  Require(guest::Times(&ticks) == -1 && errno == 5 && !std::memcmp(&ticks, &original, sizeof(ticks)),
+          "times preserves output when its self CPU query fails");
+  boundary::current->fail_sample = false;
+  Require(Equal(Snapshot(), children), "SELF/THREAD failures do not alter cumulative child accounting");
+}
+
 void Faults() {
   if (!kHasUsage) return;
   Worker worker{};
@@ -423,9 +477,9 @@ int main(int argc, char** argv) {
     return failures ? 1 : 0;
   }
 #endif
-  Provider(); Native(); Java();
+  Provider(); Native(); Java(); SelfQueries();
 #if @HOST_ONLY_REPEAT@
-  Faults();
+  SelfFailures(); Faults();
 #endif
 #ifdef _WIN32
   HMODULE peer = LoadLibraryA("child-usage-peer.dll");

@@ -326,13 +326,13 @@ int BIONIC_SYSV Getrusage(int who, LinuxRusage* ru) {
     ChildRusage(cpu, ru);
     return 0;
   }
+  // The validated selector remaining here is THREAD or SELF. Make sampling
+  // exhaustive and publish nothing unless the selected OS query succeeds.
+  FILETIME c{}, e{}, k{}, u{};
+  BOOL sampled = who == 1 ? GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)
+                         : GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+  if (!sampled) return errno = kEINVAL, -1;
   std::memset(ru, 0, sizeof(*ru));
-  FILETIME c, e, k, u;
-  if (who == 1) {  // RUSAGE_THREAD
-    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return errno = kEINVAL, -1;
-  } else if (who == 0) {  // RUSAGE_SELF
-    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return errno = kEINVAL, -1;
-  }
   ru->ru_utime = Tv(FileTime100ns(u));
   ru->ru_stime = Tv(FileTime100ns(k));
   PROCESS_MEMORY_COUNTERS pmc;
