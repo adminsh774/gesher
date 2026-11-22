@@ -49,7 +49,7 @@ public final class SensorAccessLifecycleHost {
         void die() { for (var recipient : new ArrayList<>(deaths)) recipient.binderDied(); }
     }
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private static void lifecycle(int targetSdk, boolean permission) throws Exception {
+    private static void lifecycle(int targetSdk, boolean permission, boolean debuggable) throws Exception {
         Class<?> fixture = Class.forName("gesher.services.AppOpsContractTest$Harness");
         Constructor<?> constructor = fixture.getDeclaredConstructor(Integer.class, String[].class);
         constructor.setAccessible(true);
@@ -60,6 +60,7 @@ public final class SensorAccessLifecycleHost {
         var am = (ActivityManagerService)get(harness, "am");
         Object process = get(harness, "process");
         ApkPackage owner = (ApkPackage)get(harness, "owner");
+        ((PackageImpl)owner.parsed).setDebuggable(debuggable);
         if (permission) {
             Object catalog = get(pm.permissions(), "mCatalog");
             PermissionInfo info = new PermissionInfo();
@@ -83,6 +84,8 @@ public final class SensorAccessLifecycleHost {
                     "Authenticated pre-resume process is available but delivery-inactive");
             check(((state(session).flags() & 4) != 0) == (targetSdk >= 31 && !permission),
                     "Rate policy derives from actual target SDK and installed manifest grant");
+            check(((state(session).flags() & SensorAccessPolicy.DEBUGGABLE) != 0) == debuggable,
+                    "Debug policy derives from authenticated package metadata");
             Class stateType = Class.forName("com.gesher.server.ActivityTaskManagerService$State");
             Object stopped = Enum.valueOf(stateType, "STOPPED"), resumed = Enum.valueOf(stateType, "RESUMED");
             set(process, "inProcessActivityState", stopped);
@@ -140,9 +143,10 @@ public final class SensorAccessLifecycleHost {
         field(locales, "sLocales").set(null, new android.os.LocaleList(java.util.Locale.ROOT));
         android.app.PropertyInvalidatedCache.setTestMode(true);
         android.app.PropertyInvalidatedCache.disableForTestMode();
-        lifecycle(36, false);
-        lifecycle(30, false);
-        lifecycle(36, true);
+        lifecycle(36, false, false);
+        lifecycle(30, false, false);
+        lifecycle(36, true, false);
+        lifecycle(36, false, true);
         System.out.println("Sensor caller identity + real lifecycle hooks: " + checks + " checks passed");
     }
 }

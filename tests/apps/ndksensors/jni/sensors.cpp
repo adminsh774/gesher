@@ -114,8 +114,13 @@ void* Worker(void*) {
           "rate change does not enable sensor");
     Check(ASensorEventQueue_registerSensor(queue, accel, 50000, 0) == 0,
           "accelerometer registration");
-    Check(ASensorEventQueue_setEventRate(queue, accel, 1000) == -EPERM,
-          "debuggable target 36 cannot bypass high-rate permission");
+    // Release apps accept this request with effective limits. This supplier's
+    // hardware minimum is 10 ms, so the guest fixture cannot isolate the 5 ms
+    // permission cap; the production host tests cover that and debug denial.
+    Check(ASensorEventQueue_setEventRate(queue, accel, 1000) == 0,
+          "release target 36 accepts the fast request");
+    Check(ASensorEventQueue_setEventRate(queue, accel, 50000) == 0,
+          "restore sampling period for queue checks");
     Check(ASensorEventQueue_registerSensor(queue, light, 20000, 0) == 0,
           "light registration");
     Check(AwaitIdent(37) == 37, "Looper identifier readiness");

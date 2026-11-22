@@ -107,6 +107,14 @@ are produced by the existing `native2` CI artifact workflow. A compiled APK is
 not evidence that these Windows executions passed; their exact-head CI results
 must be reviewed separately.
 
+The guest APK is non-debuggable and checks that a release app's fast sampling
+request succeeds before restoring the queue-test period. Its explicit test
+accelerometer has a 10 ms hardware minimum, so this fixture cannot independently
+establish the 5 ms permission cap. The production host bridge tests separately
+cover that cap, effective metadata, and permission denial for debuggable apps.
+The actual server/controller host suite also verifies that the authenticated
+package's debug flag reaches its sensor policy alongside the rate restriction.
+
 Local Linux host tests, the Windows object cross-build against the repository's
 patched AOSP Looper headers, and NDK compilation establish bounded pieces of the
 implementation. They do not establish WinRT hardware behavior, actual Android
