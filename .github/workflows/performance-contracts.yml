@@ -54,7 +54,9 @@ jobs:
           [void][Management.Automation.Language.Parser]::ParseFile(
             (Join-Path $PWD 'tools/perf/e2e-workload.ps1'), [ref]$tokens, [ref]$errors)
           if ($errors.Count) { throw ($errors -join "`n") }
-          & tests/e2e/render-readiness.test.ps1
+          # The fixtures declare different native boundary types with the same
+          # names. Each needs a fresh Windows PowerShell process.
+          powershell.exe -NoProfile -File tests/e2e/render-readiness.test.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & tests/e2e/performance-ownership.test.ps1
+          powershell.exe -NoProfile -File tests/e2e/performance-ownership.test.ps1
           exit $LASTEXITCODE
