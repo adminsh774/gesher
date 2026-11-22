@@ -29,10 +29,18 @@ def main() -> int:
     parser.add_argument("--cxx", default=os.environ.get("CXX", "g++"))
     parser.add_argument("--cc", default=os.environ.get("CC", "gcc"))
     parser.add_argument("--sanitize", action="store_true")
+    parser.add_argument("--source-ref", help="Run the unchanged current fixture against exact historical adapter/fsops/header sources")
+    parser.add_argument("--adapter-case", choices=["bionic-unlocked"],
+                        help="Run the bounded guest-unlocked regression against the selected production sources")
     args = parser.parse_args()
-    adapter = (ROOT / "compat/posix/src/stdio_output.cc").read_text()
-    fsops = (ROOT / "compat/posix/src/fsops.cc").read_text()
-    sockets = (ROOT / "compat/posix/src/fd.cc").read_text()
+    def read_source(path: str) -> bytes:
+        if args.source_ref:
+            return subprocess.check_output(["git", "show", args.source_ref + ":" + path], cwd=ROOT)
+        return (ROOT / path).read_bytes()
+    adapter = read_source("compat/posix/src/stdio_output.cc").decode()
+    fsops = read_source("compat/posix/src/fsops.cc").decode()
+    sockets = read_source("compat/posix/src/fd.cc").decode()
+    guest = read_source("compat/bionic/stdio_bionic.cc").decode()
     adapter = adapter[adapter.index('extern "C" int __mingw_pformat'):]
     writer = 'return ::write(fd, bytes, count);'
     if adapter.count(writer) != 1:
@@ -66,6 +74,9 @@ def main() -> int:
         "@SOCKET_REGISTRY@": section(sockets, "struct SocketRegistry {", "// Takes the socket out"),
         "@SOCKET_INSERT@": section(sockets, "void Insert(", "// Publish a successful CRT replacement"),
         "@SOCKET_LOOKUP@": section(sockets, "bool LookupSocket(", "void RegisterDevice("),
+        "@BIONIC_ORIENT@": section(guest, "int Orient(FILE* stream,", "using StreamLock"),
+        "@BIONIC_READ_STREAM@": section(guest, "size_t ReadStream(", "// fopen through"),
+        "@BIONIC_UNLOCKED@": section(guest, "size_t BIONIC_SYSV FreadUnlocked(", "int BIONIC_SYSV FputsUnlocked("),
     }
     template = (ROOT / "tests/native/stdio_adapter_host.cc.in").read_text()
     for marker, source in sections.items():
@@ -78,8 +89,8 @@ def main() -> int:
         folder = Path(temporary)
         include = folder / "include/gesher"
         include.mkdir(parents=True)
-        (include / "stdio.h").write_bytes((ROOT / "compat/posix/include/gesher/stdio.h").read_bytes())
-        (include / "cancellation.h").write_bytes((ROOT / "compat/posix/include/gesher/cancellation.h").read_bytes())
+        (include / "stdio.h").write_bytes(read_source("compat/posix/include/gesher/stdio.h"))
+        (include / "cancellation.h").write_bytes(read_source("compat/posix/include/gesher/cancellation.h"))
         generated = folder / "adapter.cc"
         generated.write_text(template)
         cxx = shlex.split(args.cxx) + ["-std=c++17", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-fno-builtin", "-pthread"]
@@ -90,9 +101,14 @@ def main() -> int:
             ("adapter", generated, ["-I", str(folder / "include"), "-I", str(ROOT / "tests/native")]),
         ]
         for name, source, extra in cases:
+            if args.adapter_case and name != "adapter":
+                continue
             executable = folder / name
             subprocess.run(cxx + extra + [str(source), "-o", str(executable)], check=True, timeout=120)
-            subprocess.run([str(executable)], cwd=folder, check=True, timeout=45)
+            subprocess.run([str(executable)] + (["--" + args.adapter_case] if args.adapter_case else []),
+                           cwd=folder, check=True, timeout=45)
+            if args.adapter_case:
+                return 0
             if name == "adapter":
                 destination = folder / "exit-output.txt"
                 subprocess.run([str(executable), "--exit-output", str(destination)], cwd=folder, check=True, timeout=45)
@@ -121,8 +137,12 @@ def main() -> int:
                 # Only the registry's lifetime changes in this negative. The
                 # actual late stdio flush, map insertion/lookup and real files
                 # remain identical; diagnose retirement before undefined access.
-                lifetime = section(sockets, "SocketRegistry& Sockets() {", "// Lets the common case")
-                negative = "SocketRegistry& Sockets() {\n  static SocketRegistry registry;\n  return registry;\n}\n"
+                if "SocketRegistry& Sockets() {" in sockets:
+                    lifetime = section(sockets, "SocketRegistry& Sockets() {", "// Lets the common case")
+                    negative = "SocketRegistry& Sockets() {\n  static SocketRegistry registry;\n  return registry;\n}\n"
+                else:
+                    lifetime = section(sockets, "alignas(SocketRegistry) unsigned char", "std::mutex& table_mutex")
+                    negative = "SocketRegistry socket_registry;\n"
                 if template.count(lifetime) != 1:
                     raise ValueError("socket registry lifetime control boundary changed")
                 negative_source = folder / "retired-socket.cc"

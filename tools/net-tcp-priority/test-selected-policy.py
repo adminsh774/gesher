@@ -88,6 +88,27 @@ SOCKET_BASE='d5ad9aa318583ae3c3cca2d062ee964680e99e32'
 # pending flags, wake sockets, bounded retention and thread-exit destruction.
 WINSOCK_BASE='eb652ece90f327622d1971867ab1730ae71ea786'
 WINSOCK_SHA256='190b659777f3df317e4dc90f9df322a95bd2c840ea00ad2976f9dbf56935b02d'
+# One zero-time native sample confirms a waited OOB notification before it
+# becomes Linux POLLPRI. Undo only this exact reviewed replacement before the
+# unchanged checkpoint, hunk and full-byte validations below. The original
+# shared TCP contract, including its immediate select before sender join, stays
+# byte-identical. The native Poll fixture covers early wake, timeout, error,
+# mixed readiness and real delayed data at the production boundary.
+TCP_PRIORITY_WAKE_BEFORE=b'''      if (result != SOCKET_ERROR) break;
+'''
+TCP_PRIORITY_WAKE_AFTER=b'''      if (result != SOCKET_ERROR) {
+        // A waited Winsock OOB notification can precede the readable byte.
+        // Confirm the current level once without waiting before publishing
+        // POLLPRI. The outer poll keeps its original deadline if it is absent.
+        bool confirm_priority = false;
+        if (sample_wait != 0 && result > 0) {
+          for (const auto& fd : active)
+            confirm_priority |= (fd.revents & fd.events & POLLRDBAND) != 0;
+        }
+        if (confirm_priority) { sample_wait = 0; continue; }
+        break;
+      }
+'''
 # The reviewed file repairs change only statvfs/fstatvfs volume queries,
 # sched_getaffinity capacity validation, posix_fallocate, its limits header and
 # memfd_create, the virtual-descriptor writev route and fcntl argument selection.
@@ -240,11 +261,67 @@ RECEIPT_SOURCE_BLOCK=b'''  if ($null -ne $SourceIdentity) {
     $Expected['head_repository_id'] = $SourceIdentity.head_repository_id
   }
 '''
-# This exact transition is applied in reverse to the current fd/system bytes,
+# This exact transition is applied in reverse to the current OFD and SCM_RIGHTS bytes,
 # then EVERY earlier preservation assertion below still runs on its result.
 # Coupled OFD/stdio/pipe source files are pinned by the same qualification.
 # No supplier, socket core, fixture predicate, deadline or DAG is exempted.
-OFD_QUALIFICATION_SHA256 = 'ea354dae98e5e4d1ea4c9c2a6b212ab15a3f59b1bbd9b5fd9fddd2515a25ba12'
+OFD_QUALIFICATION_SHA256 = '1847217ffc744c9362c264f40d658ab2e7bf31510e0e83d4267bf24ae4640171'
+# PR73 unifies Bionic conversion metadata with the existing shared stream
+# owner. Keep the original OFD receipt and all of its 71 source digests intact.
+# Only this separately pinned four-file transition may be reversed to main's
+# exact bytes before the unchanged OFD and supplier checks run. It neither
+# qualifies Windows execution nor replaces review of the production delta.
+SHARED_STDIO_BASE = '751d82310f7c4c470c098ccebfd5d2d04699a0cd'
+SHARED_STDIO_FEATURE_HEAD = 'de1e43c391275137c7b7b25dc170892684d55b5e'
+SHARED_STDIO_TRANSITION_SHA256 = 'a0eeee901ed4937f340ced17399fa3b3828d2ba73c9ee2ca8bf6357e0d0b38a4'
+SHARED_STDIO_PATHS = (
+ 'compat/bionic/stdio_bionic.cc',
+ 'compat/posix/include/gesher/stdio.h',
+ 'compat/posix/include/stdio.h',
+ 'compat/posix/src/stdio_output.cc',
+)
+
+def preceding_shared_stdio_sources(qualification):
+ folder=ROOT/'tools/net-tcp-priority/qualified'
+ raw=(folder/'shared-stdio-source.json').read_bytes()
+ assert hashlib.sha256(raw).hexdigest()==SHARED_STDIO_TRANSITION_SHA256,'shared-stdio source transition changed'
+ transition=json.loads(raw)
+ assert set(transition)=={'baseline','feature_head','baseline_policy_sha256','paths',
+                         'before_sha256','after_sha256','patch_sha256'},'shared-stdio transition schema changed'
+ assert transition['baseline']==SHARED_STDIO_BASE,'shared-stdio baseline changed'
+ assert transition['feature_head']==SHARED_STDIO_FEATURE_HEAD,'shared-stdio feature checkpoint changed'
+ paths=list(SHARED_STDIO_PATHS)
+ assert transition['paths']==paths,'shared-stdio transition paths changed'
+ assert sorted(transition['before_sha256'])==sorted(transition['after_sha256'])==paths,'shared-stdio endpoint paths changed'
+ baseline_policy=subprocess.check_output(['git','-C',str(ROOT),'show',SHARED_STDIO_BASE+':tools/net-tcp-priority/test-selected-policy.py'])
+ assert hashlib.sha256(baseline_policy).hexdigest()==transition['baseline_policy_sha256'],'shared-stdio baseline policy changed'
+ patch=(folder/'shared-stdio-source.patch').read_bytes()
+ assert hashlib.sha256(patch).hexdigest()==transition['patch_sha256'],'shared-stdio transition patch changed'
+ assert [line for line in patch.splitlines() if line.startswith(b'diff --git ')]==[
+     ('diff --git a/'+path+' b/'+path).encode() for path in paths],'shared-stdio patch paths changed'
+ current={};baseline={}
+ for path in paths:
+  current[path]=(ROOT/path).read_bytes()
+  assert hashlib.sha256(current[path]).hexdigest()==transition['after_sha256'][path],path
+  baseline[path]=subprocess.check_output(['git','-C',str(ROOT),'show',SHARED_STDIO_BASE+':'+path])
+  assert hashlib.sha256(baseline[path]).hexdigest()==transition['before_sha256'][path],path
+  assert transition['before_sha256'][path]==qualification['source_sha256'][path],path
+  assert current[path]!=baseline[path],('empty shared-stdio transition',path)
+ with tempfile.TemporaryDirectory(prefix='gesher-shared-stdio-qualification-') as temporary:
+  work=Path(temporary)
+  for path in paths:
+   (work/path).parent.mkdir(parents=True,exist_ok=True)
+   (work/path).write_bytes(current[path])
+  subprocess.run(['git','apply','--reverse','--check','-'],input=patch,cwd=work,check=True,capture_output=True)
+  subprocess.run(['git','apply','--reverse','-'],input=patch,cwd=work,check=True,capture_output=True)
+  for path in paths:
+   assert (work/path).read_bytes()==baseline[path],('shared-stdio reverse endpoint',path)
+  subprocess.run(['git','apply','--check','-'],input=patch,cwd=work,check=True,capture_output=True)
+  subprocess.run(['git','apply','-'],input=patch,cwd=work,check=True,capture_output=True)
+  for path in paths:
+   assert (work/path).read_bytes()==current[path],('shared-stdio forward endpoint',path)
+ return baseline
+
 # Valid pipes can now fail a control operation explicitly. These two exact
 # non-socket dispatch substitutions are the only PollFdsImpl changes allowed;
 # normalize them before comparing every byte of the original native poll core.
@@ -262,19 +339,6 @@ PIPE_POLL_ERROR_REPLACEMENTS = (
         if (!result) waiting_files = true;
 '''),
 )
-# Stream finalization must outlive ordinary C++ static destruction. Only these
-# exact registry-access substitutions accompany the process-lifetime owner;
-# socket reference counts, replacement decisions and native operations remain
-# byte-for-byte bound below. The actual shutdown/stdio corpus rejects the old
-# destructible registry and tests real final output after ordinary destructors.
-SOCKET_REGISTRY_ACCESS_REPLACEMENTS = (
- (b'lock(table_mutex)', b'lock(Sockets().mutex)'),
- (b'table.find(', b'Sockets().entries.find('),
- (b'table.end()', b'Sockets().entries.end()'),
- (b'table.erase(', b'Sockets().entries.erase('),
- (b'table.insert_or_assign(', b'Sockets().entries.insert_or_assign('),
- (b'table.emplace(', b'Sockets().entries.emplace('),
-)
 def preceding_ofd_sources():
  folder=ROOT/'tools/net-tcp-priority/qualified'
  raw=(folder/'ofd-stream-source.json').read_bytes()
@@ -282,11 +346,14 @@ def preceding_ofd_sources():
  qualification=json.loads(raw)
  patch=(folder/'ofd-stream-source.patch').read_bytes()
  assert hashlib.sha256(patch).hexdigest()==qualification['patch_sha256'],'OFD transition patch changed'
- paths=['compat/posix/src/fd.cc','compat/posix/src/system.cc']
+ paths=['compat/posix/src/fd.cc','compat/posix/src/socket.cc','compat/posix/src/socket_internal.h',
+        'compat/posix/src/system.cc','compat/posix/src/winsock.cc']
  assert qualification['paths']==paths
  assert [line.decode().split(' b/',1)[1] for line in patch.splitlines() if line.startswith(b'diff --git ')]==paths
+ shared_stdio=preceding_shared_stdio_sources(qualification)
  for path,digest in qualification['source_sha256'].items():
-  assert hashlib.sha256((ROOT/path).read_bytes()).hexdigest()==digest,path
+  actual=shared_stdio[path] if path in shared_stdio else (ROOT/path).read_bytes()
+  assert hashlib.sha256(actual).hexdigest()==digest,path
  with tempfile.TemporaryDirectory(prefix='gesher-ofd-qualification-') as temporary:
   work=Path(temporary)
   for path in paths:
@@ -304,23 +371,53 @@ def preceding_ofd_sources():
   return source[begin:end]
  # Independently retain socket ownership and actual native poll core bytes.
  for path,markers in {
-   paths[0]:[b'bool Remove(',b'void Insert(',b'bool ReplaceSocket(',b'bool LookupSocket(',b'static int PollFdsImpl('],
-   paths[1]:[b'bool SocketIo('],
+   'compat/posix/src/fd.cc':[b'bool Remove(',b'void Insert(',b'bool ReplaceSocket(',b'bool LookupSocket(',b'static int PollFdsImpl('],
+   'compat/posix/src/system.cc':[b'bool SocketIo('],
  }.items():
   current=(ROOT/path).read_bytes()
   for marker in markers:
    actual=function(current,marker);expected=function(previous[path],marker)
-   if path==paths[0] and marker!=b'static int PollFdsImpl(':
-    for before,after in SOCKET_REGISTRY_ACCESS_REPLACEMENTS:
-     assert actual.count(after)==expected.count(before),(path,marker,before)
-     assert before not in actual and after not in expected,(path,marker,before)
-     expected=expected.replace(before,after)
    if marker==b'static int PollFdsImpl(':
     for before,after in PIPE_POLL_ERROR_REPLACEMENTS:
      assert actual.count(after)==expected.count(before)==1,(path,marker)
      actual=actual.replace(after,before,1)
    assert actual==expected,(path,marker)
  return previous
+# AF_UNIX credentials and descriptor passing (ADR 0088) and memfd seals change
+# these selected sources after REVIEWED_CHECKPOINT, a commit on main. The
+# pinned REVIEWED_PATCH lists each changed line as an exact hunk at its line in
+# the checkpoint's file: every current file must be its checkpoint bytes with
+# exactly those hunks applied, and the derivations below still verify the
+# checkpoint's bytes. Any other change fails here as before.
+REVIEWED_CHECKPOINT='7a45c2468c270bfe68ee5f854aa9d4feaf2208b3'
+REVIEWED_PATCH='tools/net-tcp-priority/reviewed-adr0088-memfd-seals.json'
+REVIEWED_PATCH_SHA256='5724ba64d08b68b8900c1442f6302f3fcadc4ef6b584c52d2055b0bb6c04e441'
+def reviewed(path,actual):
+ raw=(ROOT/REVIEWED_PATCH).read_bytes()
+ assert hashlib.sha256(raw).hexdigest()==REVIEWED_PATCH_SHA256,REVIEWED_PATCH
+ patch=json.loads(raw)
+ assert patch['checkpoint']==REVIEWED_CHECKPOINT and sorted(patch['hunks'])==sorted(REVIEWED_PATHS),REVIEWED_PATCH
+ base=subprocess.check_output(['git','-C',str(ROOT),'show',REVIEWED_CHECKPOINT+':'+path])
+ lines=base.decode('utf-8').splitlines(keepends=True);rebuilt=[];cursor=0
+ for start,before,after in patch['hunks'][path]:
+  assert start>=cursor and lines[start:start+len(before)]==before and before!=after,path
+  rebuilt+=lines[cursor:start]+after;cursor=start+len(before)
+ assert ''.join(rebuilt+lines[cursor:]).encode('utf-8')==actual,path
+ return base
+# The TCP jobs restore the authenticated r27c publisher archive from the
+# cache entry native2 and the fonts environment job already keep, instead of
+# a second copy of the same 663987688-byte zip under its own path and key.
+# prepare-ndk.py still checks the publisher sha1 and size, downloads on a
+# miss and extracts freshly on every use; only these exact lines may differ.
+NDK_ARCHIVE_SHARING={
+ '.github/workflows/net-tcp-coherent-component.yml':(
+  b'          path: tcp-ndk-archive\n          key: tcp-ndk-r27c-090e8083a715fdb1a3e402d0763c388abb03fb4e\n',
+  b'          path: dns-ndk.zip\n          key: combined-ndk-r27c-090e8083a715fdb1a3e402d0763c388abb03fb4e\n'),
+ 'tools/net-tcp-priority/prepare-ndk.py':(
+  b"archive = Path('tcp-ndk-archive/android-ndk-r27c-linux.zip')\narchive.parent.mkdir(exist_ok=True)\n",
+  b"# Shares native2's publisher-archive cache entry (same path and key), so one copy is kept.\narchive = Path('dns-ndk.zip')\n"),
+}
+REVIEWED_PATHS=('compat/posix/src/fd.cc','compat/posix/src/socket.cc','compat/posix/src/socket_internal.h','compat/posix/src/system.cc','compat/posix/src/winsock.cc')
 def old(path):return subprocess.check_output(['git','-C',str(ROOT),'show',BASE+':'+path])
 def check():
  preceding=preceding_ofd_sources()
@@ -335,6 +432,14 @@ def check():
          CONTROL_BASE if path=='tools/windows4/test-tsf-job-supervisor.ps1' else BASE)
   expected=subprocess.check_output(['git','-C',str(ROOT),'show',epoch+':'+path])
   actual=preceding.get(path,(ROOT/path).read_bytes())
+  if path=='compat/posix/src/winsock.cc':
+   assert actual.count(TCP_PRIORITY_WAKE_AFTER)==1 and TCP_PRIORITY_WAKE_BEFORE not in actual,path
+   actual=actual.replace(TCP_PRIORITY_WAKE_AFTER,TCP_PRIORITY_WAKE_BEFORE,1)
+  if path in NDK_ARCHIVE_SHARING:
+   before,after=NDK_ARCHIVE_SHARING[path]
+   assert actual.count(after)==1 and before not in actual,path
+   actual=actual.replace(after,before,1)
+  if path in REVIEWED_PATHS:actual=reviewed(path,actual)
   if path=='compat/posix/src/winsock.cc':
    assert actual==expected and hashlib.sha256(actual).hexdigest()==WINSOCK_SHA256,path
    original=old(path)
@@ -414,12 +519,13 @@ def check():
  raw=old('.github/workflows/net-tcp-coherent-component.yml').decode()
  expected=raw.replace('name: net-tcp-coherent-component','name: net-tcp-selected-component',1).replace('wip/tcp-coherent-port','wip/tcp-minimum-selection').replace('.github/workflows/net-tcp-coherent-component.yml','.github/workflows/net-tcp-selected-component.yml').replace('net-tcp-coherent-component-${{ github.ref }}','net-tcp-selected-component-${{ github.ref }}').replace('supplier: [canonical, retirement]','supplier: [canonical, selected-minimum]').replace('else prefix=tcp-private-supplier','else prefix=tcp-selected-supplier').replace('separately patched diagnostic compiler','intentionally selected two-patch original-profile candidate').replace('# canonical supplier separate from the minimal-retirement diagnostic supplier.','# canonical supplier separate from the intentionally selected minimum candidate.')
  expected=expected.replace('      - uses: actions/checkout@v4\n      - uses: ./.github/actions/setup-build','      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n      - name: Verify exact source and two-supplier preservation before native compilation\n        run: |\n          python3 tools/net-tcp-priority/test-selected-policy.py\n          python3 tools/net-tcp-priority/test-selected-supplier.py\n          python3 tools/host-pthread-authority/minimum_receipt.py selftest\n      - uses: ./.github/actions/setup-build',1)
+ before,after=(s.decode() for s in NDK_ARCHIVE_SHARING['.github/workflows/net-tcp-coherent-component.yml']);assert expected.count(before)==1;expected=expected.replace(before,after,1)
  actual=(ROOT/'.github/workflows/net-tcp-selected-component.yml').read_text(encoding='utf-8');assert actual==expected,'Supplier-independent DAG/commands changed'
  pin=json.loads((ROOT/'tools/host-pthread-authority/minimum-inputs.json').read_text());assert pin['role']=='gesher-winpthreads-selected-minimum-v1' and len(pin['source_sha256'])==len(pin['output_source_sha256'])==12
  assert pin['ordered_patch_sha256']=={'minimum-detached-retirement.patch':'ebc5aac990c6ec075431d0c25a9b74ecadc0940da1bdad9503f358d4fe3431ad','minimum-noattach-join.patch':'c4f47903af720542a584fa743932316d86c45683da70a4c8620d7a71d3eb7f96'}
  for name,digest in pin['ordered_patch_sha256'].items():assert hashlib.sha256((ROOT/'tools/host-pthread-authority'/name).read_bytes()).hexdigest()==digest
  for path in ['tools/net-tcp-priority/manifest.py','tools/host-pthread-authority/minimum_receipt.py']:ast.parse((ROOT/path).read_text(encoding='utf-8'))
- print('TCP_SELECTED_POLICY_PASS exact_OFD_stdio_pipe_transition reviewed_pipe_control_errors original_socket_ownership_and_native_poll=EXACT reviewed_outer_poll_scratch_exact original_product3 reviewed_nested_epoll_fd reviewed_device_lookup_and_stream_retirement_only reviewed_sendmsg_control reviewed_statvfs_affinity_file_advice_allocation_writev_and_memfd_only reviewed_fcntl_argument_selection_only canonical_Recv originalworkflow other_fixture_assertions_deadlines=EXACT reviewed_select_and_calibrated_owner_census controller_execution_tail original_import_NDK_build_roles=EXACT new_two_supplier_DAG=BOUNDED source12_patch2_exact native_processes_started=0')
+ print('TCP_SELECTED_POLICY_PASS exact_OFD_stdio_pipe_transition reviewed_pipe_control_errors reviewed_process_lifetime_socket_registry reviewed_outer_poll_scratch_exact reviewed_priority_wake_confirmation_only original_socket_ownership_and_native_poll=EXACT original_product3 reviewed_nested_epoll_fd reviewed_device_lookup_and_stream_retirement_only reviewed_sendmsg_control reviewed_statvfs_affinity_file_advice_allocation_writev_and_memfd_only reviewed_fcntl_argument_selection_only canonical_Recv originalworkflow other_fixture_assertions_deadlines=EXACT reviewed_select_and_calibrated_owner_census controller_execution_tail original_import_NDK_build_roles=EXACT new_two_supplier_DAG=BOUNDED source12_patch2_exact native_processes_started=0')
 def transition_negative_controls():
  from unittest.mock import patch
  original=Path.read_bytes
@@ -432,7 +538,13 @@ def transition_negative_controls():
   ('compat/elf/exec/shell_execute.inc',b'gesher::ReadPipeDescriptionInterruptible(description, value, 1, interrupted)',b'gesher::ReadFileDescription(description, value, 1)'),
   ('tools/net-tcp-priority/qualified/ofd-stream-source.patch',b'@@',b'@x'),
   ('compat/posix/src/fd.cc',b'if (result < 0) return -1;',b'if (result < 0) return 0;'),
-  ('compat/posix/src/fd.cc',b'static SocketRegistry* registry = new (storage) SocketRegistry;',b'static SocketRegistry owned; SocketRegistry* registry = &owned;'),
+  ('compat/posix/src/fd.cc',b'SocketRegistry& socket_registry = *new (socket_registry_storage) SocketRegistry;',b'SocketRegistry socket_registry;'),
+  ('compat/posix/src/stdio_output.cc',b'if (locked_stream_) _lock_file(locked_stream_);',b'if (locked_stream_) {}'),
+  ('compat/posix/src/socket.cc',b'if (flags & MSG_CMSG_CLOEXEC) result |= ws::kMsgCmsgCloexec;',b'if (flags & MSG_CMSG_CLOEXEC) result |= 0;'),
+  ('compat/posix/src/socket.cc',b'gesher::ClaimRights(token, rights, (flags & MSG_CMSG_CLOEXEC) != 0);',b'gesher::ClaimRights(token, rights, true);'),
+  ('compat/posix/src/winsock.cc',b'(flags & kMsgCmsgCloexec) != 0);',b'false);'),
+  ('compat/posix/src/unix_rights.cc',b'AdoptFileDescription(h, shared, static_cast<DescriptorKind>(kind), close_on_exec)',b'AdoptFileDescription(h, shared, static_cast<DescriptorKind>(kind), false)'),
+  ('probes/binder/binder_probe.cc',b'retained_files.size() == 9',b'retained_files.size() == 6'),
  ]
  for name,before,after in cases:
   target=ROOT/name
@@ -449,4 +561,7 @@ def transition_negative_controls():
 if __name__=='__main__':
  import sys
  check()
- if '--selftest' in sys.argv:transition_negative_controls()
+ if '--selftest' in sys.argv:
+  transition_negative_controls()
+  import runpy
+  runpy.run_path(str(ROOT/'tools/net-tcp-priority/test-shared-stdio-policy.py'),run_name='__main__')

@@ -31,6 +31,7 @@
 #include <utility>
 #include <vector>
 #include "@PE_EXPORTS_HEADER@"
+#include "@ENVIRONMENT_ENCODING_HEADER@"
 
 static thread_local int allocation_failure = -1;
 void* operator new(size_t count) {
@@ -41,6 +42,10 @@ void* operator new(size_t count) {
 }
 void operator delete(void* value) noexcept { std::free(value); }
 void operator delete(void* value, size_t) noexcept { std::free(value); }
+void* operator new(size_t count, const std::nothrow_t&) noexcept {
+  try { return ::operator new(count); } catch (const std::bad_alloc&) { return nullptr; }
+}
+void operator delete(void* value, const std::nothrow_t&) noexcept { std::free(value); }
 
 #define WINAPI
 #define CALLBACK
@@ -60,7 +65,7 @@ constexpr BOOL TRUE = 1, FALSE = 0;
 #define INVALID_HANDLE_VALUE reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1))
 constexpr DWORD ERROR_SUCCESS = 0, ERROR_NOT_ENOUGH_MEMORY = 8, ERROR_INVALID_HANDLE = 6,
     ERROR_INVALID_PARAMETER = 87, ERROR_ACCESS_DENIED = 5, ERROR_NOT_SUPPORTED = 50,
-    ERROR_GEN_FAILURE = 31;
+    ERROR_GEN_FAILURE = 31, ERROR_NO_UNICODE_TRANSLATION = 1113;
 constexpr DWORD ERROR_ALREADY_EXISTS = 183, WAIT_OBJECT_0 = 0, WAIT_ABANDONED = 128,
     WAIT_TIMEOUT = 258, WAIT_FAILED = 0xffffffffu, SYNCHRONIZE = 0x100000, MUTEX_MODIFY_STATE = 1;
 constexpr DWORD BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2;
@@ -78,7 +83,7 @@ constexpr DWORD GENERIC_READ = 0x80000000, GENERIC_WRITE = 0x40000000,
     FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, OPEN_EXISTING = 3;
 constexpr DWORD PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x20002, STARTF_USESTDHANDLES = 0x100;
 constexpr DWORD CREATE_UNICODE_ENVIRONMENT = 0x400, EXTENDED_STARTUPINFO_PRESENT = 0x80000,
-    CREATE_NO_WINDOW = 0x8000000;
+    CREATE_NO_WINDOW = 0x8000000, DETACHED_PROCESS = 0x8, CREATE_NEW_CONSOLE = 0x10;
 constexpr int _O_BINARY = 0x8000;
 constexpr int _O_NOINHERIT = 0x0080;
 struct SECURITY_ATTRIBUTES { DWORD length; void* security; BOOL inherit; };
@@ -113,6 +118,9 @@ static uint64_t next_identity = 1;
 static thread_local DWORD error;
 static int duplicate_fail_after = -1, map_error, handle_information_error;
 static int create_process_error;
+static int allocation_after_duplicate = -1;
+static bool allocation_after_attributes;
+static size_t attribute_lists, create_process_calls;
 static int pipe_mode_sets;
 static bool image_transport = true;
 static size_t last_inherited_handles;
@@ -215,6 +223,17 @@ static HANDLE OpenMutexW(DWORD access, BOOL inherit, const wchar_t* name) {
   host::Require(access == (SYNCHRONIZE | MUTEX_MODIFY_STATE) && !inherit);
   return MapMutex(shm_open(MutexName(name).c_str(), O_RDWR | O_CLOEXEC, 0), false);
 }
+static HANDLE CreateMutexExW(void* attributes, const wchar_t* name, DWORD flags, DWORD access) {
+  host::Require(!attributes && !flags && access == (SYNCHRONIZE | MUTEX_MODIFY_STATE));
+  const std::string path = MutexName(name);
+  int fd = shm_open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  const bool created = fd >= 0;
+  if (created) host::mutex_names.insert(path);
+  else if (errno == EEXIST) fd = shm_open(path.c_str(), O_RDWR | O_CLOEXEC, 0);
+  HANDLE result = MapMutex(fd, created);
+  if (result && !created) SetLastError(ERROR_ALREADY_EXISTS);
+  return result;
+}
 static DWORD WaitForSingleObject(HANDLE handle, DWORD milliseconds) {
   host::Require(milliseconds == 0);
   auto found = host::mutexes.find(host::Native(handle));
@@ -261,6 +280,10 @@ static BOOL DuplicateHandle(HANDLE, HANDLE source, HANDLE, HANDLE* result, DWORD
   host::owned.insert(fd);
   host::identities[fd] = host::identities[original];
   *result = host::Handle(fd);
+  // Inject only after the OS boundary has acquired its real handle. The next
+  // throwing allocation belongs to the production launch builder.
+  if (inherit && host::allocation_after_duplicate > 0 && --host::allocation_after_duplicate == 0)
+    allocation_failure = 0;
   return TRUE;
 }
 static HANDLE CreateFileMappingW(HANDLE file, SECURITY_ATTRIBUTES* attributes, DWORD protection,
@@ -398,6 +421,7 @@ static HANDLE CreateFileW(const wchar_t* path, DWORD, DWORD, SECURITY_ATTRIBUTES
 static BOOL InitializeProcThreadAttributeList(AttributeList* attributes, DWORD count, DWORD flags, SIZE_T* bytes) {
   host::Require(count == 1 && flags == 0);
   *bytes = sizeof(AttributeList);
+  if (attributes) ++host::attribute_lists;
   return attributes ? TRUE : FALSE;
 }
 static BOOL UpdateProcThreadAttribute(AttributeList* attributes, DWORD, DWORD kind, void* data,
@@ -405,13 +429,25 @@ static BOOL UpdateProcThreadAttribute(AttributeList* attributes, DWORD, DWORD ki
   host::Require(kind == PROC_THREAD_ATTRIBUTE_HANDLE_LIST && size % sizeof(HANDLE) == 0);
   attributes->handles = static_cast<HANDLE*>(data);
   attributes->count = size / sizeof(HANDLE);
+  if (host::allocation_after_attributes) {
+    host::allocation_after_attributes = false;
+    allocation_failure = 0;
+  }
   return TRUE;
 }
-static void DeleteProcThreadAttributeList(AttributeList*) {}
+static void DeleteProcThreadAttributeList(AttributeList*) {
+  host::Require(host::attribute_lists != 0);
+  --host::attribute_lists;
+}
 static BOOL CreateProcessW(const wchar_t*, wchar_t*, void*, void*, BOOL, DWORD, void*, const wchar_t*,
                            STARTUPINFOW*, PROCESS_INFORMATION*);
 
 namespace gesher {
+// This corpus uses ordinary files; the memfd-seal corpus exercises the EA
+// boundary separately. No ordinary descriptor may be registered as a memfd.
+static bool FileHasMemfdSeals(HANDLE) { return false; }
+static void RegisterMemfd(int) { std::abort(); }
+static int MemfdWriteHandleError(HANDLE, bool, uint64_t, uint64_t, bool) { return 0; }
 int PipeStatusFlags(HANDLE handle, int flags) {
   const int native = fcntl(host::Native(handle), F_GETFL);
   return native < 0 ? -1 : (flags & ~O_NONBLOCK) | (native & O_NONBLOCK);
@@ -468,7 +504,37 @@ static FARPROC GetProcAddress(HMODULE module, const char* name) {
   return nullptr;
 }
 
+namespace gesher {
+// This OFD envelope supplies one owned ASCII environment fixture. The actual
+// environment owner/borrowed storage uses the separate production-owner and
+// native ELF/exec tests; UTF16 conversion remains a Windows boundary here.
+bool VisitEnvironment(void (*visit)(const char*, void*), void* context) {
+  visit("GESHER_OFD_TRANSFER_ENV=fixture", context);
+  return true;
+}
+}
 namespace gesher::exec {
+static wchar_t* GetEnvironmentStringsW() {
+  // Only the native-only entries survive; the owner's live assignment wins.
+  static constexpr wchar_t values[] = L"=D:=D:\\fixture\xd83d\xde00\0"
+      L"=C:=C:\\fixture\xd800\0GESHER_OFD_TRANSFER_ENV=stale-native\0";
+  auto* copy = static_cast<wchar_t*>(std::malloc(sizeof(values)));
+  if (copy) std::memcpy(copy, values, sizeof(values));
+  return copy;
+}
+static void FreeEnvironmentStringsW(wchar_t* value) { std::free(value); }
+static constexpr int CSTR_LESS_THAN = 1;
+static int CompareStringOrdinal(const wchar_t* left, int left_size, const wchar_t* right, int right_size, BOOL) {
+  const int size = std::min(left_size, right_size);
+  for (int i = 0; i < size; ++i) {
+    wchar_t a = left[i], b = right[i];
+    if (a >= L'a' && a <= L'z') a -= L'a' - L'A';
+    if (b >= L'a' && b <= L'z') b -= L'a' - L'A';
+    if (a != b) return a < b ? 1 : 3;
+  }
+  return left_size == right_size ? 2 : left_size < right_size ? 1 : 3;
+}
+@ENVIRONMENT_BLOCK@
 struct Launch { std::wstring application, command_line; };
 struct ChildFd { int fd; HANDLE handle; gesher::DescriptorSnapshotPtr snapshot{}; };
 static DWORD DescriptorTransportSupport(const std::wstring& path, bool* supported, HANDLE* image) {
@@ -486,10 +552,15 @@ DWORD SpawnWithFds(const Launch&, const wchar_t*, const std::wstring&,
 static BOOL CreateProcessW(const wchar_t* app, wchar_t* command, void*, void*, BOOL inherit,
                            DWORD flags, void* environment, const wchar_t* cwd,
                            STARTUPINFOW* raw_startup, PROCESS_INFORMATION* info) {
-  host::Require(!environment && !cwd &&
-      (flags & ~EXTENDED_STARTUPINFO_PRESENT) == (CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW));
+  ++host::create_process_calls;
+  const auto* inherited = static_cast<const wchar_t*>(environment);
+  static constexpr wchar_t expected[] = L"=C:=C:\\fixture\xd800\0"
+      L"=D:=D:\\fixture\xd83d\xde00\0GESHER_OFD_TRANSFER_ENV=fixture\0";
   auto* startup = reinterpret_cast<STARTUPINFOEXW*>(raw_startup);
   const bool extended = (flags & EXTENDED_STARTUPINFO_PRESENT) != 0;
+  host::Require(inherited && std::memcmp(inherited, expected, sizeof(expected)) == 0 && !cwd &&
+      (flags & ~EXTENDED_STARTUPINFO_PRESENT) ==
+      (CREATE_UNICODE_ENVIRONMENT | (extended ? CREATE_NO_WINDOW : DETACHED_PROCESS)));
   host::Require(inherit == extended && raw_startup->cb == (extended ? sizeof(*startup) : sizeof(*raw_startup)) &&
       raw_startup->dwFlags == STARTF_USESTDHANDLES && extended == (startup->lpAttributeList != nullptr));
   host::last_inherited_handles = extended ? startup->lpAttributeList->count : 0;
@@ -727,6 +798,18 @@ int main(int argc, char** argv) {
       ReleaseMutex(child->description->pipe_mutex);
     });
     while (!holding.load()) std::this_thread::yield();
+    {
+      HANDLE late_mapping = nullptr;
+      Check("retain shared state for adoption while another process owns the gate",
+          DuplicateHandle(GetCurrentProcess(), gesher::ShareFileDescription(parent),
+              GetCurrentProcess(), &late_mapping, 0, FALSE, DUPLICATE_SAME_ACCESS));
+      gesher::OpenFileDescription late;
+      const bool late_adopted = late_mapping && late.Adopt(late_mapping);
+      const DWORD admission = late_adopted ? WaitForSingleObject(late.pipe_mutex, 0) : WAIT_FAILED;
+      Check("adoption opens the existing gate without resetting active ownership", admission == WAIT_TIMEOUT);
+      if (admission == WAIT_OBJECT_0 || admission == WAIT_ABANDONED) ReleaseMutex(late.pipe_mutex);
+      if (!late_adopted && late_mapping) CloseHandle(late_mapping);
+    }
     Check("unchanged and metadata-only flags remain usable during endpoint I/O",
         gesher::SetFileDescriptionFlags(parent, 0) == 0 &&
         gesher::SetFileDescriptionFlags(parent, O_APPEND) == 0 &&
@@ -738,6 +821,45 @@ int main(int argc, char** argv) {
     Check("restore metadata after active-I/O checks", gesher::SetFileDescriptionFlags(parent, 0) == 0);
     child.reset(); parent.reset();
     Check("shared-state interleavings release every retained native handle", host::owned.size() == before);
+  }
+  {
+    const size_t before = host::owned.size();
+    int ends[2];
+    host::Require(pipe2(ends, O_CLOEXEC) == 0);
+    HANDLE original_file = host::Handle(host::Own(ends[0]));
+    auto original = gesher::CaptureFileHandle(original_file);
+    host::Require(original && gesher::InitializePipeDescription(original, O_RDONLY) == 0);
+    std::wstring gate_name = L"Local\\gesher-pipe-";
+    for (char digit : original->description->shared.load()->pipe_gate) {
+      if (digit) gate_name += static_cast<wchar_t>(digit);
+    }
+    HANDLE inherited = nullptr, inherited_file = nullptr;
+    host::Require(DuplicateHandle(GetCurrentProcess(), gesher::ShareFileDescription(original),
+        GetCurrentProcess(), &inherited, 0, FALSE, DUPLICATE_SAME_ACCESS) &&
+        DuplicateHandle(GetCurrentProcess(), original->handle, GetCurrentProcess(),
+            &inherited_file, 0, FALSE, DUPLICATE_SAME_ACCESS));
+    original.reset(); CloseHandle(original_file);
+    // POSIX shared-memory names survive their last close. Explicitly model
+    // Windows destroying this now-unowned mutex before the child imports.
+    Check("sender retired every pipe gate handle before child adoption", host::owned.size() == before + 2);
+    host::Require(shm_unlink(MutexName(gate_name.c_str()).c_str()) == 0);
+    auto child = std::make_shared<gesher::DescriptorSnapshot>();
+    child->handle = inherited_file;
+    child->description = std::make_shared<gesher::OpenFileDescription>();
+    const bool adopted = child->description->Adopt(inherited);
+    Check("child imports a pipe after the sender's last description retired", adopted);
+    if (!adopted) CloseHandle(inherited);
+    Check("retired-owner adoption preserves real access and permits a mode change",
+        adopted && gesher::FileDescriptionFlags(child) == O_RDONLY &&
+        gesher::SetFileDescriptionFlags(child, O_NONBLOCK) == 0 &&
+        (fcntl(host::Native(child->handle), F_GETFL) & O_NONBLOCK) != 0);
+    char byte = 0;
+    Check("retired-owner endpoint retains the actual pipe data",
+        write(ends[1], "R", 1) == 1 && read(host::Native(child->handle), &byte, 1) == 1 && byte == 'R');
+    close(ends[1]);
+    Check("retired-owner endpoint sees actual last-writer EOF", read(host::Native(child->handle), &byte, 1) == 0);
+    child.reset();
+    Check("retired-owner adoption releases every retained native handle", host::owned.size() == before);
   }
   Check("stateless device kind fixture", OpenFixture("/dev/null", 42, O_RDWR) == 42 &&
       gesher::SetDescriptorKind(42, gesher::DescriptorKind::kZero) == 0);
@@ -756,6 +878,44 @@ int main(int argc, char** argv) {
   // all transient handles. The original descriptors and status remain live.
   for (const auto& file : fds) Check("promote child description", gesher::ShareFileDescription(file.snapshot) != nullptr);
   const size_t before_failure = host::owned.size();
+  {
+    const std::wstring directory;
+    const size_t before_calls = host::create_process_calls, before_views = host::views.size();
+    const size_t before_attributes = host::attribute_lists;
+    DWORD result = ERROR_SUCCESS;
+    bool escaped = false;
+    // The public HANDLE wrapper builds its ChildFd vector before it reaches
+    // SpawnWithFds. Its allocation must obey the same status-only boundary.
+    allocation_failure = 0;
+    try { result = gesher::exec::Spawn(launch, nullptr, directory, snapshot->handle, nullptr, nullptr, &info); }
+    catch (const std::bad_alloc&) { escaped = true; }
+    allocation_failure = -1;
+    Check("launch wrapper allocation failure returns a Win32 memory error", !escaped && result == ERROR_NOT_ENOUGH_MEMORY);
+    Check("launch wrapper allocation failure retains caller resources", host::owned.size() == before_failure &&
+        host::views.size() == before_views && host::attribute_lists == before_attributes);
+    Check("launch wrapper allocation failure does not start a child", host::create_process_calls == before_calls);
+  }
+  for (bool after_attributes : {false, true}) {
+    const size_t before_views = host::views.size(), before_attributes = host::attribute_lists;
+    const size_t before_calls = host::create_process_calls;
+    // First file + shared-description duplication is followed by ownership
+    // bookkeeping; the late case reaches the command-line copy after the
+    // native attribute list has been initialized. No child may start in either.
+    host::allocation_after_duplicate = after_attributes ? -1 : 2;
+    host::allocation_after_attributes = after_attributes;
+    DWORD result = ERROR_SUCCESS;
+    bool escaped = false;
+    try { result = gesher::exec::SpawnWithFds(launch, nullptr, L"", fds, &info, 0); }
+    catch (const std::bad_alloc&) { escaped = true; }
+    allocation_failure = -1;
+    host::allocation_after_duplicate = -1;
+    host::allocation_after_attributes = false;
+    Check("launch allocation failure returns a Win32 memory error", !escaped && result == ERROR_NOT_ENOUGH_MEMORY);
+    Check("launch allocation failure releases all temporary handles and views",
+        host::owned.size() == before_failure && host::views.size() == before_views);
+    Check("launch allocation failure destroys initialized native attribute lists", host::attribute_lists == before_attributes);
+    Check("launch allocation failure does not start a child", host::create_process_calls == before_calls);
+  }
   host::duplicate_fail_after = 3;
   Check("partial duplicate failure is propagated", gesher::exec::SpawnWithFds(launch, nullptr, L"", fds, &info, 0) == ERROR_NOT_ENOUGH_MEMORY);
   host::duplicate_fail_after = -1;
@@ -841,7 +1001,8 @@ int main(int argc, char** argv) {
   close(parent_to_child[1]); close(child_to_parent[0]);
   for (int fd : {37, 38, 39, 42, 50, 7100}) CloseFixture(fd);
   snapshot.reset(); alias.reset();
-  Check("last alias releases mappings and native snapshots", host::owned.empty() && host::views.empty() && host::mutexes.empty());
+  Check("last alias releases mappings and native snapshots", host::owned.empty() && host::views.empty() &&
+      host::mutexes.empty() && host::attribute_lists == 0);
   for (const auto& name : host::mutex_names) shm_unlink(name.c_str());
   std::printf("Production OFD/exec transfer: %d assertions, %d failures\n", checks, failures);
   return failures ? 1 : 0;

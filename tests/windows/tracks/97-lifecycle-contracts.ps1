@@ -31,6 +31,8 @@ foreach ($fixture in @(
      Label = 'kernel pipe admission, cancellation, aliases and truthful unsupported operations' },
   @{ Exe = 'pipe_native_process_test.exe'; Markers = @('pipe native process contracts:', ' checks, 0 failures');
      Label = 'native peer lifetime, shared process admission and external sync/async pipe I/O' },
+  @{ Exe = 'revocable_file_test.exe'; Markers = @('revocable Windows contracts:', ' checks, 0 failures');
+     Label = 'revocable descriptor aliases, in-flight I/O barrier and bounded native resources' },
   @{ Exe = 'ofd_spawn_test.exe'; Markers = @('OFD Windows spawn:', ' checks, 0 failures');
      Label = 'actual importer discovery, shared file descriptions and native PE interoperability' },
   @{ Exe = 'media_input_surface_callback_test.exe'; Markers = @('input surface callback contracts:', ' checks, 0 failures');
@@ -57,4 +59,29 @@ try {
   } @('stdio exit-handler output: earlylate')
 } finally {
   Remove-Item $stdioExitPath -Force -ErrorAction SilentlyContinue
+}
+
+$stdioTlsOut = RunTimed "$Dir/stdio_ofd_test.exe" @('--tls-exit') 30
+$stdioTlsCode = $LASTEXITCODE
+Check 'stdio: concurrent output and pthread TLS destruction' {
+  $global:LASTEXITCODE = $stdioTlsCode
+  $stdioTlsOut
+} @('stdio TLS exit: all passed')
+
+$fontScope = $env:GESHER_FONT_REGRESSION_SCOPE
+# Unselected/manual execution retains the strict default. CI selects the
+# supported scope explicitly; an unknown selection never drops an assertion.
+if (-not $fontScope) { $fontScope = 'functional-and-strict' }
+if ($fontScope -cnotin @('functional', 'functional-and-strict')) {
+  throw "Unknown font regression scope: $fontScope"
+}
+Check 'environment: font values, borrowed storage, read callback and concurrent snapshots' {
+  & "$PSScriptRoot/../run-environment-owner-regression.ps1" -Fixture "$Dir/font_environment_test.exe" -Scope functional
+} @('font environment functional regression: 5 cases passed; held_writer_callback_qualified=0 crt_owner_qualified=0')
+if ($fontScope -ceq 'functional-and-strict') {
+  Check 'environment: strict held CRT owner and concurrent callback completion' {
+    & "$PSScriptRoot/../run-environment-owner-regression.ps1" -Fixture "$Dir/font_environment_test.exe" -Scope strict
+  } @('font environment regression: 5 cases passed')
+} else {
+  Write-Host 'ENVIRONMENT_HOST_STRICT_WCT_NOT_RUN selected_scope=functional held_writer_callback_qualified=0 crt_owner_qualified=0 historical_Windows2025_WCT_qualified=0'
 }

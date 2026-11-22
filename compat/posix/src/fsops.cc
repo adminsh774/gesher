@@ -27,6 +27,7 @@
 #include "internal.h"
 #include "descriptor_resources.h"
 #include "record_lock_descriptors.h"
+#include "revocable_internal.h"
 #include "stdio_internal.h"
 
 using gesher::PathKind;
@@ -573,8 +574,11 @@ int fchmodat(int dirfd, const char* path, mode_t mode, int flags) {
 // Linux lets the owner change the mode through any fd, so this works on a
 // second handle with the access it needs (as futimens, path.cc).
 int fchmod(int fd, mode_t mode) {
-  HANDLE h = gesher::HandleFromFd(fd);
-  if (h == INVALID_HANDLE_VALUE) return errno = EBADF, -1;
+  auto snapshot = gesher::CaptureDescriptor(fd);
+  if (!snapshot) return -1;
+  gesher::FileOperationLease operation(snapshot);
+  if (operation.Error()) return errno = operation.Error(), -1;
+  HANDLE h = snapshot->handle;
   if (GetFileType(h) != FILE_TYPE_DISK) return 0;  // pipes, sockets, devices
   HANDLE writable = ReOpenFile(h, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -666,15 +670,15 @@ FILE* fdopen(int fd, const char* mode) {
 
 FILE* fopen64(const char* path, const char* mode) { return fopen(path, mode); }
 
-int gesher_fclose_state(FILE* stream, int* retired) {
-  if (retired) *retired = 0;
+int gesher_fclose_state(FILE* stream, int* retired_out) {
+  if (retired_out) *retired_out = 0;
   if (!stream) return errno = EINVAL, EOF;
   StreamLock stream_lock(stream);
   if (!stream_lock) return EOF;
   const int fd = _fileno(stream);
   const int flushed = gesher::stdio::FlushOutput(stream);
   const int flush_error = errno;
-  gesher::RetiredDescriptor retired_descriptor;
+  gesher::RetiredDescriptor retired;
   int result, saved, error;
   {
     gesher::record_locks::ClosingDescriptor transaction(fd);
@@ -682,8 +686,8 @@ int gesher_fclose_state(FILE* stream, int* retired) {
     // Use the CRT's documented unlocked entry under the shared stream lock,
     // retiring the token before native close can release its allocation. This
     // also prevents a concurrent flush-all from dereferencing a retired FILE.
-    if (retired) *retired = 1;
     gesher::stdio::Forget(stream);
+    if (retired_out) *retired_out = 1;
     // The native entry avoids recursion through this public fclose symbol.
     result = _fclose_nolock(stream);
     saved = result == EOF ? gesher_errno_from_crt(errno) : flushed < 0 ? flush_error : errno;
@@ -691,11 +695,11 @@ int gesher_fclose_state(FILE* stream, int* retired) {
     // A flush error can coexist with a completed close. Retire the fd entry
     // while its descriptor transaction still excludes participating reuse.
     if (result == 0 || gesher::HandleFromFd(fd) == INVALID_HANDLE_VALUE) {
-      retired_descriptor.Retire(fd);
+      retired.Retire(fd);
     }
     error = transaction.Finish(result == 0);
   }
-  if (retired_descriptor.Finish() < 0 && result != EOF) { result = EOF; saved = errno; }
+  if (retired.Finish() < 0 && result != EOF) { result = EOF; saved = errno; }
   if (error) return errno = error, EOF;
   errno = saved;
   return result == EOF || flushed < 0 ? EOF : 0;
@@ -705,14 +709,14 @@ int fclose(FILE* stream) { return gesher_fclose_state(stream, nullptr); }
 
 // The stream is reopened by the CRT on the Windows name (NUL for /dev/null),
 // keeping its FILE.
-FILE* gesher_freopen_state(const char* path, const char* mode, FILE* stream, int* retired) {
-  if (retired) *retired = 0;
+FILE* gesher_freopen_state(const char* path, const char* mode, FILE* stream, int* retired_out) {
+  if (retired_out) *retired_out = 0;
   if (!stream) return errno = EINVAL, nullptr;
   StreamLock stream_lock(stream);
   if (!stream_lock) return nullptr;
   const int old_fd = _fileno(stream);
   gesher::stdio::FlushOutput(stream);
-  gesher::RetiredDescriptor retired_descriptor;
+  gesher::RetiredDescriptor retired;
   // Keep native socket close outside the descriptor guard on every return,
   // including invalid modes and unsuccessful destination opens.
   auto reopen = [&]() -> FILE* {
@@ -722,12 +726,12 @@ FILE* gesher_freopen_state(const char* path, const char* mode, FILE* stream, int
       // Even a destination rejected before the CRT reopen still closes the
       // original stream. Use the already-held stream/descriptor transaction
       // exactly once, including when flushing/closing itself reports an error.
-      if (retired) *retired = 1;
       gesher::stdio::Forget(stream);
+      if (retired_out) *retired_out = 1;
       int closed = _fclose_nolock(stream);
       gesher::ForgetStreamDevice(old_fd, closed == 0);
       if (closed == 0 || gesher::HandleFromFd(old_fd) == INVALID_HANDLE_VALUE) {
-        retired_descriptor.Retire(old_fd);
+        retired.Retire(old_fd);
       }
       int metadata_error = transaction.Finish(closed == 0);
       errno = metadata_error ? metadata_error : requested_error;
@@ -757,14 +761,14 @@ FILE* gesher_freopen_state(const char* path, const char* mode, FILE* stream, int
     // existence check before reopening would still race another creator.
     if (mode[0] == 'w' && (flags & O_EXCL) != 0) wmode += L'x';
     if ((flags & O_CLOEXEC) != 0) wmode += L'N';
-    if (retired) *retired = 1;
+    if (retired_out) *retired_out = 1;
     FILE* result = _wfreopen(windows.c_str(), wmode.c_str(), stream);
     int saved = result == nullptr ? gesher_errno_from_crt(errno) : errno;
     gesher::ForgetStreamDevice(old_fd, result != nullptr);
     if (result == nullptr && saved == ENOENT && HasNonDirectoryParent(windows)) saved = ENOTDIR;
     // The CRT closes the original file on both success and failure. A successful
     // reopen creates a new description; dup aliases must retain the old one.
-    retired_descriptor.Retire(old_fd);
+    retired.Retire(old_fd);
     if (result == nullptr || result != stream) gesher::stdio::Forget(stream);
     if (result != nullptr &&
         (gesher::RegisterOfd(_fileno(result), flags | O_LARGEFILE) < 0 ||

@@ -14,12 +14,21 @@ from validate_stdio_evidence import main as validate
 
 def transcript(full_wct):
     lines = ['ACTUAL_PUBLIC_LOCK_PROBE pid=42 public-api=true',
-             'ACTUAL_PUBLIC_LOCK_PROBE pid=43 public-api=true']
+             'ACTUAL_PUBLIC_LOCK_PROBE pid=43 public-api=true',
+             'ACTUAL_CRT_LOCK_LAYOUT decoded=true offset=48',
+             'ACTUAL_CRT_LOCK_LAYOUT decoded=true offset=48']
     phases = ['start', 'held-and-entered', 'sample-and-negatives', 'independent-close',
               'unlock', 'actual-thread-exit-and-join', 'control-cleanup']
     for cycle in range(1, 5):
         for tick, phase in enumerate(phases):
             lines.append(f'ACTUAL_STDIO_CLOCK cycle={cycle} phase={phase} tick={1000 + tick} deadline=6000')
+        lines.append(f'ACTUAL_STDIO_LOCK_OWNER cycle={cycle} public-api={"true" if cycle % 2 else "false"}')
+        for phase, file, cs, owner, recursion in [('before', '0x1000', '0x1030', 0, 0),
+                                                ('held', '0x1000', '0x1030', 10, 1),
+                                                ('waiting', '0x1000', '0x1030', 10, 1),
+                                                ('negative-sibling', '0x2000', '0x2030', 10, 1)]:
+            lines.append(f'ACTUAL_CRT_FILE_OWNER phase={phase} FILE={file} cs={cs} owner={owner} '
+                         f'expected-owner=10 owner-birth=100 recursion={recursion}')
         for phase, first, second, recursive in [('before', 0, 0, 0),
                                                ('held-sibling-unlocked', 16, 0, 1),
                                                ('waiting', 16, 16, 1)]:
@@ -27,12 +36,15 @@ def transcript(full_wct):
                          f'owner-birth=100 probe=30 probe-birth=300 target-result={first} '
                          f'sibling-result={second} recursive-owner={recursive} signaled-exit=true handle-closed=true')
         lines += [
-            'ACTUAL_CLOSER_STACK pid=42 closer=20 birth=200 FILE=0x1000 fd=5 captured=1 error=0 frames=2 suspend-before=0 resume-before=1 closed=1',
+            'ACTUAL_CLOSER_STACK pid=42 closer=20 birth=200 FILE=0x1000 fd=5 captured=1 error=0 frames=3 suspend-before=0 resume-before=1 closed=1',
             'ACTUAL_CLOSER_FRAME index=0 pc=0x3100 nearest-export=synthetic',
             'ACTUAL_CLOSER_FRAME index=1 pc=0x5100 nearest-export=synthetic',
-            'ACTUAL_CLOSER_FILE_CALL index=1 pc=0x5100 unwound-r12=0x1000 FILE=0x1000 exact-r12-rcx-copy-and-public-fclose=true unsupported-code-copy=reject',
+            'ACTUAL_CLOSER_FRAME index=2 pc=0x6100 nearest-export=synthetic',
+            'ACTUAL_CLOSER_FILE_CALL index=1 pc=0x5100 argument-register=rsi unwound-rsi=0x1000 unwound-rdi=0x9000 FILE=0x1000 exact-file-argument-and-lock-file-iat=true',
+            'ACTUAL_CLOSER_PUBLIC_FILE_CALL index=2 pc=0x6100 unwound-r12=0x1000 FILE=0x1000 exact-r12-rcx-copy-and-public-fclose=true unsupported-code-copy=reject',
             'ACTUAL_CLOSER_ENTER_FRAME index=0 pc=0x3100 named-entry=0x3000 unwind-begin=0x3000 unwind-end=0x3200',
             'ACTUAL_CLOSER_FILE_CALL_SUMMARY matches=1 required=1 enter-frames=1 other-FILE=0x2000 other-matches=0',
+            'ACTUAL_CLOSER_PUBLIC_FILE_CALL_SUMMARY matches=1 required=1 other-FILE=0x2000 other-matches=0',
             f'ACTUAL_WCT samples=3 success=1 error=0 count={3 if full_wct else 1} cycle=0 contradictory=0 closer=20 owner=10 FILE=0x1000 completed-before-unlock=0',
             'ACTUAL_WCT_NODE index=0 type=8 status=3 pid=42 tid=20',
         ]
@@ -43,10 +55,12 @@ def transcript(full_wct):
             'ACTUAL_STDIO_PHASE independent-fd-closed result=0 closer-completed-before-unlock=0',
             'ACTUAL_STDIO_PHASE stream-unlocked',
             'ACTUAL_PUBLIC_NEGATIVE_CONTROLS distinct-live-FILE-lock=reject wrong-live-owner=reject actual-other-birth=reject completed-real-closer=reject unsupported-code-copy=reject call-other-FILE-argument=reject',
-            f'ACTUAL_PUBLIC_NEGATIVE_VALUES cycle={cycle} closer=20 closer-birth=200 wrong-owner=30 wrong-birth=100 completed-control-tid=40 completed-control-birth=400 completed-control-close=0 completed-control-signaled=true',
+            f'ACTUAL_PUBLIC_NEGATIVE_VALUES cycle={cycle} closer=20 closer-birth=200 wrong-owner=20 wrong-birth=100 completed-control-tid=40 completed-control-birth=400 completed-control-close=0 completed-control-signaled=true',
+            'ACTUAL_CRT_NEGATIVE_CONTROLS wrong-live-FILE-CS=reject wrong-live-owner=reject actual-other-birth=reject completed-real-closer=reject unsupported-code-copy=reject call-other-FILE-argument=reject',
+            f'ACTUAL_CRT_NEGATIVE_VALUES cycle={cycle} closer=20 closer-birth=200 wrong-owner=20 wrong-birth=100 completed-control-tid=40 completed-control-birth=400 completed-control-close=0 completed-control-signaled=true',
             'WCT_NEGATIVE_METADATA_COPIES error=reject cycle=reject wrong-live-thread=reject not-actual-OS-cycle=true',
             'STDIO_ROUTE_METADATA_COPIES single-running=reject sticky-contradiction=reject not-actual-OS-waits=true',
-            f'ACTUAL_STDIO_ROUTE cycle={cycle} route={"full-wct" if full_wct else "public-file-lock"} full-wct={int(full_wct)} single-blocked={int(not full_wct)} strong-witness=true independent-close=0 fclose=0 preunlock-completed=false signaled-exit=true joined=true fd-retired=true',
+            f'ACTUAL_STDIO_ROUTE cycle={cycle} route={"full-wct" if full_wct else "decoded-crt-lock"} full-wct={int(full_wct)} single-blocked={int(not full_wct)} strong-witness=true independent-close=0 fclose=0 preunlock-completed=false signaled-exit=true joined=true fd-retired=true',
         ]
     return '\n'.join(lines) + '\n'
 
@@ -97,7 +111,20 @@ class EvidenceControls(unittest.TestCase):
             ('thread handle leaked', 'handle-closed=true', 'handle-closed=false'),
             ('probe did not exit', 'signaled-exit=true handle-closed=true', 'signaled-exit=false handle-closed=true'),
             ('completed control did not exit', 'completed-control-signaled=true', 'completed-control-signaled=false'),
+            ('completed probe substituted for live wrong owner',
+             'ACTUAL_PUBLIC_NEGATIVE_VALUES cycle=1 closer=20 closer-birth=200 wrong-owner=20',
+             'ACTUAL_PUBLIC_NEGATIVE_VALUES cycle=1 closer=20 closer-birth=200 wrong-owner=30'),
             ('deadline extended', 'deadline=6000', 'deadline=6001'),
+            ('missing native layout', 'ACTUAL_CRT_LOCK_LAYOUT decoded=true offset=48\n', ''),
+            ('inconsistent native layout', 'offset=48', 'offset=49'),
+            ('wrong native FILE lock', 'cs=0x1030', 'cs=0x1040'),
+            ('wrong native owner', 'owner=10 expected-owner=10', 'owner=20 expected-owner=10'),
+            ('missing native recursion', 'recursion=1', 'recursion=0'),
+            ('unknown native argument register', 'argument-register=rsi', 'argument-register=rax'),
+            ('wrong native call argument', 'unwound-rsi=0x1000', 'unwound-rsi=0x2000'),
+            ('unchecked native import call', 'exact-file-argument-and-lock-file-iat=true', 'exact-file-argument-and-lock-file-iat=false'),
+            ('missing native owner mode', 'ACTUAL_STDIO_LOCK_OWNER cycle=2 public-api=false\n', ''),
+            ('native owner case replaced', 'ACTUAL_STDIO_LOCK_OWNER cycle=2 public-api=false', 'ACTUAL_STDIO_LOCK_OWNER cycle=2 public-api=true'),
         ]
         for route in (False, True):
             original = transcript(route)

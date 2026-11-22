@@ -4,7 +4,7 @@
 //
 // close, read, write, dup and dup2 are defined here under the CRT's own
 // names: gesher-base is linked before the CRT, so every caller gets these.
-// Each falls through to the CRT's underscore version for other fds.
+// Non-socket I/O retains the selected native object through completion.
 #include <errno.h>
 #include <fcntl.h>
 #include <io.h>
@@ -30,6 +30,7 @@
 #include "descriptor_resources.h"
 #include "event_internal.h"
 #include "internal.h"
+#include "revocable_internal.h"
 #include "pipe_io.h"
 #include "poll_scratch.h"
 #include "record_lock_descriptors.h"
@@ -38,38 +39,40 @@
 namespace gesher {
 namespace {
 
+// Descriptor-backed stdio flushes after application atexit handlers and static
+// destructors, and still dispatches through LookupSocket. Keep this registry
+// alive until process teardown: destroying it first loses live socket owners
+// and makes that final flush enter an already-destroyed mutex. Native handles
+// and any deliberately quarantined owners remain process-owned until exit.
 struct SocketRegistry {
   std::mutex mutex;
   std::unordered_map<int, SocketFd> entries;
 };
-SocketRegistry& Sockets() {
-  // C stdio flushes after ordinary application exit handlers and C++ static
-  // destructors. Its write dispatch must still find live socket descriptions.
-  // Fixed process storage avoids both a teardown race and an allocation on
-  // first lookup; explicit close still retires entries and native resources.
-  alignas(SocketRegistry) static unsigned char storage[sizeof(SocketRegistry)];
-  static SocketRegistry* registry = new (storage) SocketRegistry;
-  return *registry;
-}
+// Static storage preserves startup construction without a fallible allocation
+// or a registered destructor. Map entries still use the ordinary allocator.
+alignas(SocketRegistry) unsigned char socket_registry_storage[sizeof(SocketRegistry)];
+SocketRegistry& socket_registry = *new (socket_registry_storage) SocketRegistry;
+std::mutex& table_mutex = socket_registry.mutex;
+std::unordered_map<int, SocketFd>& table = socket_registry.entries;
 // Lets the common case, a process without sockets, skip the lock.
 std::atomic<size_t> socket_count{0};
 
 // Takes the socket out of the table; false if fd is not a socket.
 bool Remove(int fd, SocketFd* state, bool* last) {
   if (socket_count.load(std::memory_order_acquire) == 0) return false;
-  std::lock_guard<std::mutex> lock(Sockets().mutex);
-  auto it = Sockets().entries.find(fd);
-  if (it == Sockets().entries.end()) return false;
+  std::lock_guard<std::mutex> lock(table_mutex);
+  auto it = table.find(fd);
+  if (it == table.end()) return false;
   *state = it->second;
   *last = --state->description->descriptor_refs == 0;
-  Sockets().entries.erase(it);
+  table.erase(it);
   socket_count.fetch_sub(1, std::memory_order_release);
   return true;
 }
 
 void Insert(int fd, const SocketFd& state) {
-  std::lock_guard<std::mutex> lock(Sockets().mutex);
-  if (Sockets().entries.insert_or_assign(fd, state).second) {
+  std::lock_guard<std::mutex> lock(table_mutex);
+  if (table.insert_or_assign(fd, state).second) {
     ++state.description->descriptor_refs;
     socket_count.fetch_add(1, std::memory_order_release);
   }
@@ -79,19 +82,19 @@ void Insert(int fd, const SocketFd& state) {
 // native endpoint remains live until _dup2 has succeeded; a failed CRT call
 // leaves its socket metadata and descriptor references untouched.
 bool ReplaceSocket(int fd, const SocketFd* source, SocketFd* previous, bool* last) {
-  std::lock_guard<std::mutex> lock(Sockets().mutex);
-  auto it = Sockets().entries.find(fd);
-  const bool existed = it != Sockets().entries.end();
+  std::lock_guard<std::mutex> lock(table_mutex);
+  auto it = table.find(fd);
+  const bool existed = it != table.end();
   if (existed) {
     *previous = it->second;
     *last = --previous->description->descriptor_refs == 0;
   }
   if (source) {
     if (existed) it->second = *source;
-    else { Sockets().entries.emplace(fd, *source); socket_count.fetch_add(1, std::memory_order_release); }
+    else { table.emplace(fd, *source); socket_count.fetch_add(1, std::memory_order_release); }
     ++source->description->descriptor_refs;
   } else if (existed) {
-    Sockets().entries.erase(it); socket_count.fetch_sub(1, std::memory_order_release);
+    table.erase(it); socket_count.fetch_sub(1, std::memory_order_release);
   }
   return existed;
 }
@@ -167,9 +170,9 @@ int RegisterSocket(const SocketFd& state) {
 
 bool LookupSocket(int fd, SocketFd* state) {
   if (socket_count.load(std::memory_order_acquire) == 0) return false;
-  std::lock_guard<std::mutex> lock(Sockets().mutex);
-  auto it = Sockets().entries.find(fd);
-  if (it == Sockets().entries.end()) return false;
+  std::lock_guard<std::mutex> lock(table_mutex);
+  auto it = table.find(fd);
+  if (it == table.end()) return false;
   *state = it->second;
   return true;
 }
@@ -199,6 +202,16 @@ namespace {
 void ReleaseCanceledSnapshot(void* raw) {
   static_cast<gesher::DescriptorSnapshotPtr*>(raw)->reset();
 }
+int NativeDescriptorIo(gesher::DescriptorSnapshotPtr snapshot, void* buffer,
+                       unsigned int count, bool writing) {
+  if (!snapshot) return -1;
+  int result;
+  pthread_cleanup_push(ReleaseCanceledSnapshot, &snapshot);
+  result = writing ? gesher::WriteFileDescription(snapshot, buffer, count)
+                   : gesher::ReadFileDescription(snapshot, buffer, count);
+  pthread_cleanup_pop(0);
+  return result;
+}
 bool NativePipeIo(int fd, void* buffer, unsigned int count, bool writing, int* result) {
   gesher::DescriptorSnapshotPtr snapshot;
   {
@@ -208,13 +221,9 @@ bool NativePipeIo(int fd, void* buffer, unsigned int count, bool writing, int* r
     if (GetFileType(file) != FILE_TYPE_PIPE) return false;
     snapshot = gesher::CaptureDescriptor(fd);
   }
-  if (!snapshot) { *result = -1; return true; }
   // Validate status and transfer through one capture. Looking the fd up again
   // could select a replacement, and would duplicate every pipe query/pin.
-  pthread_cleanup_push(ReleaseCanceledSnapshot, &snapshot);
-  *result = writing ? gesher::WriteFileDescription(snapshot, buffer, count)
-                    : gesher::ReadFileDescription(snapshot, buffer, count);
-  pthread_cleanup_pop(0);
+  *result = NativeDescriptorIo(std::move(snapshot), buffer, count, writing);
   return true;
 }
 // The caller owns an exact native object reference for the whole operation.
@@ -267,12 +276,18 @@ bool NativeFileIo(int fd, void* buffer, unsigned int count, bool writing, int* r
     snapshot = gesher::CaptureDescriptor(fd);
   }
   if (!snapshot) { *result = -1; return true; }
+  gesher::FileOperationLease operation(snapshot);
+  if (operation.Error()) { *result = (errno = operation.Error(), -1); return true; }
   const int flags = gesher::FileDescriptionFlags(snapshot);
   if (flags < 0) { *result = -1; return true; }
   if ((flags & O_PATH) != 0 ||
       (flags & O_ACCMODE) == (writing ? O_RDONLY : O_WRONLY)) {
     *result = (errno = EBADF, -1);
     return true;
+  }
+  if (writing && gesher::FileDescriptionIsMemfd(snapshot)) {
+    const int error = gesher::MemfdWriteHandleError(snapshot->handle, true, 0, count, (flags & O_APPEND) != 0);
+    if (error) { *result = (errno = error, -1); return true; }
   }
   // A zero-length append must not move the shared cursor to EOF.
   if (writing && count == 0) { *result = 0; return true; }
@@ -289,6 +304,7 @@ int CloseFdBody(int fd, bool unpublished, SocketFd* deferred = nullptr) {
     gesher::ForgetDevice(fd);
     gesher::ForgetEventObject(fd);
     gesher::ForgetBinder(fd);
+    gesher::ForgetMemfd(fd);
     // A pipe's last writer closing makes its reader readable (end of file).
     const bool pipe = gesher::HasPollWaiters() &&
                       GetFileType(gesher::HandleFromFd(fd)) == FILE_TYPE_PIPE;
@@ -373,6 +389,7 @@ void RetiredDescriptor::Retire(int fd) {
     ForgetBinder(fd);
   }
   ForgetOfd(fd);
+  ForgetMemfd(fd);
   if (HasPollWaiters()) WakePollers();
 }
 int RetiredDescriptor::Finish() {
@@ -388,6 +405,8 @@ RetiredDescriptor::~RetiredDescriptor() {
   errno = saved;
 }
 int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsigned count) {
+  FileOperationLease operation(snapshot);
+  if (operation.Error()) return errno = operation.Error(), -1;
   const int flags = FileDescriptionIoFlags(snapshot);
   if (flags < 0) return -1;
   if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_WRONLY) return errno = EBADF, -1;
@@ -402,6 +421,8 @@ int ReadFileDescription(const DescriptorSnapshotPtr& snapshot, void* bytes, unsi
   return TransferFileHandle(snapshot->handle, bytes, count, false, false);
 }
 int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* bytes, unsigned count) {
+  FileOperationLease operation(snapshot);
+  if (operation.Error()) return errno = operation.Error(), -1;
   const int flags = FileDescriptionIoFlags(snapshot);
   if (flags < 0) return -1;
   if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_RDONLY) return errno = EBADF, -1;
@@ -409,6 +430,9 @@ int WriteFileDescription(const DescriptorSnapshotPtr& snapshot, const void* byte
   count = std::min(count, 0x7ffff000u);
   if (snapshot->kind == DescriptorKind::kZero) return static_cast<int>(count);
   const bool append = (flags & O_APPEND) != 0 && GetFileType(snapshot->handle) == FILE_TYPE_DISK;
+  if (FileDescriptionIsMemfd(snapshot)) {
+    if (int error = MemfdWriteHandleError(snapshot->handle, true, 0, count, append)) return errno = error, -1;
+  }
   int result = GetFileType(snapshot->handle) == FILE_TYPE_PIPE
       ? TransferPipe(snapshot, const_cast<void*>(bytes), count, true)
       : TransferFileHandle(snapshot->handle, const_cast<void*>(bytes), count, true, append);
@@ -443,7 +467,10 @@ int read(int fd, void* buf, unsigned int count) {
     Device device;
     if (gesher::LookupDevice(fd, &device)) return gesher::ReadDevice(device, buf, count);
     if (gesher::ReadEventObject(fd, buf, count, &result)) return result;
-    return gesher::CrtResult(_read(fd, buf, count));
+    // A close/dup2 between the earlier kind probes may have replaced the fd
+    // with a file or pipe. Dispatch the final capture through its own policy;
+    // never fall through to a raw CRT operation on an unchecked replacement.
+    return NativeDescriptorIo(gesher::CaptureDescriptor(fd), buf, count, false);
   }
   gesher::ws::Buffer buffer = {buf, count};
   return static_cast<int>(gesher::ws::RecvOwned(state.socket, &buffer, 1, 0, nullptr, state.description));
@@ -460,13 +487,7 @@ int write(int fd, const void* buf, unsigned int count) {
     if (flags < 0) return -1;
     if ((flags & O_PATH) != 0 || (flags & O_ACCMODE) == O_RDONLY) return errno = EBADF, -1;
     if (gesher::WriteEventObject(fd, buf, count, &result)) return result;
-    result = gesher::CrtResult(_write(fd, buf, count));
-    if (result > 0) gesher::InotifyNoteWrite(fd);
-    if (result > 0 && gesher::HasPollWaiters() &&
-        GetFileType(gesher::HandleFromFd(fd)) == FILE_TYPE_PIPE) {
-      gesher::WakePollers();
-    }
-    return result;
+    return NativeDescriptorIo(gesher::CaptureDescriptor(fd), const_cast<void*>(buf), count, true);
   }
   gesher::ws::Buffer buffer = {const_cast<void*>(buf), count};
   return static_cast<int>(gesher::ws::SendOwned(state.socket, &buffer, 1, 0, nullptr, state.description));
@@ -494,6 +515,7 @@ int dup(int fd) {
         return errno = error, -1;
       }
     }
+    if (fd2 >= 0) gesher::CopyMemfdRegistration(fd, fd2);
     return fd2;
   }
   // WSADuplicateSocket creates distinct native connect-error ownership.
@@ -537,6 +559,7 @@ static int DupTo(int fd, int fd2, bool cloexec) {
     gesher::ForgetEpollEntries(fd2);
     gesher::ForgetBinder(fd2);
     gesher::ForgetOfd(fd2);
+    gesher::CopyMemfdRegistration(fd, fd2);
     Device device;
     if (!source_is_socket && gesher::LookupDevice(fd, &device)) {
       gesher::RegisterDevice(fd2, device);

@@ -66,7 +66,9 @@ OwnedState* Find(FILE* stream, bool create) {
 BionicState* BionicMetadata(FILE* stream, bool create) {
   auto* state = Find(stream, create); return state ? &state->bionic : nullptr;
 }
-int Orient(FILE* stream, int mode) {
+static bool fail_orientation;
+int Orient(FILE* stream, int mode, bool = false) {
+  if (fail_orientation) return errno = ENOMEM, 0;
   auto* state = Find(stream, mode != 0);
   if (!state) return 0;
   if (!state->orientation) state->orientation = mode > 0 ? 1 : mode < 0 ? -1 : 0;
@@ -249,6 +251,30 @@ static void allocation_contracts() {
         existing_worked && allocation_attempts == 0 && errno == EDOM && lock_depth == 0);
   check("recovered stream closes normally", shim::CloseBionicStream(f) == 0 && !recorded(f));
 }
+static void shared_orientation_contracts() {
+  FILE* f = std::tmpfile();
+  if (!f) std::abort();
+  auto* state = shim::State(f);
+  if (!state) std::abort();
+  uint32_t wide[3] = {0xfeed, 0xbeef, 0};
+  gesher::stdio::fail_orientation = true;
+  auto rejected = [&](const char* name, auto operation) {
+    errno = 0; io_calls = 0;
+    bool result = operation();
+    check(name, result && errno == ENOMEM && io_calls == 0 &&
+        state->pushback == shim::kWeof && gesher::stdio::Find(f, false)->orientation == 0 && lock_depth == 0);
+  };
+  rejected("fgetwc stops before I/O if shared orientation fails", [&] { return shim::Fgetwc(f) == shim::kWeof; });
+  rejected("fgetws preserves output if shared orientation fails", [&] {
+    return shim::Fgetws(wide, 3, f) == nullptr && wide[0] == 0xfeed;
+  });
+  rejected("ungetwc preserves pushback if shared orientation fails", [&] { return shim::Ungetwc('B', f) == shim::kWeof; });
+  rejected("fputwc stops before I/O if shared orientation fails", [&] { return shim::Fputwc('B', f) == shim::kWeof; });
+  rejected("fputws stops before I/O if shared orientation fails", [&] { return shim::Fputws(wide, f) == -1; });
+  gesher::stdio::fail_orientation = false;
+  check("shared orientation failure permits a later successful retry", shim::Fgetwc(f) == 'A' && gesher::stdio::Orient(f, 0) == 1);
+  check("shared orientation failure preserves stream ownership", shim::CloseBionicStream(f) == 0 && !recorded(f));
+}
 int main(){
   FILE* f=prepared();int fd=fileno(f);int calls=crt_calls;admission_error=EBUSY;
   check("pre-close failure is returned",shim::CloseBionicStream(f)==EOF && errno==EBUSY);
@@ -310,5 +336,6 @@ int main(){
   size_t remaining=gesher::stdio::states.size();
   check("no retired state accumulates",remaining==0);
   allocation_contracts();
+  shared_orientation_contracts();
   std::printf("stdio lifetime: %d checks, %d failures\n",checks,failures);return failures?1:0;
 }

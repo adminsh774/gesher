@@ -39,7 +39,10 @@ def between(text, begin, end):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--source-ref')
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--source-ref')
+    source.add_argument('--fd-source', type=Path,
+                        help='use an exact descriptor source for focused negative controls')
     parser.add_argument('--sanitize', action='store_true')
     parser.add_argument('--cxx', default=os.environ.get('CXX', 'c++'))
     parser.add_argument('--case', choices=['epoll', 'vector', 'select', 'scratch'])
@@ -54,7 +57,7 @@ def main():
 
     epoll = read('compat/posix/src/epoll.cc')
     system = read('compat/posix/src/system.cc')
-    fd = read('compat/posix/src/fd.cc')
+    fd = args.fd_source.read_text() if args.fd_source else read('compat/posix/src/fd.cc')
     select = read('compat/posix/src/select.cc')
     has_pipe_snapshot = 'gesher::PollPipeHandle(' in fd
     pipe = read('compat/posix/src/pipe_io.cc') if has_pipe_snapshot else ''

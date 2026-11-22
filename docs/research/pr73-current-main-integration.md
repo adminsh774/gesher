@@ -1,5 +1,148 @@
 # PR 73: current-main integration and runtime repair
 
+## Current composition, 2026-11-22
+
+This round starts from published PR73 head
+`de1e43c391275137c7b7b25dc170892684d55b5e` and merges verified main
+`751d82310f7c4c470c098ccebfd5d2d04699a0cd`. Their merge base is
+`7a45c2468c270bfe68ee5f854aa9d4feaf2208b3`. All 57 conflicting paths were
+examined against those inputs. Earlier dated sections below describe previous
+checkpoints; their source qualification and validation claims are historical.
+This section describes the new composition, which requires its own independent
+scope, production-source and qualification review before publication.
+
+Main already contains much of the older PR through subsequent integrations.
+The resulting production delta against main is exactly four files:
+
+| File | Behavior retained from PR73 and composed with main |
+| --- | --- |
+| `compat/posix/src/stdio_output.cc` | Store Bionic conversion error, decoder and wide pushback in the shared stream owner; retire/reset them with the real host lifecycle. Preserve main's outer CRT lock, cancellation cleanup, unlocked orientation API and wide formatter dispatch. |
+| `compat/bionic/stdio_bionic.cc` | Use that owner for guest locks and metadata, close/reopen, seek and errors. Already-guarded and explicitly unlocked operations call orientation with its unlocked flag; public `fwide` retains ordinary locking. |
+| `compat/posix/include/gesher/stdio.h` | Declare the Bionic metadata and its required caller synchronization while retaining main's orientation signature. |
+| `compat/posix/include/stdio.h` | Document shared-owner retirement and the existing close/reopen retirement result; the declarations remain unchanged. |
+
+Every other `app/` and `compat/` file equals main. In particular this preserves
+the OFD v3 transfer/revocation format, memfd seals and descriptor adoption,
+environment ownership, signal behavior, ARM support, and current permission and
+service implementations. Main's two relevant OFD corrections remain intact:
+wide formatting uses the descriptor-backed FILE callback path, and a native
+child with no inherited standard handles uses the detached-process creation
+behavior. Their strengthened Windows assertions remain unchanged. Overlapping
+history had introduced duplicate signal exports and duplicate executable target
+definitions; the composition keeps main's single definitions.
+
+### Reproduced unlocked-call defect and its limits
+
+The old PR's Bionic `FreadUnlocked` and `FwriteUnlocked` call an orientation helper
+that takes the shared stream lock. In the native libc fixture, another thread
+can own `flockfile` while an unlocked operation is expected to proceed. A bounded
+regression now compiles the exact production owner, orientation and Bionic
+unlocked function bodies. The lock holder remains idle while the other thread
+performs real file I/O; the fixture always releases the lock and joins the worker
+after the bounded observation, including when testing the defective source.
+
+The unchanged fixture against exact head `de1e43c...` reports two failures out of
+twelve assertions: both unlocked operations fail to complete before unlock.
+Actual byte effects and normal close still succeed afterward. The composed
+source passes those twelve assertions as part of the 167-check production
+adapter corpus. This establishes the source-level lock defect. It does **not**
+establish that this defect caused the entire historical Windows timeout: the
+last failed native jobs reached the libc ELF invocation, but no target stack or
+fresh composed Windows execution is available locally.
+
+The event-loop fixture additionally preserves main's capture/query error
+assertions while executing PR73's exact `DescriptorGuard`, `PipeAdmission` and
+`PollPipeHandle` bodies over the declared Linux pipe boundary. Descriptor reuse
+occurs after the real descriptor transaction releases; failed capture cannot
+query a pipe, and failed native queries retire their snapshot. Main's real
+revocation, seals, allocation-failure and OFD-transfer cases are retained.
+
+### Exact source qualification
+
+The original `qualified/ofd-stream-source.json`, its transition patch and the
+`OFD_QUALIFICATION_SHA256` constant are byte-for-byte main. All 71 original
+source digests, supplier roles, provenance rules, deadlines and native ownership
+comparisons remain. A separate
+`tools/net-tcp-priority/qualified/shared-stdio-source.json` and `.patch` bind only
+the four production files above to exact main and PR input identities.
+
+The check validates the manifest schema and its independent digest, exact path
+list, patch digest and headers, main policy digest, current endpoints and original
+receipt digests. It reverses the minimal patch in an isolated directory and
+compares every result to literal `git show 751d823...:path` bytes, then applies
+the patch forward and compares every result to the current file. Only those
+verified predecessor bytes enter the original 71-digest check. An unrelated
+source change remains an error. No execution-approval field is added or changed.
+
+The original main policy was run in a separate checkout and passed all 15
+original negative controls. The composed policy passes the same controls plus
+23 new controls. These reject unqualified admitted-source/header changes,
+repinned endpoints with undeclared includes, expanded paths, modified patch
+before-hunks, changed baseline identities, invented approval fields, changed
+original receipts and unrelated protected-source edits. Run the complete set
+with `python3 tools/net-tcp-priority/test-selected-policy.py --selftest`.
+This is source preservation evidence, not a substitute for behavioral review.
+
+### Windows witness composition and available validation
+
+The native3 worker retains main's native CRT layout/owner observations, exact
+`_lock_file` argument instruction and import checks, owned-thread birth checks,
+WCT rejection controls, actual completion/join checks and original five-second
+absolute deadline. PR73's public `ftrylockfile` observations and exact public
+`fclose` call witness are required **in addition** on both accepted wait routes.
+Four cycles alternate public and native ownership. A released/reacquired sibling
+gets a fresh native-owner observation. The wrong-live-owner negative binds the
+still-live blocked closer; an exited probe is not described as a live owner.
+The descriptor must be actually retired after close. Unsupported call shapes
+fail the witness rather than falling back to an inferred argument.
+
+Synthetic parser controls accept two complete transcripts and reject 70
+corruptions across the two routes. They do not constitute Windows evidence.
+The genuine-CI restriction in the command oracle, actual evidence validator and
+artifact adversarial runner remains enforced. No CI identity is supplied to run
+an actual worker or to qualify actual execution. Parser controls use only their
+explicitly synthetic test context and transcripts.
+The producer inventories all tracked sources, including both public witness
+files, and the consumer's source/run/attempt/compiler/member checks remain.
+Historical source-envelope modes and approval receipts are unchanged.
+
+Eleven relevant host suites pass with ASan/UBSan: stdio buffering/adapter/Linux
+reference, Bionic stream lifetime, event-loop contracts, OFD/exec transfer,
+scalar and positioned file I/O, pipe I/O, revocable files, freopen modes,
+stream-device retirement and memfd contracts. They include main's cancellation
+and CRT-lock composition assertions and PR73's shared metadata and actual
+socket-registry shutdown negative. LeakSanitizer is disabled only for the traced
+local executor; the checked-in sanitizer commands remain unchanged. Linux
+native3 workers compile with warnings as errors, the instruction-pattern corpus
+passes 45 checks, and the command cleanup suite passes seven tests.
+
+The build uses an isolated Android 16 r4 tree refreshed by this checkout's
+unchanged fetch script: all 123 project heads match their pinned tags and every
+sparse/ordered-patch stamp matches these sources. PR107-only patches and sparse
+inputs are absent. The llvm-mingw 20261006 publisher archive and WebView2 SDK
+digests are verified. The x64 build and link pass for `stdio_ofd_test`,
+`ofd_spawn_test`, `pipe_native_process_test`, all three native3 workers and
+`elf_load_test`, including the real `gesher-exec` and native-child dependencies.
+The standalone font input proof passes through the existing
+`GESHER_VERIFY_STANDALONE_LOCAL=ON` mode, retaining its actual map and archive
+member checks and recording a local execution context with no workflow source.
+Both changed stdio translation units also compile with the ARM64 Windows
+toolchain and the project's warnings-as-errors settings.
+
+Inspection of the linked x64 worker confirms the supported generated public
+R12-to-RCX `fclose` call and native RDX-to-RDI-to-RCX `_lock_file` import-call
+patterns. The three native3 PE import sets pass the existing system-import
+policy, and the production POSIX archive contains no wait-test hooks while the
+private blocking fixture does. These are compilation, link and binary-inspection
+results, not Windows runtime observations or qualification of the separate CI
+publisher-cancel toolchain overlay.
+
+Actual Windows 2022/2025 native libc, stdio/OFD, native3, services and Puzzles
+process-exit checks remain required on the reviewed new head. Old AppOps,
+document-dialog and process-exit failures are not assigned speculative causes
+or patched independently here. A new target failure must be assessed against
+this exact composition and its actual evidence.
+
 ## Event-loop fixture continuation, 2026-11-20
 
 This continuation preserves published PR73 head

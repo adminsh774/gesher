@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include "file_call_pattern.h"
 namespace native3_stack_probe {
 // The export of `module` at or before `rva` (nullptr when none).
 const char* NearestExport(HMODULE module, DWORD rva, DWORD* offset) {
@@ -104,13 +105,13 @@ __attribute__((noinline)) int Close(FILE* stream) {
   return result;
 }
 
-inline bool CallShape(const unsigned char (&code)[9], bool* indirect) {
+inline bool PublicCallShape(const unsigned char (&code)[9], bool* indirect) {
   *indirect = code[0] == 0x4c && code[1] == 0x89 && code[2] == 0xe1 &&
       code[3] == 0xff && code[4] == 0x15;
   return *indirect || (code[1] == 0x4c && code[2] == 0x89 && code[3] == 0xe1 && code[4] == 0xe8);
 }
 
-inline bool ExactFileCall(DWORD64 pc, DWORD64 r12, FILE* stream) {
+inline bool ExactPublicFileCall(DWORD64 pc, DWORD64 r12, FILE* stream) {
   if (pc < 9 || r12 != reinterpret_cast<uintptr_t>(stream)) return false;
   HMODULE worker = GetModuleHandleW(nullptr);
   MEMORY_BASIC_INFORMATION instruction{}, import_region{};
@@ -125,7 +126,7 @@ inline bool ExactFileCall(DWORD64 pc, DWORD64 r12, FILE* stream) {
   SIZE_T copied = 0;
   bool indirect = false;
   if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(pc - 9), code, sizeof(code), &copied) ||
-      copied != sizeof(code) || !CallShape(code, &indirect)) return false;
+      copied != sizeof(code) || !PublicCallShape(code, &indirect)) return false;
   int32_t displacement = 0;
   std::memcpy(&displacement, code + 5, sizeof(displacement));
   uintptr_t slot = 0;
@@ -146,16 +147,52 @@ inline bool ExactFileCall(DWORD64 pc, DWORD64 r12, FILE* stream) {
       copied == sizeof(target) && target == reinterpret_cast<uintptr_t>(&std::fclose);
 }
 
-inline bool RejectsUnsupportedCall(DWORD64 pc) {
+inline bool RejectsUnsupportedPublicCall(DWORD64 pc) {
   if (pc < 9) return false;
   unsigned char code[9]{};
   SIZE_T copied = 0;
   bool indirect = false;
   if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(pc - 9), code, sizeof(code), &copied) ||
-      copied != sizeof(code) || !CallShape(code, &indirect)) return false;
+      copied != sizeof(code) || !PublicCallShape(code, &indirect)) return false;
   // Change an owned copy of the observed argument-move opcode only.
   code[indirect ? 0 : 1] ^= 1;
-  return !CallShape(code, &indirect);
+  return !PublicCallShape(code, &indirect);
+}
+
+// Match the exact observed argument-copy instructions, then independently
+// require their indirect call to resolve to the worker's _lock_file import.
+// This is never a nearest-export or generic register-value inference.
+inline FileArgumentRegister ExactFileCall(DWORD64 pc, DWORD64 rsi, DWORD64 rdi, FILE* stream) {
+  if (pc < 15) return FileArgumentRegister::None;
+  HMODULE worker = GetModuleHandleW(nullptr);
+  MEMORY_BASIC_INFORMATION instruction{}, import_region{};
+  if (!VirtualQuery(reinterpret_cast<const void*>(pc - 15), &instruction, sizeof(instruction)) ||
+      instruction.Type != MEM_IMAGE || instruction.AllocationBase != worker) return FileArgumentRegister::None;
+  unsigned char code[15]{};
+  SIZE_T copied = 0;
+  if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(pc - 15), code, sizeof(code), &copied) ||
+      copied != sizeof(code)) return FileArgumentRegister::None;
+  FileArgumentRegister argument = FileCallPattern(code, sizeof(code), rsi, rdi,
+                                                  reinterpret_cast<uintptr_t>(stream));
+  if (argument == FileArgumentRegister::None) return argument;
+  int32_t displacement = 0;
+  std::memcpy(&displacement, code + sizeof(code) - sizeof(displacement), sizeof(displacement));
+  uintptr_t slot = 0;
+  if (displacement < 0) {
+    uint64_t subtract = static_cast<uint64_t>(-static_cast<int64_t>(displacement));
+    if (pc < subtract) return FileArgumentRegister::None;
+    slot = pc - subtract;
+  } else {
+    if (pc > UINTPTR_MAX - static_cast<unsigned>(displacement)) return FileArgumentRegister::None;
+    slot = pc + static_cast<unsigned>(displacement);
+  }
+  if (!VirtualQuery(reinterpret_cast<const void*>(slot), &import_region, sizeof(import_region)) ||
+      import_region.Type != MEM_IMAGE || import_region.AllocationBase != worker) return FileArgumentRegister::None;
+  uintptr_t target = 0;
+  copied = 0;
+  return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(slot), &target, sizeof(target), &copied) &&
+      copied == sizeof(target) && target == reinterpret_cast<uintptr_t>(&_lock_file) ?
+      argument : FileArgumentRegister::None;
 }
 
 // Reuse the established Rtl unwind pattern on this exact owned thread. Only
@@ -184,6 +221,8 @@ inline bool Capture(DWORD tid, uint64_t expected_birth, FILE* stream, int fd, FI
   }
   DWORD64 pcs[32]{};
   DWORD64 r12s[32]{};
+  DWORD64 rsis[32]{};
+  DWORD64 rdis[32]{};
   unsigned count = 0;
   CONTEXT context{};
   context.ContextFlags = CONTEXT_FULL;
@@ -191,7 +230,9 @@ inline bool Capture(DWORD tid, uint64_t expected_birth, FILE* stream, int fd, FI
   DWORD error = captured ? ERROR_SUCCESS : GetLastError();
   while (captured && count < 32 && context.Rip != 0) {
     pcs[count] = context.Rip;
-    r12s[count++] = context.R12;
+    r12s[count] = context.R12;
+    rsis[count] = context.Rsi;
+    rdis[count++] = context.Rdi;
     DWORD64 image_base = 0;
     PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
     if (function) {
@@ -225,7 +266,8 @@ inline bool Capture(DWORD tid, uint64_t expected_birth, FILE* stream, int fd, FI
   HMODULE modules[32]{};
   unsigned module_count = 0;
   unsigned exact_file_calls = 0;
-  unsigned other_file_calls = 0, enter_frames = 0, rejected_code_copies = 0;
+  unsigned other_file_calls = 0, enter_frames = 0;
+  unsigned public_file_calls = 0, other_public_file_calls = 0, rejected_public_calls = 0;
   FARPROC enter = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "EnterCriticalSection");
   DWORD64 enter_image = 0;
   PRUNTIME_FUNCTION enter_function = enter ? RtlLookupFunctionEntry(reinterpret_cast<uintptr_t>(enter), &enter_image, nullptr) : nullptr;
@@ -239,15 +281,25 @@ inline bool Capture(DWORD tid, uint64_t expected_birth, FILE* stream, int fd, FI
   for (unsigned index = 0; index < count; ++index) {
     std::fprintf(stderr, "ACTUAL_CLOSER_FRAME index=%u pc=0x%llx nearest-export=%s\n", index,
         static_cast<unsigned long long>(pcs[index]), Describe(pcs[index]).c_str());
-    if (ExactFileCall(pcs[index], r12s[index], stream)) {
-      ++exact_file_calls;
-      bool rejected = RejectsUnsupportedCall(pcs[index]);
-      rejected_code_copies += rejected;
-      std::fprintf(stderr, "ACTUAL_CLOSER_FILE_CALL index=%u pc=0x%llx unwound-r12=0x%llx FILE=%p exact-r12-rcx-copy-and-public-fclose=true unsupported-code-copy=%s\n",
+    if (ExactPublicFileCall(pcs[index], r12s[index], stream)) {
+      ++public_file_calls;
+      const bool rejected = RejectsUnsupportedPublicCall(pcs[index]);
+      rejected_public_calls += rejected;
+      std::fprintf(stderr, "ACTUAL_CLOSER_PUBLIC_FILE_CALL index=%u pc=0x%llx unwound-r12=0x%llx FILE=%p exact-r12-rcx-copy-and-public-fclose=true unsupported-code-copy=%s\n",
           index, static_cast<unsigned long long>(pcs[index]), static_cast<unsigned long long>(r12s[index]),
           static_cast<void*>(stream), rejected ? "reject" : "accept");
     }
-    if (other_live_stream && ExactFileCall(pcs[index], r12s[index], other_live_stream)) ++other_file_calls;
+    if (other_live_stream && ExactPublicFileCall(pcs[index], r12s[index], other_live_stream)) ++other_public_file_calls;
+    FileArgumentRegister argument = ExactFileCall(pcs[index], rsis[index], rdis[index], stream);
+    if (argument != FileArgumentRegister::None) {
+      ++exact_file_calls;
+      std::fprintf(stderr, "ACTUAL_CLOSER_FILE_CALL index=%u pc=0x%llx argument-register=%s unwound-rsi=0x%llx unwound-rdi=0x%llx FILE=%p exact-file-argument-and-lock-file-iat=true\n",
+          index, static_cast<unsigned long long>(pcs[index]), argument == FileArgumentRegister::Rsi ? "rsi" : "rdi",
+          static_cast<unsigned long long>(rsis[index]), static_cast<unsigned long long>(rdis[index]),
+          static_cast<void*>(stream));
+    }
+    if (other_live_stream && ExactFileCall(pcs[index], rsis[index], rdis[index], other_live_stream) !=
+        FileArgumentRegister::None) ++other_file_calls;
     if (enter_bounds && pcs[index] >= enter_begin && pcs[index] < enter_end) {
       ++enter_frames;
       std::fprintf(stderr, "ACTUAL_CLOSER_ENTER_FRAME index=%u pc=0x%llx named-entry=%p unwind-begin=0x%llx unwind-end=0x%llx\n",
@@ -271,7 +323,10 @@ inline bool Capture(DWORD tid, uint64_t expected_birth, FILE* stream, int fd, FI
   }
   std::fprintf(stderr, "ACTUAL_CLOSER_FILE_CALL_SUMMARY matches=%u required=1 enter-frames=%u other-FILE=%p other-matches=%u\n",
       exact_file_calls, enter_frames, static_cast<void*>(other_live_stream), other_file_calls);
-  return captured && count > 0 && closed && previous == 0 && resumed == 1 && exact_file_calls == 1 && rejected_code_copies == 1 &&
+  std::fprintf(stderr, "ACTUAL_CLOSER_PUBLIC_FILE_CALL_SUMMARY matches=%u required=1 other-FILE=%p other-matches=%u\n",
+      public_file_calls, static_cast<void*>(other_live_stream), other_public_file_calls);
+  return captured && count > 0 && closed && previous == 0 && resumed == 1 &&
+      public_file_calls == 1 && rejected_public_calls == 1 && other_public_file_calls == 0 && exact_file_calls == 1 &&
       enter_frames == 1 && other_live_stream && other_live_stream != stream && other_file_calls == 0;
 }
 

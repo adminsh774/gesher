@@ -52,9 +52,10 @@ function DevsvcWait([int] $Mark, [string[]] $Texts, [int] $Seconds) {
   return $false
 }
 
-function DevsvcLaunch([string] $Activity) {
+function DevsvcLaunch([string] $Activity, [switch] $Window) {
+  $mode = if ($Window) { '--window' } else { '--headless' }
   return StartTimed "$Dir/dalvikvm.exe" ($launcher + 'launch', (NoDrive $devsvcApk), '--activity', ".$Activity",
-    '--keep-task', '--headless')
+    '--keep-task', $mode)
 }
 
 function DevsvcCheck([string] $Name, [string[]] $Problems, [string] $Details) {
@@ -130,11 +131,11 @@ function ToastTags {
 }
 
 function DevsvcToastTag([int] $Id, [string] $Tag = 'null') {
-  # The toast bridge hashes the Android id/tag tuple as big-endian UTF-16.
+  # The Windows spelling retains the full SHA-256 of the big-endian UTF-16 key.
   $hash = [Security.Cryptography.SHA256]::Create()
   try {
     $key = [Text.Encoding]::BigEndianUnicode.GetBytes("$Id/$Tag")
-    return [BitConverter]::ToString($hash.ComputeHash($key)).Replace('-', '').ToLowerInvariant()
+    return 'sha256-' + [Convert]::ToBase64String($hash.ComputeHash($key)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
   } finally {
     $hash.Dispose()
   }
@@ -236,7 +237,29 @@ DevsvcCheck 'devsvc: jobs: JobScheduler runs a one-off job (latency, deadline, c
 # The app's clip (HTML text) is on Windows' clipboard, as text and as HTML
 # Format; what PowerShell puts there reaches the app's listener.
 $mark = (DevsvcText $devsvcLog).Length
-$t = DevsvcLaunch 'ClipActivity'
+$t = DevsvcLaunch 'ClipActivity' -Window
+. "$PSScriptRoot/../graphics/WindowChecks.ps1"
+if (-not ('ImeInput' -as [type])) { Add-Type -Path "$PSScriptRoot/../ime/ImeInput.cs" }
+$clipWindow = [IntPtr]::Zero
+$clipFocusProblem = ''
+$deadline = (Get-Date).AddSeconds(90)
+do {
+  $clipLog = DevsvcSince $mark
+  $frame = [regex]::Match($clipLog, 'first frame drawn \(\d+ presented\), \w+, hwnd 0x([0-9a-f]+)')
+  $identity = [regex]::Match($clipLog, 'devsvc: clip: window process ([0-9]+) uid ([0-9]+)')
+  if ($frame.Success -and $identity.Success) {
+    $clipWindow = [IntPtr][Convert]::ToInt64($frame.Groups[1].Value, 16)
+    if ([GesherWin32]::ProcessId($clipWindow) -ne [int]$identity.Groups[1].Value -or
+        [int]$identity.Groups[2].Value -lt 10000 -or [int]$identity.Groups[2].Value -gt 19999) {
+      $clipFocusProblem = 'the application identity does not own its actual window'
+    } elseif (-not [ImeInput]::Foreground($clipWindow)) {
+      $clipFocusProblem = 'the ordinary clipboard application did not gain actual foreground'
+    }
+    break
+  }
+  Start-Sleep -Milliseconds 100
+} while ((Get-Date) -lt $deadline)
+if ($clipWindow -eq [IntPtr]::Zero) { $clipFocusProblem = 'the clipboard fixture did not create a real application window' }
 $set = DevsvcWait $mark @('devsvc: clip: set; reads back') 300
 Start-Sleep 1
 $winText = (Get-Clipboard -Raw) -as [string]
@@ -246,6 +269,7 @@ $out = WaitTimed $t 200
 $code = $LASTEXITCODE
 $log = DevsvcSince $mark
 $problems = @()
+if ($clipFocusProblem) { $problems += $clipFocusProblem }
 if (-not $set) { $problems += 'the app did not set its clip' }
 if ($winText -ne 'android text 57') { $problems += "Windows' clipboard has '$winText'" }
 if (-not $winHtml.Contains('<b>android html 57</b>')) { $problems += "Windows' HTML Format has no '<b>android html 57</b>'" }
@@ -308,7 +332,7 @@ if (-not ($tags1.Contains($toast7) -and $tags1.Contains($toast8))) { $problems +
 if ($tags2.Contains($toast7) -or -not $tags2.Contains($toast8)) { $problems += "after cancel(7) the history has: $($tags2.Trim())" }
 if ($tags3.Contains('tag=')) { $problems += "after cancelAll the history has: $($tags3.Trim())" }
 if ($code -ne 0) { $problems += "launch exit $code" }
-DevsvcCheck "devsvc: notifications: posted notifications are toasts of $devsvcAppId in Windows' toast history (ToastNotificationManager.History), removed by cancel and cancelAll" $problems ($out + "`n--- package log`n" + $log + "`n--- system server`n" + ((DevsvcText $serverLog) -split "`n" | Select-String 'notification' | Out-String))
+DevsvcCheck "devsvc: notifications: posted notifications are toasts of $devsvcAppId in Windows' toast history (ToastNotificationManager.History), removed by cancel and cancelAll" $problems ($out + "`n--- package log`n" + $log + "`n--- system server`n" + ((DevsvcText $serverLog) -split "`n" | Select-String 'notification|TOAST_IDENTITY' | Out-String))
 $problems = @()
 foreach ($e in 'devsvc: listener: connected', 'devsvc: listener: posted com.gesher.devsvc 7 "Gesher notification"', 'devsvc: listener: removed com.gesher.devsvc 7') {
   if (-not $log.Contains($e)) { $problems += "no '$e'" }

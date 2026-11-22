@@ -11,6 +11,7 @@
 
 namespace gesher {
 
+struct RevocableFileGroup;
 struct OpenFileDescription {
   struct Shared {
     uint64_t magic;
@@ -21,16 +22,24 @@ struct OpenFileDescription {
     char pipe_gate[33];
     volatile LONG pipe_native;
     volatile LONG pipe_transition;
+    // Immutable after a fresh descriptor is attached, before publication.
+    // Empty for ordinary descriptors; otherwise a shared revocation group ID.
+    char revocation[33];
   };
   std::atomic<DescriptorKind> kind{DescriptorKind::kFile};
   std::atomic<int> local_flags{0};
   // Native handles discovered through the CRT are initialized only after the
   // caller has pinned them and released the descriptor/table transaction.
   std::atomic<bool> initialized{false};
+  // File kind is immutable after publication. Cache the one-time seals
+  // lookup so ordinary snapshot writes do not query an EA on every call.
+  std::atomic<bool> memfd_known{false};
+  std::atomic<bool> memfd{false};
   std::atomic<Shared*> shared{nullptr};
   HANDLE mapping = nullptr;
   HANDLE pipe_mutex = nullptr;
   std::mutex mutex;
+  std::shared_ptr<RevocableFileGroup> revocation;
   ~OpenFileDescription();
   int Flags() const;
   void SetFlags(int flags);

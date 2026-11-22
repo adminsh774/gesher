@@ -160,8 +160,18 @@ static bool PeekNamedPipe(HANDLE h, void*, DWORD, void*, DWORD* available, void*
 // boundary supplies a real recursive transaction, not an empty guard.
 static std::recursive_mutex descriptor_transaction;
 static thread_local unsigned descriptor_depth;
+static thread_local void (*after_descriptor_guard)(void*);
+static thread_local void* descriptor_guard_context;
 static void DescriptorEnter() { descriptor_transaction.lock(); ++descriptor_depth; }
-static void DescriptorLeave() { --descriptor_depth; descriptor_transaction.unlock(); }
+static void DescriptorLeave() {
+  --descriptor_depth;
+  descriptor_transaction.unlock();
+  if (descriptor_depth == 0 && after_descriptor_guard) {
+    auto observer = after_descriptor_guard;
+    after_descriptor_guard = nullptr;
+    observer(descriptor_guard_context);
+  }
+}
 static void* GetModuleHandleW(const wchar_t*) { return &descriptor_transaction; }
 static void* GetProcAddress(void* module, const char* name) {
   if (module != &descriptor_transaction) return nullptr;
@@ -204,10 +214,9 @@ namespace record_locks {
 @DESCRIPTOR_GUARD_BODY@
 }
 static int live_pipe_snapshots, last_pipe_duplicate = -1;
+static unsigned captured_pipe_snapshots, pipe_queries;
 static thread_local int capture_error, query_error;
 static thread_local bool capture_had_guard = true, query_outside_guard = true;
-static thread_local void (*after_pipe_capture)(void*);
-static thread_local void* pipe_capture_context;
 struct OpenFileDescription {
   int fd;
   std::recursive_mutex mutex;
@@ -236,17 +245,15 @@ static DescriptorSnapshotPtr CaptureDescriptor(int fd) {
   if (duplicate < 0) return {};
   snapshot->handle = reinterpret_cast<HANDLE>(intptr_t{duplicate} + 1);
   ++live_pipe_snapshots; last_pipe_duplicate = duplicate;
+  ++captured_pipe_snapshots;
   snapshot->description = std::make_shared<OpenFileDescription>(duplicate);
-  if (after_pipe_capture) {
-    auto observer = after_pipe_capture; after_pipe_capture = nullptr;
-    observer(pipe_capture_context);
-  }
   return snapshot;
 }
 using ULONG = uint32_t;
 enum FILE_INFORMATION_CLASS { FilePipeLocalInformation };
 struct FILE_PIPE_LOCAL_INFORMATION { ULONG NamedPipeState, ReadDataAvailable, WriteQuotaAvailable; };
 static int QueryPipe(HANDLE handle, void* output, ULONG size, FILE_INFORMATION_CLASS kind) {
+  ++pipe_queries;
   query_outside_guard &= descriptor_depth == 0;
   if (query_error) { errno = query_error; query_error = 0; return -1; }
   if (kind != FilePipeLocalInformation || size != sizeof(FILE_PIPE_LOCAL_INFORMATION)) std::abort();
@@ -446,27 +453,34 @@ void pipe_snapshot_boundary() {
   const char byte = 'p';
   if (::write(original[1], &byte, 1) != 1) std::abort();
   check("production pipe readiness sees real queued byte", run_poll(&read_end, 1) == 1 && read_end.revents == POLLIN);
-  struct ReusePipe { int original, replacement; } reuse{original[0], replacement[0]};
-  gesher::after_pipe_capture = [](void* raw) {
-    const auto& state = *static_cast<ReusePipe*>(raw);
+  struct ReusePipe { int original, replacement; bool replaced = false; } reuse{original[0], replacement[0]};
+  after_descriptor_guard = [](void* raw) {
+    auto& state = *static_cast<ReusePipe*>(raw);
     if (::dup2(state.replacement, state.original) != state.original) std::abort();
+    state.replaced = true;
   };
-  gesher::pipe_capture_context = &reuse;
+  descriptor_guard_context = &reuse;
+  const unsigned captured = gesher::captured_pipe_snapshots;
   check("captured pipe survives actual numeric descriptor replacement",
-      run_poll(&read_end, 1) == 1 && read_end.revents == POLLIN && gesher::after_pipe_capture == nullptr);
+      run_poll(&read_end, 1) == 1 && read_end.revents == POLLIN && after_descriptor_guard == nullptr);
+  check("pipe capture precedes actual descriptor replacement after its guard releases",
+      reuse.replaced && gesher::captured_pipe_snapshots == captured + 1 && descriptor_depth == 0);
   check("next call observes replacement pipe without old readiness", run_poll(&read_end, 1) == 0 && read_end.revents == 0);
   check("snapshot duplicate really closes before return", gesher::live_pipe_snapshots == 0 &&
       ::fcntl(gesher::last_pipe_duplicate, F_GETFD) < 0 && errno == EBADF);
   gesher::capture_error = EMFILE;
-  check("descriptor capture error propagates", run_poll(&read_end, 1) == -1 && errno == EMFILE);
+  const unsigned sampled = gesher::pipe_queries;
+  check("descriptor capture error propagates without sampling or false readiness",
+      run_poll(&read_end, 1) == -1 && errno == EMFILE && read_end.revents == 0 &&
+      gesher::pipe_queries == sampled && gesher::live_pipe_snapshots == 0);
   gesher::query_error = EIO;
   check("native pipe query error propagates and retires snapshot",
-      run_poll(&read_end, 1) == -1 && errno == EIO && gesher::live_pipe_snapshots == 0);
+      run_poll(&read_end, 1) == -1 && errno == EIO && read_end.revents == 0 && gesher::live_pipe_snapshots == 0);
   ::close(replacement[1]);
   check("real final writer close produces pipe HUP", run_poll(&read_end, 1) == 1 && read_end.revents == POLLHUP);
   check("capture owns transaction and native query releases it", gesher::capture_had_guard && gesher::query_outside_guard);
   ::close(original[0]); ::close(original[1]); ::close(replacement[0]);
-  check("pipe boundary retains no descriptor owner", gesher::live_pipe_snapshots == 0);
+  check("pipe boundary retains no descriptor owner", gesher::live_pipe_snapshots == 0 && descriptor_depth == 0);
   check_empty_cache();
 }
 #endif

@@ -78,6 +78,7 @@ HANDLE OpenFileDescription::Share() {
   std::memset(view, 0, sizeof(*view));
   view->magic = ofd_transfer::kMagic;
   view->version = ofd_transfer::kVersion;
+  std::memset(view->revocation, 0, sizeof(view->revocation));
   InterlockedExchange(&view->flags, static_cast<LONG>(local_flags.load()));
   mapping = candidate;
   shared.store(view, std::memory_order_release);
@@ -103,7 +104,13 @@ bool OpenFileDescription::Adopt(HANDLE inherited) {
       name += static_cast<wchar_t>(digit);
     }
     if (!valid) { UnmapViewOfFile(view); errno = EINVAL; return false; }
-    gate = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, name.c_str());
+    // The sender can retire its last local description after transferring
+    // the file and shared state, before this process starts importing them.
+    // The named gate then has no handles and Windows destroys it. Every
+    // active operation pins its description (and therefore its gate), so a
+    // missing gate has no active owner. Open or recreate that same gate,
+    // without resetting the shared flags or an existing mutex's ownership.
+    gate = CreateMutexExW(nullptr, name.c_str(), 0, SYNCHRONIZE | MUTEX_MODIFY_STATE);
     if (!gate) {
       DWORD error = GetLastError();
       UnmapViewOfFile(view);
@@ -437,6 +444,9 @@ int AttachLocal(const DescriptorSnapshotPtr& snapshot, bool close_on_exec) {
   if (!snapshot || !snapshot->description || !snapshot->handle || snapshot->handle == INVALID_HANDLE_VALUE)
     return errno = EBADF, -1;
   if (snapshot->kind == DescriptorKind::kUnshareable) return errno = EOPNOTSUPP, -1;
+  // Probe the pinned file before taking the descriptor-table locks. A file
+  // attribute query must not hold up unrelated descriptor operations.
+  const bool memfd = FileDescriptionIsMemfd(snapshot);
   record_locks::DescriptorGuard guard;
   if (InitializeLocal() < 0) return -1;
   HANDLE duplicate = nullptr;
@@ -461,6 +471,7 @@ int AttachLocal(const DescriptorSnapshotPtr& snapshot, bool close_on_exec) {
   }
   std::lock_guard<std::mutex> lock(table->mutex);
   table->entries[fd] = snapshot->description;
+  if (memfd) RegisterMemfd(fd);
   return fd;
 }
 
@@ -707,6 +718,7 @@ int ValidateNativeFileDescription(const DescriptorSnapshotPtr& snapshot) {
   int flags = FileDescriptionIoFlags(snapshot);
   if (flags < 0) return -1;
   if (snapshot->kind != DescriptorKind::kFile) return errno = EOPNOTSUPP, -1;
+  if (FileDescriptionIsRevocable(snapshot)) return errno = EOPNOTSUPP, -1;
   int native = NativeFlags(snapshot->handle);
   if (native < 0) return -1;
   if (GetFileType(snapshot->handle) == FILE_TYPE_PIPE) {
@@ -753,6 +765,45 @@ int NativeFileDescriptionExport::Prepare(const DescriptorSnapshotPtr& snapshot) 
   description_ = snapshot->description;
   description_->ExposePipe(true);
   return 0;
+}
+bool FileDescriptionIsMemfd(const DescriptorSnapshotPtr& snapshot) {
+  if (!snapshot || !snapshot->description || snapshot->kind != DescriptorKind::kFile) return false;
+  auto& description = *snapshot->description;
+  if (!description.memfd_known.load(std::memory_order_acquire)) {
+    description.memfd.store(GetFileType(snapshot->handle) == FILE_TYPE_DISK &&
+                            FileHasMemfdSeals(snapshot->handle), std::memory_order_relaxed);
+    description.memfd_known.store(true, std::memory_order_release);
+  }
+  return description.memfd.load(std::memory_order_acquire);
+}
+
+bool FileDescriptionIsRevocable(const DescriptorSnapshotPtr& snapshot) {
+  if (!snapshot || !snapshot->description) return false;
+  auto* view = snapshot->description->shared.load(std::memory_order_acquire);
+  return view && view->revocation[0] != '\0';
+}
+int AdoptFileDescription(HANDLE file, HANDLE shared, DescriptorKind kind, bool close_on_exec) try {
+  struct Owned {
+    HANDLE file, shared;
+    ~Owned() {
+      if (file && file != INVALID_HANDLE_VALUE) CloseHandle(file);
+      if (shared && shared != INVALID_HANDLE_VALUE) CloseHandle(shared);
+    }
+  } cleanup{file, shared};
+  if (!file || file == INVALID_HANDLE_VALUE || !shared || shared == INVALID_HANDLE_VALUE ||
+      kind > DescriptorKind::kRandom) return errno = EINVAL, -1;
+  auto description = std::make_shared<OpenFileDescription>();
+  if (!description->Adopt(shared)) return -1;
+  cleanup.shared = nullptr;
+  description->kind = kind;
+  auto snapshot = std::make_shared<DescriptorSnapshot>();
+  snapshot->handle = file;
+  cleanup.file = nullptr;
+  snapshot->description = std::move(description);
+  snapshot->kind = kind;
+  return AttachFileDescription(snapshot, close_on_exec);
+} catch (const std::bad_alloc&) {
+  return errno = ENOMEM, -1;
 }
 int CaptureDescriptors(std::vector<std::pair<int, DescriptorSnapshotPtr>>* out, bool include_close_on_exec) {
   const auto* owner = Owner();
