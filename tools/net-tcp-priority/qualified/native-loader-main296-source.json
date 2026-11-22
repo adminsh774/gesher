@@ -1,0 +1,55 @@
+{
+  "after_sha256": {
+    "compat/bionic/extra_bionic.cc": "f6afd252bf88ae9c36fcd117655a3a63297979668f108558f14e0900ddccf982",
+    "compat/bionic/extra_bionic.h": "f94af1490da57b3aec407ca27d591ae74ffaa3bba83b83d5061d05d977526d7b",
+    "compat/bionic/include/gesher/bionic_shim.h": "09bf290c5c0b842cd73a5be0d498e900d46bbb87226215a52bc80834b23e3340",
+    "compat/bionic/shim.cc": "c4daa40af3a7c6ed4813b06971b79f026eed23ccaf7290b20ac29a57992747d5",
+    "compat/bionic/shim_internal.h": "69dd64701b4fbe446e59121f2bb5428ab8212d60d2e26eaea6ad6970775880c3",
+    "compat/bionic/stdio_bionic.cc": "cb58b2ec48dce00ce04cf0fa3627ec561fd393eac12d0e6080e0189ff175d70f",
+    "compat/elf/exec/gesher_exec.cc": "a7dd6a1404b9d438c7ca8be895055495bd72664667fe4c442f214f5c04841f56",
+    "compat/elf/include/gesher/elf_loader.h": "67520cfb5ce54cd424b10ac3219e7d6ecd735b338d14400d04fa3718504b76cd",
+    "compat/posix/include/gesher/elf_dlopen.h": "1f35c46ac7d37656b7fedd471ad9e4a51005dfb5c12476ea902641f3f2bf96cd"
+  },
+  "baseline": "f8800806ffd3a52c3e28256c2d6dfd5129ef8e2e",
+  "baseline_policy_sha256": "bea6798aa2adb9d44a6ff5a69bfb0bfdb1116b398d0197413aa3c1329d118d47",
+  "before_sha256": {
+    "compat/bionic/extra_bionic.cc": "0e0958142d26aa1dbe87acf44e416507d87969c5ba100e478356ffc9ba942bc3",
+    "compat/bionic/extra_bionic.h": "d0107054021c62fd7edc2b14dcec7c408ad2568a76b3497d2d5b5c15860cdb8f",
+    "compat/bionic/include/gesher/bionic_shim.h": "ee2f3fb2c6fea311f8a42c0547cd0765313fc1488a0a5c484ba1f54c070a99e2",
+    "compat/bionic/shim.cc": "657c185ed9b77ebc6804ce485acc5b866411f7c2641774582a1b4552df21aa6e",
+    "compat/bionic/shim_internal.h": "eac2550acbd74dd5da75f5087860748e45ef3115a7e3276e00e00ac441283f6d",
+    "compat/bionic/stdio_bionic.cc": "bb8aba18f5794919f0338eb42df7807b89203ffd3371f9e3a53aad40982ecfa1",
+    "compat/elf/exec/gesher_exec.cc": "6c86da7c77affc2f18871d4e83adc3175552925c10bdeda3f40523e6e1b2199f",
+    "compat/elf/include/gesher/elf_loader.h": "f89f251948f91bcca8b43f7a95410e39040016e38b649c35d45771b4fa50515a",
+    "compat/posix/include/gesher/elf_dlopen.h": "513defa70be62aec8bb96704d0b786a2e7ffd09c7cdec799fc3495b6983b1ed3"
+  },
+  "coupled_paths": [
+    "compat/bionic/extra_bionic.h",
+    "compat/bionic/include/gesher/bionic_shim.h",
+    "compat/bionic/shim_internal.h",
+    "compat/elf/include/gesher/elf_loader.h",
+    "compat/posix/include/gesher/elf_dlopen.h"
+  ],
+  "feature_head": "5779008c800a3f5e9caedf1a1e4c0cdc584ed1eb",
+  "patch_sha256": "1ca236f17f149a107a08c1d813ea4f5db4dfa650b11b30f238595b748b866bc7",
+  "paths": [
+    "compat/bionic/extra_bionic.cc",
+    "compat/bionic/extra_bionic.h",
+    "compat/bionic/include/gesher/bionic_shim.h",
+    "compat/bionic/shim.cc",
+    "compat/bionic/shim_internal.h",
+    "compat/bionic/stdio_bionic.cc",
+    "compat/elf/exec/gesher_exec.cc",
+    "compat/elf/include/gesher/elf_loader.h",
+    "compat/posix/include/gesher/elf_dlopen.h"
+  ],
+  "protected_paths": [
+    "compat/bionic/extra_bionic.cc",
+    "compat/bionic/shim.cc",
+    "compat/bionic/stdio_bionic.cc",
+    "compat/elf/exec/gesher_exec.cc"
+  ],
+  "unchanged_sha256": {
+    "compat/arm64/include/gesher/symbol_table.h": "0142e694541611f3882df10096efae8c815de0ca06ce3410a9c5f7e0748c71bb"
+  }
+}

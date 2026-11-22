@@ -22,8 +22,8 @@ spec = importlib.util.spec_from_file_location(
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 FOLDER = "tools/net-tcp-priority/qualified/"
-MANIFEST = FOLDER + "native-loader-source.json"
-PATCH = FOLDER + "native-loader-source.patch"
+MANIFEST = FOLDER + "native-loader-main296-source.json"
+PATCH = FOLDER + "native-loader-main296-source.patch"
 read_bytes = Path.read_bytes
 manifest = json.loads((ROOT / MANIFEST).read_bytes())
 transition_patch = (ROOT / PATCH).read_bytes()
@@ -74,14 +74,12 @@ for name in manifest["paths"]:
     rejected("unqualified bytes in " + name,
              {name: (ROOT / name).read_bytes() + b"\n// unqualified mutation\n"}, name)
 
-# Replacing the new full-file hash is insufficient: the exact original patch
-# must still reverse all bytes to the original main file and OFD receipt.
+# Replacing the new full-file hash is insufficient: the exact transition patch
+# must still reverse all bytes to the corrected baseline and its OFD receipt.
 for name in ("compat/bionic/shim.cc", "compat/bionic/shim_internal.h"):
     mutated = (ROOT / name).read_bytes() + b'\n#include "unqualified_native_loader.h"\n'
     changed = copy.deepcopy(manifest)
-    # The original namespace endpoint precedes main's later exact memmem edit.
-    endpoint = policy.preceding_memmem_source(mutated) if name == "compat/bionic/shim.cc" else mutated
-    changed["after_sha256"][name] = sha(endpoint)
+    changed["after_sha256"][name] = sha(mutated)
     rejected("an undeclared include even with a repinned endpoint: " + name,
              {name: mutated}, "native-loader reverse endpoint", changed)
 
@@ -90,20 +88,43 @@ for name in ("compat/bionic/shim.cc", "compat/bionic/shim_internal.h"):
 shim_path = "compat/bionic/shim.cc"
 shim = (ROOT / shim_path).read_bytes()
 rejected("the old namespace source without main's memmem change",
-         {shim_path: policy.preceding_memmem_source(shim)}, "exact reviewed memmem substitution changed")
+         {shim_path: policy.preceding_memmem_source(shim)}, shim_path)
 only_memmem = subprocess.check_output(["git", "-C", str(ROOT), "show",
                                       policy.NATIVE_LOADER_BASE + ":" + shim_path])
-for before, after in policy.MEMMEM_REPLACEMENTS:
-    assert only_memmem.count(before) == 1
-    only_memmem = only_memmem.replace(before, after, 1)
 rejected("main's memmem source without the namespace ownership transition", {shim_path: only_memmem}, shim_path)
 scoped = b"return LookupOwnedSymbol(name, symbol);"
 assert shim.count(scoped) == 1
 unscoped = shim.replace(scoped, b"return LookupBionicSymbol(symbol);", 1)
 changed = copy.deepcopy(manifest)
-changed["after_sha256"][shim_path] = sha(policy.preceding_memmem_source(unscoped))
-rejected("aggregate lookup despite a repinned normalized endpoint", {shim_path: unscoped},
+changed["after_sha256"][shim_path] = sha(unscoped)
+rejected("aggregate lookup despite a repinned endpoint", {shim_path: unscoped},
          "exact patch application", changed)
+
+# Main249's cache is part of the new baseline, not a namespace change. Losing
+# it cannot be hidden behind a new endpoint hash. The actual owner split is
+# also mandatory: libc cannot silently regain liblog's entries.
+stdio_path = "compat/bionic/stdio_bionic.cc"
+stdio = (ROOT / stdio_path).read_bytes()
+uncached = subprocess.check_output(["git", "-C", str(ROOT), "show",
+                                   policy.NATIVE_LOADER_FEATURE_HEAD + ":" + stdio_path])
+changed = copy.deepcopy(manifest)
+changed["after_sha256"][stdio_path] = sha(uncached)
+rejected("loss of main's stdio cache despite a repinned endpoint",
+         {stdio_path: uncached}, "native-loader reverse endpoint", changed)
+split = b"}\n\nvoid RegisterLog(SymbolTable& t) {\n  // liblog."
+assert stdio.count(split) == 1
+unsplit = stdio.replace(split, b"  // liblog.", 1)
+changed = copy.deepcopy(manifest)
+changed["after_sha256"][stdio_path] = sha(unsplit)
+rejected("liblog entries restored to libc despite a repinned endpoint",
+         {stdio_path: unsplit}, "empty native-loader transition", changed)
+invalidate = b"if (generation != 0) bucket.generation.store(generation + 1, std::memory_order_release);"
+assert stdio.count(invalidate) == 1
+stale = stdio.replace(invalidate, b"(void)generation;", 1)
+changed = copy.deepcopy(manifest)
+changed["after_sha256"][stdio_path] = sha(stale)
+rejected("lost close/reopen invalidation despite a repinned endpoint",
+         {stdio_path: stale}, "native-loader reverse endpoint", changed)
 
 # The unchanged dependency is compared with independently named main bytes.
 name = policy.NATIVE_LOADER_UNCHANGED_PATHS[0]
@@ -158,6 +179,11 @@ rejected("changed transition metadata without its independent pin",
          {MANIFEST: (ROOT / MANIFEST).read_bytes() + b"\n"}, "native-loader source transition changed")
 rejected("changed transition patch without its independent pin",
          {PATCH: transition_patch + b"\n"}, "native-loader transition patch changed")
+for name in policy.NATIVE_LOADER_HISTORICAL_SHA256:
+    path = FOLDER + name
+    rejected("a rewritten historical transition: " + name,
+             {path: (ROOT / path).read_bytes() + b"\n"},
+             "historical native-loader transition changed: " + name)
 
 # These files never enter the native-loader normalization and must continue to
 # fail the original exact OFD source qualification, including its header rules.
