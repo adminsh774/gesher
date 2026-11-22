@@ -167,6 +167,31 @@ Reviewing the declaration alone does not establish that CI executed it.
 The exact-head run must show the microphone host step and Windows public/native
 and existing recording gates actually executing.
 
+### Integration after main's native/runtime update
+
+Main advanced to `1a3a5c244d643c7c93b621326857c6b8c858d5bb` while the PR was
+under validation. Integrating that main commit preserves all of its native,
+compiler, cancellation-receipt, CI and source-security changes. The only merge
+conflict was the immutable framework recipe pin. Main's recipe at `8b316aeb`
+and its checked-in `framework.yml` have the same blob
+`b84c63efb79aea8f97f484c9ac206921ac3c4627`; the retained reviewed `8332eac1`
+recipe is exactly that file plus this round's microphone-admission step.
+
+Post-integration local verification rebuilt the complete application Java/DEX
+output and reran the production host fixtures: 50 Java/JNI/provider checks and
+30 native resolver controls passed. CI YAML parsing, the six cache-policy tests
+and the diff check against current main passed. Structural comparison retains
+every other upstream-changed path byte-for-byte and leaves this round's
+production and fixture source unchanged.
+
+The prior exact head `14c32630a0d67c1d4930f55fe601ca2384381f82` passed the fresh
+host-tools receipt, 30 native resolver checks and 50 Java/JNI/provider checks
+in run `45023393219`. Its first predecessor run encountered malformed GitHub
+jobs-API JSON before compilation; a transparent empty commit triggered a full
+normal CI run with fresh coherent suppliers, without changing source or guards.
+Those prior-head results do not qualify the integrated runtime; the integrated
+head requires fresh CI, including all Windows recording paths.
+
 ## Parallel PR integration
 
 The foreground-service, camera and microphone rounds each pin their own reviewed
