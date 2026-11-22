@@ -137,8 +137,28 @@ owner-target base-permission enforcement and UID-wide type compatibility.
 The correction adds installed shared-UID metadata, real PM replacement/removal
 publication, normal-permission union checks, and an unrelated-UID control.
 The new shared-UID scenario reproduces the first candidate's rejection before
-passing with the corrected production path. Final independent review and CI are
-still separate gates.
+passing with the corrected production path. Independent review passed local
+commit `3b5cbb28c0f195f69ec3ec41d97dcd863ed87419`, including a separate execution
+of all 173 checks. The published commit
+`71ccbb7cfe8d67d0e1f0056d00bf250367d44d85` has the identical reviewed tree
+`911b089fa98aa1ba63b5d580f95323a6bfe95bb1`.
+
+### Required framework workflow pin
+
+The first PR run, `45020293584`, exposed a wiring gap: `ci.yml` called the
+immutable framework recipe at `2c096437d9474a59e4fd6f78d1670c9c7afc573f`, so
+declaring the new host step in the candidate's `framework.yml` did not execute
+that step. The caller now pins the already-published, reviewed recipe at
+`71ccbb7cfe8d67d0e1f0056d00bf250367d44d85`. The complete recipe delta retains
+all previous steps and also activates the installer-attribution, Bluetooth-request
+and Windows Wi-Fi contract gates already present on the captured main branch.
+
+The replacement retains `local-runner: false`, immutable runner/cache action
+pins, existing permissions and main-only cache saves. It changes no runner-group
+allowlist or local-runner authorization. The next exact-head run must show the
+foreground-admission host step actually executing, as well as the Windows/ART
+fixture and notification integration gates; a green run that omits the step is
+not evidence for this regression.
 
 ## Remaining F06 work and qualification limits
 
