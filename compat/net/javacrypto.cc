@@ -19,7 +19,7 @@ jint JNI_OnLoad_conscrypt(JavaVM* vm, void* reserved);  // jniload.cc
 namespace {
 
 jint OnLoad(JavaVM* vm, void* reserved) {
-  gesher::net::SyncSystemCaCerts();
+  if (!gesher::net::SyncSystemCaCerts()) return JNI_ERR;
   return JNI_OnLoad_conscrypt(vm, reserved);
 }
 

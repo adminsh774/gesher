@@ -302,6 +302,9 @@ jobs:
       - name: Bionic stream state across close and reopen failures
         run: python3 tools/test_stdio_lifetime_contracts.py --sanitize
 
+      - name: Verified trust encodings and fail-closed publication with pinned BoringSSL
+        run: python3 tools/test_trust_store.py --fetch --sanitize
+
       - name: Freopen contracts against the pinned glibc reference
         run: bash tools/ci/test-freopen-reference.sh
 
@@ -622,6 +625,21 @@ jobs:
           ninja -C out CMakeFiles/gesher_bionic_unicode.dir/compat/bionic/unicode_width.cc.obj
           ninja -C out native3_unicode_test
           ninja -C out native3_cpu_clock_test clock_domains_windows_test boottime_resume_windows_test
+          ninja -C out trust_store_contract_test
+          # Keep the actual CMake executable as the correctness gate. Both
+          # measurement variants use the same runner/compiler/flags/archive;
+          # only the selected production source revision differs.
+          git fetch --no-tags --depth=1 origin a6be01164ff09de1a87382aad864a6253264b77b
+          for trust_variant in baseline candidate; do
+            trust_source=()
+            if [[ "$trust_variant" == baseline ]]; then
+              trust_source=(--source-ref a6be01164ff09de1a87382aad864a6253264b77b)
+            fi
+            python3 tools/test_trust_store.py --compile-only "${trust_source[@]}" \
+              --cxx "$GESHER_BUILD_LLVM/bin/x86_64-w64-mingw32-clang++" \
+              --boringssl-source third_party/aosp/external/boringssl \
+              --crypto-library out/libboringssl_crypto.a --output "out/trust_store_${trust_variant}_test.exe"
+          done
           ninja -C out
           # Native fixtures are CI-only; none is installed by gesher.iss.
           ninja -C out install_pipe_test account_chooser_test window_promotion_test permission_dialog_test
@@ -1874,6 +1892,30 @@ jobs:
         run: |
           python tools/surface/assemble-artifacts.py --source ci-suppliers/core/artifacts/framework --destination dist --ledger ci-owners.json --owner framework
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Real Windows CryptoAPI trust cache and publication contracts
+        if: matrix.shard == 'native'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          & ./dist/trust_store_contract_test.exe --corpus ./dist/cacerts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Paired original-source and candidate trust-store measurements
+        if: matrix.shard == 'native'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          # Observations only: no noisy elapsed-time threshold. This workload uses
+          # isolated synthetic CryptoAPI stores, not an app's first TLS request.
+          foreach ($pair in 1..3) {
+            $order = if ($pair % 2) { @('baseline', 'candidate') } else { @('candidate', 'baseline') }
+            foreach ($variant in $order) {
+              Write-Output "TRUST_PAIRED pair=$pair variant=$variant baseline=a6be01164ff09de1a87382aad864a6253264b77b source=${{ github.sha }}"
+              & "./dist/trust_store_${variant}_test.exe" --measure-only
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
 
       - name: Verify and assemble native-libs artifact
         shell: pwsh

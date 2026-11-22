@@ -142,10 +142,32 @@ config (`SystemCertificateSource`) read the system CAs from
 
 So a root an administrator, a company or a content filter (NetFree, TLS
 inspection) installed in Windows is trusted by Android apps with no setup.
-A manifest (`.gesher-cacerts`) makes the check cheap when nothing changed; a
-named mutex serializes writers; `GESHER_WINDOWS_CERTS=0` leaves Windows'
-stores out; `GESHER_TRACE_CACERTS=1` reports what was written. User CAs
-(`$ANDROID_DATA/misc/keychain`) are Android's, unchanged.
+A manifest (`.gesher-cacerts`) indexes previously encoded certificates. Every
+load still freshly enumerates the user, machine, bundled and Disallowed
+sources and rechecks purpose restrictions. A cached PEM is reused only when
+its DER equals a currently admitted source certificate and its filename's
+subject hash agrees with a hash independently derived from that source.
+The manifest never authorizes trust or establishes that a Windows store did
+not change. All output certificates are checked; stale or malformed entries
+are removed and missing or corrupt encodings are regenerated.
+
+The existing named mutex now covers scanning through publication, and failure
+to acquire it stops this library load. Individual files are replaced atomically;
+stale anchors are removed before additions, and the manifest is published last.
+Unreadable sources, failed deletions and failed publication return `JNI_ERR`
+from libjavacrypto's `JNI_OnLoad` instead of initializing Conscrypt with an
+unverified old directory. A missing optional Windows store is an empty store;
+access denial and partial enumeration are errors. A failed update can leave a
+partial directory which the next successful synchronization repairs. Existing
+TLS objects and native clients reading during publication are not a directory
+transaction or a live revocation mechanism.
+
+`GESHER_WINDOWS_CERTS=0` leaves Windows' positive root stores out while retaining
+Disallowed checks. `GESHER_TRACE_CACERTS=1` reports conversion, reuse, write and
+removal counts. User CAs (`$ANDROID_DATA/misc/keychain`) remain Android's.
+The [NATIVE-11 experiment](performance/native11-trust-store.md) records the
+cache limits, failure cases, measured CPU/I/O tradeoff and the remaining
+notification/lifetime work. It does not establish a Windows startup-speed win.
 
 ### Native TLS clients
 

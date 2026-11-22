@@ -29,6 +29,20 @@ target_link_libraries(conscrypt_jni PUBLIC nativehelper log boringssl_ssl crypt3
 
 target_link_libraries(dalvikvm PRIVATE conscrypt_jni)
 
+# Isolated native trust-store contract: the production synchronizer/JNI wrapper,
+# real BoringSSL, CryptoAPI memory stores, and real Windows files/named mutexes.
+# Only this observer target redirects source selection and injects explicit faults.
+set(_trust_tests "${CMAKE_SOURCE_DIR}/tests/trust-store")
+add_library(trust_store_observed OBJECT ${_net}/trust_store.cc)
+target_compile_options(trust_store_observed PRIVATE -include "${_trust_tests}/observe.h")
+target_link_libraries(trust_store_observed PRIVATE boringssl_crypto)
+add_executable(trust_store_contract_test ${_trust_tests}/contracts.cc ${_trust_tests}/boundary.cc
+  ${_net}/javacrypto.cc $<TARGET_OBJECTS:trust_store_observed>)
+target_include_directories(trust_store_contract_test PRIVATE ${_net} ${_trust_tests}/include)
+target_compile_definitions(trust_store_contract_test PRIVATE TRUST_SYNC_RETURNS_BOOL=1)
+target_compile_options(trust_store_contract_test PRIVATE -Wall -Wextra -Wno-deprecated-declarations)
+target_link_libraries(trust_store_contract_test PRIVATE boringssl_crypto crypt32)
+
 # com.gesher.net.WindowsNetworks's natives (the built-in library libgesher_net.so):
 # Windows' networks for the connectivity service, and the INTERNET permission's
 # switch (<gesher/inet.h>), plus the libgesher_nsd.so multicast query transport.

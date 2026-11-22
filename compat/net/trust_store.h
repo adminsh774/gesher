@@ -12,8 +12,14 @@ namespace gesher::net {
 // user and the machine, group policy and enterprise ones included, and
 // self-signed certificates in the CA stores), less those in Windows'
 // Disallowed stores. Each is a PEM file named <subject hash>.<n>, as Android
-// names them. A manifest makes later calls cheap when nothing changed.
-// Failures are reported on stderr and leave the directory as it was.
-void SyncSystemCaCerts();
+// names them. Every call freshly reads all sources and restrictions. Unchanged
+// certificates reuse their PEM only after verifying the actual DER and subject
+// hash; the manifest is an untrusted index, not a source-generation receipt.
+// Returns false on an unreadable source, serialization or publication failure;
+// JNI_OnLoad must then fail rather than initialize TLS with stale trust. Output
+// files are individually atomic, with stale certificates removed first and the
+// manifest last. Failure can leave a partial directory, repaired by the next
+// call; there is no directory transaction or live revocation of existing TLS.
+bool SyncSystemCaCerts();
 
 }  // namespace gesher::net
