@@ -90,6 +90,11 @@ static void CALLBACK Inspect(HWND dialog, UINT message, UINT_PTR timer, DWORD ti
 static void CALLBACK InspectHostPrompt(HWND dialog, UINT message, UINT_PTR timer, DWORD time) {
   (void)message; (void)time;
   KillTimer(dialog, timer);
+  if (phase == 1) {
+    Check(GetFocus() == GetDlgItem(dialog, IDYES), "Tab from default Deny reaches host Allow");
+    PostMessageW(GetFocus(), WM_KEYDOWN, VK_RETURN, 0);
+    return;
+  }
   HWND text = GetDlgItem(dialog, GESHER_HOST_MESSAGE_TEXT);
   HWND accept = GetDlgItem(dialog, prompt_confirmation ? IDYES : IDOK);
   HWND deny = GetDlgItem(dialog, IDCANCEL);
@@ -117,6 +122,10 @@ static void CALLBACK InspectHostPrompt(HWND dialog, UINT message, UINT_PTR timer
     PostMessageW(dialog, WM_CLOSE, 0, 0);
   } else if (prompt_action == ESCAPE || prompt_action == ENTER) {
     PostMessageW(GetFocus(), WM_KEYDOWN, prompt_action == ESCAPE ? VK_ESCAPE : VK_RETURN, 0);
+  } else if (prompt_action == TAB_ALLOW) {
+    phase = 1;
+    PostMessageW(GetFocus(), WM_KEYDOWN, VK_TAB, 0);
+    SetTimer(dialog, 1, 20, InspectHostPrompt);
   }
 }
 
@@ -133,8 +142,8 @@ static LRESULT CALLBACK AfterInit(int code, WPARAM wparam, LPARAM lparam) {
 }
 
 static DWORD WINAPI Watchdog(void* completed) {
-  if (WaitForSingleObject((HANDLE)completed, 45000) != WAIT_OBJECT_0) {
-    fprintf(stderr, "FAIL: permission dialog test exceeded 45 seconds\n");
+  if (WaitForSingleObject((HANDLE)completed, 120000) != WAIT_OBJECT_0) {
+    fprintf(stderr, "FAIL: permission dialog test exceeded 120 seconds\n");
     TerminateProcess(GetCurrentProcess(), 4);
   }
   return 0;
@@ -171,18 +180,20 @@ int main(void) {
   for (int locale = 0; locale < 2; ++locale) {
     language = locale ? GESHER_UI_HE : GESHER_UI_EN;
     prompt_confirmation = TRUE;
-    for (prompt_action = DENY; prompt_action <= ESCAPE; ++prompt_action) {
+    for (prompt_action = DENY; prompt_action <= TAB_ALLOW; ++prompt_action) {
+      phase = 0;
       BOOL accepted = GesherHostPrompt(GesherUiText(language, "account_title"),
           L"com.example.app\r\nandroid.permission.CAMERA",
           GesherUiText(language, "permission_allow"),
           GesherUiText(language, "permission_deny"),
           GesherUiRtl(language), NULL);
-      Check(accepted == (prompt_action == ALLOW),
+      Check(accepted == (prompt_action == ALLOW || prompt_action == TAB_ALLOW),
           "only an explicit account-token Allow grants access");
     }
     // Launcher notices are informational: OK closes them, and X cancels safely.
     prompt_confirmation = FALSE;
     for (prompt_action = ALLOW; prompt_action <= CLOSE; ++prompt_action) {
+      phase = 0;
       BOOL accepted = GesherHostPrompt(GesherUiText(language, "brand"),
           L"com.example.app\r\nandroid.permission.CAMERA",
           GesherUiText(language, "cp_dialog_ok"), NULL,

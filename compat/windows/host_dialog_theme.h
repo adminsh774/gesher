@@ -42,7 +42,7 @@ static inline COLORREF GesherHostAccentColor(const GesherHostTheme* theme) {
  * the normal title bar, and high-contrast overrides are never painted over. */
 static inline void GesherHostApplyCaption(HWND window) {
   if (GesherHostHighContrast()) return;
-  HMODULE module = LoadLibraryW(L"dwmapi.dll");
+  HMODULE module = LoadLibraryExW(L"dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
   if (module == NULL) return;
   typedef HRESULT (WINAPI *SetAttribute)(HWND, DWORD, LPCVOID, DWORD);
   SetAttribute set_attribute = (SetAttribute)GetProcAddress(module, "DwmSetWindowAttribute");
@@ -92,7 +92,9 @@ static inline HFONT GesherHostHeadingFont(HWND window) {
 static inline void GesherHostDrawButton(const DRAWITEMSTRUCT* item,
                                         const GesherHostTheme* theme) {
   if (item->CtlType != ODT_BUTTON) return;
-  BOOL primary = item->CtlID == IDYES || item->CtlID == IDOK;
+  /* IDOK is the single action of a notice or the chooser's selection. A grant
+   * (IDYES) is drawn with the same weight as its safe default, Deny. */
+  BOOL primary = item->CtlID == IDOK;
   BOOL disabled = (item->itemState & ODS_DISABLED) != 0;
   BOOL pressed = (item->itemState & ODS_SELECTED) != 0;
   COLORREF fill, border, ink;
@@ -215,18 +217,25 @@ typedef struct {
 /* Windows EDIT controls use CRLF line breaks; do not mutate input or embed it in
  * a resource template. The window copies this buffer synchronously at creation. */
 static inline WCHAR* GesherHostEditCopy(const WCHAR* text) {
+  /* Keep the dialog visible for very long (e.g. launch failure) text: show the
+   * beginning and mark the cut instead of failing to present anything. */
   SIZE_T length = wcslen(text), extra = 0;
-  if (length > 32767) return NULL;
+  BOOL cut = length > 32000;
+  if (cut) {
+    length = 32000;
+    if (IS_HIGH_SURROGATE(text[length - 1])) --length;
+  }
   for (SIZE_T i = 0; i < length; ++i)
     if (text[i] == L'\n' && (i == 0 || text[i - 1] != L'\r')) ++extra;
   WCHAR* buffer = (WCHAR*)HeapAlloc(GetProcessHeap(), 0,
-      (length + extra + 1) * sizeof(WCHAR));
+      (length + extra + 2) * sizeof(WCHAR));
   if (buffer == NULL) return NULL;
   SIZE_T at = 0;
   for (SIZE_T i = 0; i < length; ++i) {
     if (text[i] == L'\n' && (i == 0 || text[i - 1] != L'\r')) buffer[at++] = L'\r';
     buffer[at++] = text[i];
   }
+  if (cut) buffer[at++] = 0x2026; /* HORIZONTAL ELLIPSIS */
   buffer[at] = 0;
   return buffer;
 }
@@ -250,11 +259,12 @@ static inline INT_PTR CALLBACK GesherHostPromptProc(HWND dialog, UINT message,
         GESHER_HOST_MESSAGE_TEXT, 16, 44, 300, 124);
     SecureZeroMemory(copy, (wcslen(copy) + 1) * sizeof(WCHAR));
     HeapFree(GetProcessHeap(), 0, copy);
-    HWND accept = GesherHostControl(dialog, 0, L"BUTTON", state->positive,
-        WS_TABSTOP | BS_OWNERDRAW, state->negative ? IDYES : IDOK, 230, 182, 86, 24);
+    /* Create Deny first so Tab order follows the on-screen order. */
     HWND deny = state->negative != NULL
         ? GesherHostControl(dialog, 0, L"BUTTON", state->negative,
             WS_TABSTOP | BS_OWNERDRAW, IDCANCEL, 134, 182, 86, 24) : NULL;
+    HWND accept = GesherHostControl(dialog, 0, L"BUTTON", state->positive,
+        WS_TABSTOP | BS_OWNERDRAW, state->negative ? IDYES : IDOK, 230, 182, 86, 24);
     if (!heading || !details || !accept || (state->negative && !deny)) {
       EndDialog(dialog, IDCANCEL);
       return FALSE;
