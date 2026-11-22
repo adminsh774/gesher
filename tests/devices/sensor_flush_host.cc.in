@@ -68,6 +68,8 @@ const std::vector<Sensor>& List(){return sensors;}
 }
 class TestSink : public Sink {
  public:
+ std::atomic<uint64_t> epoch{1};
+ uint64_t DeliveryEpoch() const override { return epoch.load(); }
  std::mutex mutex;
  EventBuffer buffer;
  void OnEvent(int h,const Reading&r,int64_t t) override {
@@ -107,6 +109,26 @@ void samplerTests() {
  sampler.DisableAll(&sink);sink.Take();sampler.Flush(&sink);
  check(sink.Take().empty(),"retired sink has no subscriptions or callbacks");
  sampler.DisableAll(&other);
+
+ // An on-change provider has no new data after resume. A changed access epoch
+ // must request its current value again, without publishing denied samples.
+ sensors[0].flags=kOnChange;
+ sink.epoch=1;
+ check(sampler.Enable(&sink,1,20000)==0,"on-change subscription enabled");
+ auto until=std::chrono::steady_clock::now()+2s;
+ bool first=false;
+ while(std::chrono::steady_clock::now()<until&&!first){first=!sink.Take().empty();std::this_thread::sleep_for(2ms);}
+ check(first,"on-change first event arrives");
+ sink.epoch=0;
+ std::this_thread::sleep_for(40ms);sink.Take();
+ std::this_thread::sleep_for(40ms);
+ check(sink.Take().empty(),"denied epoch produces no on-change data");
+ sink.epoch=2;
+ until=std::chrono::steady_clock::now()+2s;
+ bool resumed=false;
+ while(std::chrono::steady_clock::now()<until&&!resumed){resumed=!sink.Take().empty();std::this_thread::sleep_for(2ms);}
+ check(resumed,"unchanged on-change reading delivered after access resumes");
+ sampler.DisableAll(&sink);
 }
 #endif
 int main(){bufferTests();

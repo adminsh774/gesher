@@ -63,6 +63,11 @@ const std::vector<Sensor>& List();
 class Sink {
  public:
   virtual ~Sink() = default;
+  // A nonzero generation permits delivery. A changed generation restarts
+  // on-change sampling, so an unchanged value is observable after access
+  // resumes. Implementations must only read local state: this runs under
+  // the sampler lock and must never call Java, Binder or another hub method.
+  virtual uint64_t DeliveryEpoch() const { return 1; }
   virtual void OnEvent(int handle, const Reading& reading, int64_t timestampNs) = 0;
   // Enqueue completions as one transaction; no Java callback runs here.
   virtual int OnFlush(const std::vector<int>& handles) = 0;

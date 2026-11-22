@@ -14,7 +14,8 @@ target_link_libraries(dalvikvm PRIVATE gesher_jni_bridge gesher_bionic gesher_el
 # AssetManager natives and libutils' Looper; its static initializer adds them
 # to the bionic shim's symbol table. Linked into dalvikvm next to the
 # framework's natives (framework_runtime). docs/native-libs.md.
-add_library(gesher_libandroid OBJECT ${CMAKE_CURRENT_LIST_DIR}/libandroid.cc)
+add_library(gesher_libandroid OBJECT ${CMAKE_CURRENT_LIST_DIR}/libandroid.cc
+  ${CMAKE_CURRENT_LIST_DIR}/sensors_ndk.cc)
 target_include_directories(gesher_libandroid PRIVATE ${CMAKE_CURRENT_LIST_DIR}
   ${AOSP_DIR}/frameworks/base/core/jni/include)
 target_link_libraries(gesher_libandroid PRIVATE gesher_bionic gesher_elf androidfw utils cutils log

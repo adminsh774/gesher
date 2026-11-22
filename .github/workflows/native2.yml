@@ -43,18 +43,17 @@ jobs:
         with:
           sparse-checkout: |
             .github/workflows
+            compat/devices
+            tests/sensors
             tests/native2
             tests/native
             tests/binary128
             probes/arm64/fpcr
             tests/apps/native2app
+            tests/apps/ndksensors
             tests/apps/net4resolverapp
             tests/e2e
-            tools/net-udp
-            tools/net-udp-component
-            tools/net-dns
-            tools/net-dns-component
-            tools/fonts
+            tools
 
       - name: Cache publisher-authenticated NDK archive
         id: ndk
@@ -75,6 +74,13 @@ jobs:
           test ! -e "$NDK_DIR"
           unzip -q dns-ndk.zip
           test -d "$NDK_DIR"
+
+      - name: Native sensor policy attachment on a real JVM
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sensor-jni-header"
+          cp "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/jni.h" "$RUNNER_TEMP/sensor-jni-header/"
+          python3 tools/test_sensor_access_jni.py --java-home "$JAVA_HOME" --jni-include "$RUNNER_TEMP/sensor-jni-header"
 
       - name: Cache d8
         id: r8
@@ -157,6 +163,9 @@ jobs:
           common=(--ndk "$PWD/$NDK_DIR" --android-jar "$PWD/sdk/android.jar" --build-tools "$PWD/sdk/build-tools" --r8 "$PWD/r8.jar")
           tests/apps/native2app/build.sh dist native2app.apk x86_64 "${common[@]}"
           tests/apps/native2app/build.sh dist native2app-arm64.apk arm64-v8a "${common[@]}"
+          for abi in x86_64 arm64-v8a; do
+            bash tests/apps/ndksensors/build.sh dist "$abi" "${common[@]}"
+          done
           for abi in x86_64 arm64-v8a; do
             bash tests/apps/net4resolverapp/build.sh "$PWD/dist" "$abi" \
               --android-jar "$PWD/sdk/android.jar" --build-tools "$PWD/sdk/build-tools" --r8 "$PWD/r8.jar"

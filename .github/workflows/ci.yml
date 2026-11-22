@@ -347,6 +347,8 @@ jobs:
           python3 tools/test_input_key_contracts.py --sanitize
           python3 tools/test_mouse_capture_contracts.py --sanitize
           python3 tools/test_sensor_flush_contracts.py --sanitize
+          python3 tools/test_ndk_sensor_contracts.py --sanitize
+          python3 tools/test_sensor_access.py
           python3 tools/test_traversal_contracts.py --sanitize
           python3 tools/test_futex_contracts.py --sanitize
           python3 tools/test_futex_contracts.py --linux-reference

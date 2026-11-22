@@ -240,3 +240,33 @@ try {
   if ($savedLogs) { $env:GESHER_LOGS = $savedLogs } else { Remove-Item Env:GESHER_LOGS -ErrorAction SilentlyContinue }
   Remove-Item Env:GESHER_SHORTCUTS -ErrorAction SilentlyContinue
 }
+
+# --- 4. NDK sensors: real guest C ABI, Looper callbacks, and policy transport ---
+# Both APKs use the NDK's actual ASensorEvent layout and a guest pthread/Looper.
+# Explicit test sensors reach the production shared sampler, policy service and
+# native event queue. This is synthetic transport coverage, not physical hardware.
+$sensorEnvironment = @{ GESHER_SENSOR_TEST = '1'; GESHER_SHORTCUTS = '0' }
+$sensorLines = @('NDK sensors guest: all passed;', '0 failures; inventory, events, Looper, callback TLS, teardown', 'gesher-app: done')
+foreach ($a in $abis) {
+  $apk = NoDrive "$n2/ndksensors-$($a.Abi).apk"
+  Check "NDK sensors ($($a.Tag)): guest events and callbacks in single process" {
+    N2Run "$n2Dir/dalvikvm.exe" ($dvmN2 + @('com.gesher.app.Main', $apk)) `
+      (Get-Location).Path $sensorEnvironment 120
+  } $sensorLines
+}
+$sensorEnvironment['ANDROID_DATA'] = NoDrive "$root/data-ndk-sensors"
+$sensorEnvironment['GESHER_LOGS'] = NoDrive "$root/logs-ndk-sensors"
+New-Item -ItemType Directory -Force "$root/data-ndk-sensors" | Out-Null
+try {
+  foreach ($a in $abis) {
+    $apk = NoDrive "$n2/ndksensors-$($a.Abi).apk"
+    Check "NDK sensors ($($a.Tag)): guest callbacks through authenticated device policy" {
+      N2Run "$n2Dir/dalvikvm.exe" ($dvmN2 + @('com.gesher.app.Launcher', 'launch', $apk, '--headless')) `
+        (Get-Location).Path $sensorEnvironment 180
+    } ($sensorLines + @('gesher-app: app process for com.gesher.ndksensors'))
+  }
+} finally {
+  $shutdown = N2Run "$n2Dir/dalvikvm.exe" ($dvmN2 + @('com.gesher.app.Launcher', 'shutdown')) `
+    (Get-Location).Path $sensorEnvironment 120 | Out-String
+  if ($LASTEXITCODE -ne 0) { Write-Host "INFO NDK sensors device shutdown: $shutdown" }
+}

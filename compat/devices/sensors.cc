@@ -302,6 +302,7 @@ struct Subscription {
   bool onChange;
   bool sent;
   Reading last;
+  uint64_t deliveryEpoch;
 };
 
 class Sampler {
@@ -325,7 +326,7 @@ class Sampler {
       }
     }
     subs_.push_back({sink, handle, period, android::elapsedRealtimeNano(),
-                     sensor->flags == kOnChange, false, Reading()});
+                     sensor->flags == kOnChange, false, Reading(), 0});
     if (!thread_.joinable()) thread_ = std::thread([this] { Run(); });
     cv_.notify_all();
     return 0;
@@ -374,8 +375,13 @@ class Sampler {
       for (Subscription& s : subs_) {
         if (s.nextNs <= now) {
           const Sensor* sensor = Find(s.handle);
+          const uint64_t deliveryEpoch = s.sink->DeliveryEpoch();
+          if (deliveryEpoch != s.deliveryEpoch) {
+            s.sent = false;
+            s.deliveryEpoch = deliveryEpoch;
+          }
           Reading r;
-          if (sensor != nullptr && sensor->source->Read(&r)) {
+          if (deliveryEpoch != 0 && sensor != nullptr && sensor->source->Read(&r)) {
             bool changed = !s.sent || memcmp(r.values, s.last.values, sizeof(r.values)) != 0 ||
                            r.accuracy != s.last.accuracy;
             if (!s.onChange || changed) {
