@@ -213,7 +213,7 @@ static inline WCHAR* GesherHostEditCopy(const WCHAR* text) {
   return buffer;
 }
 
-static INT_PTR CALLBACK GesherHostPromptProc(HWND dialog, UINT message,
+static inline INT_PTR CALLBACK GesherHostPromptProc(HWND dialog, UINT message,
                                               WPARAM wparam, LPARAM lparam) {
   GesherHostPromptState* state = (GesherHostPromptState*)GetWindowLongPtrW(dialog, DWLP_USER);
   if (message == WM_INITDIALOG) {
@@ -245,6 +245,12 @@ static INT_PTR CALLBACK GesherHostPromptProc(HWND dialog, UINT message,
     if (state->heading_font != NULL)
       SendMessageW(heading, WM_SETFONT, (WPARAM)state->heading_font, TRUE);
     SendMessageW(dialog, DM_SETDEFID, deny ? IDCANCEL : IDOK, 0);
+    // A host prompt may originate on a background system-server thread. Request
+    // the foreground once, but never keep the dialog permanently topmost.
+    if (!SetForegroundWindow(dialog)) {
+      FLASHWINFO flash = {sizeof(flash), dialog, FLASHW_TRAY, 3, 0};
+      FlashWindowEx(&flash);
+    }
     SetFocus(deny ? deny : accept);
     return FALSE;
   }
