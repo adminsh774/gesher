@@ -8,6 +8,7 @@ enum {
   ACCOUNT_CHOOSER_LIST = 1001,
   ACCOUNT_CHOOSER_ADD = 1002,
   ACCOUNT_CHOOSER_BRAND = 1003,
+  ACCOUNT_CHOOSER_PROMPT = 1004,
   ACCOUNT_CHOOSER_TIMER = 1
 };
 
@@ -135,7 +136,9 @@ static INT_PTR CALLBACK AccountChooserDialog(HWND dialog, UINT message, WPARAM w
         ACCOUNT_CHOOSER_BRAND, 16, 10, 288, 14);
     HWND prompt = AccountChooserControl(dialog, reading, L"STATIC",
         state->prompt != NULL ? state->prompt : GesherUiText(state->language, "chooser_prompt"),
-        alignment | SS_ENDELLIPSIS, -1, 16, 30, 288, 26);
+        // Wraps to the two lines the heading font fits; ellipsis only after that.
+        alignment | SS_EDITCONTROL | SS_ENDELLIPSIS | SS_NOPREFIX, ACCOUNT_CHOOSER_PROMPT,
+        16, 30, 288, 26);
     // A package identifier remains LTR even when the host UI uses Hebrew.
     HWND package = AccountChooserControl(dialog, WS_EX_LTRREADING, L"STATIC",
         state->package_name, SS_LEFT | SS_ENDELLIPSIS, -1, 16, 58, 288, 18);
@@ -156,17 +159,8 @@ static INT_PTR CALLBACK AccountChooserDialog(HWND dialog, UINT message, WPARAM w
       AccountChooserFinish(dialog, state, -1);
       return FALSE;
     }
-    state->heading_font = GesherHostHeadingFont(dialog);
-    if (state->heading_font != NULL)
-      SendMessageW(prompt, WM_SETFONT, (WPARAM)state->heading_font, TRUE);
-    LOGFONTW brand_font;
-    if (GetObjectW((HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0),
-                   sizeof(brand_font), &brand_font) != 0) {
-      brand_font.lfWeight = FW_BOLD;
-      state->brand_font = CreateFontIndirectW(&brand_font);
-      if (state->brand_font != NULL)
-        SendMessageW(brand, WM_SETFONT, (WPARAM)state->brand_font, TRUE);
-    }
+    GesherHostSetFont(prompt, &state->heading_font, 145, FW_SEMIBOLD);
+    GesherHostSetFont(brand, &state->brand_font, 100, FW_BOLD);
     for (jsize i = 0; i < state->count; ++i) {
       LRESULT added = SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)state->labels[i]);
       if (added == LB_ERR || added == LB_ERRSPACE) {
@@ -187,6 +181,13 @@ static INT_PTR CALLBACK AccountChooserDialog(HWND dialog, UINT message, WPARAM w
   if (state == NULL) return FALSE;
   if (message == WM_TIMER && wparam == ACCOUNT_CHOOSER_TIMER) {
     if (!AccountChooserActive(state)) AccountChooserFinish(dialog, state, -1);
+    return TRUE;
+  }
+  if (message == GESHER_HOST_REFONT) {
+    GesherHostSetFont(GetDlgItem(dialog, ACCOUNT_CHOOSER_PROMPT), &state->heading_font,
+                      145, FW_SEMIBOLD);
+    GesherHostSetFont(GetDlgItem(dialog, ACCOUNT_CHOOSER_BRAND), &state->brand_font,
+                      100, FW_BOLD);
     return TRUE;
   }
   if (message == WM_CLOSE) {

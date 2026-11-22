@@ -14,7 +14,16 @@
 #include <windows.h>
 #include <wchar.h>
 
+/* The project defines NOGDI for AOSP code. Includers must undefine it before
+ * <windows.h> (as gesher_launch.cc and the -UNOGDI credential targets do). */
+#ifdef NOGDI
+#error "host_dialog_theme.h needs GDI: undefine NOGDI before including <windows.h>"
+#endif
+
 enum { GESHER_HOST_MESSAGE_TEXT = 1901, GESHER_HOST_MESSAGE_HEADING = 1902 };
+/* Posted after a DPI change so a dialog can rebuild the fonts it owns once the
+ * dialog manager has rescaled the dialog font. */
+#define GESHER_HOST_REFONT (WM_APP + 0x1e1)
 
 typedef struct {
   HBRUSH surface;
@@ -79,14 +88,40 @@ static inline HBRUSH GesherHostInput(const GesherHostTheme* theme) {
   return theme->input != NULL ? theme->input : GetSysColorBrush(COLOR_WINDOW);
 }
 
-static inline HFONT GesherHostHeadingFont(HWND window) {
+/* A scaled/weighted copy of the dialog's current font; the caller owns it. */
+static inline HFONT GesherHostFont(HWND dialog, int scale, LONG weight) {
   LOGFONTW font;
   ZeroMemory(&font, sizeof(font));
-  HFONT original = (HFONT)SendMessageW(window, WM_GETFONT, 0, 0);
+  HFONT original = (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0);
   if (original == NULL || GetObjectW(original, sizeof(font), &font) == 0) return NULL;
-  font.lfHeight = MulDiv(font.lfHeight, 145, 100);
-  font.lfWeight = FW_SEMIBOLD;
+  font.lfHeight = MulDiv(font.lfHeight, scale, 100);
+  font.lfWeight = weight;
   return CreateFontIndirectW(&font);
+}
+
+/* Replace an owned control font (initially or after a DPI change). */
+static inline void GesherHostSetFont(HWND control, HFONT* owned, int scale, LONG weight) {
+  if (control == NULL) return;
+  HFONT font = GesherHostFont(GetParent(control), scale, weight);
+  if (font == NULL) return;
+  SendMessageW(control, WM_SETFONT, (WPARAM)font, TRUE);
+  if (*owned != NULL) DeleteObject(*owned);
+  *owned = font;
+}
+
+/* The window's own DPI (per-monitor aware hosts), else the DC's system DPI. */
+static inline int GesherHostDpi(HWND window, HDC dc) {
+  typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+  HMODULE user32 = GetModuleHandleW(L"user32.dll");
+  GetDpiForWindowFn get_dpi = user32 != NULL
+      ? (GetDpiForWindowFn)(void*)GetProcAddress(user32, "GetDpiForWindow") : NULL;
+  UINT dpi = get_dpi != NULL ? get_dpi(window) : 0;
+  return dpi != 0 ? (int)dpi : GetDeviceCaps(dc, LOGPIXELSX);
+}
+
+static inline BOOL GesherHostIsClass(HWND window, const WCHAR* klass) {
+  WCHAR name[16];
+  return window != NULL && GetClassNameW(window, name, 16) && lstrcmpiW(name, klass) == 0;
 }
 
 static inline void GesherHostDrawButton(const DRAWITEMSTRUCT* item,
@@ -97,6 +132,10 @@ static inline void GesherHostDrawButton(const DRAWITEMSTRUCT* item,
   BOOL primary = item->CtlID == IDOK;
   BOOL disabled = (item->itemState & ODS_DISABLED) != 0;
   BOOL pressed = (item->itemState & ODS_SELECTED) != 0;
+  /* The focused button is what Enter activates (see DM_GETDEFID below), so mark
+   * it even before keyboard cues are shown. */
+  BOOL focused = (item->itemState & ODS_FOCUS) != 0;
+  int dpi = GesherHostDpi(item->hwndItem, item->hDC);
   COLORREF fill, border, ink;
   if (theme->high_contrast) {
     fill = GetSysColor(primary && !disabled ? COLOR_HIGHLIGHT : COLOR_BTNFACE);
@@ -107,17 +146,21 @@ static inline void GesherHostDrawButton(const DRAWITEMSTRUCT* item,
     fill = disabled ? RGB(242, 244, 247)
         : primary ? (pressed ? RGB(23, 92, 211) : RGB(21, 112, 239))
                   : (pressed ? RGB(242, 244, 247) : RGB(255, 255, 255));
-    border = primary && !disabled ? fill : RGB(208, 213, 221);
+    border = primary && !disabled ? fill
+        : focused && !disabled ? GesherHostAccentColor(theme) : RGB(208, 213, 221);
     ink = disabled ? RGB(152, 162, 179)
         : primary ? RGB(255, 255, 255) : RGB(52, 64, 84);
   }
+  /* Paint the corners outside the rounded shape with the dialog surface. */
+  FillRect(item->hDC, &item->rcItem, GesherHostSurface(theme));
   HBRUSH brush = CreateSolidBrush(fill);
-  HPEN pen = CreatePen(PS_SOLID, 1, border);
+  HPEN pen = CreatePen(PS_INSIDEFRAME,
+      MulDiv(focused && !primary && !disabled && !theme->high_contrast ? 2 : 1, dpi, 96), border);
   if (brush != NULL && pen != NULL) {
     HGDIOBJ old_brush = SelectObject(item->hDC, brush);
     HGDIOBJ old_pen = SelectObject(item->hDC, pen);
     RECT bounds = item->rcItem;
-    int radius = MulDiv(12, GetDeviceCaps(item->hDC, LOGPIXELSX), 96);
+    int radius = MulDiv(12, dpi, 96);
     RoundRect(item->hDC, bounds.left, bounds.top, bounds.right, bounds.bottom, radius, radius);
     SelectObject(item->hDC, old_brush);
     SelectObject(item->hDC, old_pen);
@@ -125,7 +168,7 @@ static inline void GesherHostDrawButton(const DRAWITEMSTRUCT* item,
   if (brush != NULL) DeleteObject(brush);
   if (pen != NULL) DeleteObject(pen);
   RECT label = item->rcItem;
-  InflateRect(&label, -5, -2);
+  InflateRect(&label, -MulDiv(5, dpi, 96), -MulDiv(2, dpi, 96));
   WCHAR text[256] = {0};
   GetWindowTextW(item->hwndItem, text, sizeof(text) / sizeof(text[0]));
   SetBkMode(item->hDC, TRANSPARENT);
@@ -134,16 +177,16 @@ static inline void GesherHostDrawButton(const DRAWITEMSTRUCT* item,
   if ((GetWindowLongPtrW(GetParent(item->hwndItem), GWL_EXSTYLE) & WS_EX_RTLREADING) != 0)
     flags |= DT_RTLREADING;
   DrawTextW(item->hDC, text, -1, &label, flags);
-  if ((item->itemState & ODS_FOCUS) != 0) {
+  if (focused && (item->itemState & ODS_NOFOCUSRECT) == 0) {
     RECT focus = item->rcItem;
-    InflateRect(&focus, -4, -4);
+    InflateRect(&focus, -MulDiv(4, dpi, 96), -MulDiv(4, dpi, 96));
     DrawFocusRect(item->hDC, &focus);
   }
 }
 
 /* Use only for the host's stock, owner-drawn buttons; Windows still provides
- * keyboard and UIA button behavior (including BM_CLICK and dialog mnemonics). */
-static inline INT_PTR GesherHostThemeEvent(HWND dialog, const GesherHostTheme* theme,
+ * keyboard and UIA button behavior (Space, BM_CLICK and, via DM_GETDEFID, Enter). */
+static inline INT_PTR GesherHostThemeEvent(HWND dialog, GesherHostTheme* theme,
                                            UINT message, WPARAM wparam, LPARAM lparam,
                                            int brand_id) {
   if (message == DM_GETDEFID) {
@@ -151,9 +194,7 @@ static inline INT_PTR GesherHostThemeEvent(HWND dialog, const GesherHostTheme* t
      * button on focus. Keep that for owner-drawn buttons: Enter activates the
      * focused button; elsewhere it uses the dialog's own (safe) default. */
     HWND focus = GetFocus();
-    WCHAR klass[8];
-    if (focus != NULL && GetParent(focus) == dialog
-        && GetClassNameW(focus, klass, 8) && lstrcmpiW(klass, L"Button") == 0
+    if (focus != NULL && GetParent(focus) == dialog && GesherHostIsClass(focus, L"Button")
         && (GetWindowLongW(focus, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW
         && IsWindowEnabled(focus)) {
       SetWindowLongPtrW(dialog, DWLP_MSGRESULT,
@@ -162,17 +203,25 @@ static inline INT_PTR GesherHostThemeEvent(HWND dialog, const GesherHostTheme* t
     }
     return FALSE;
   }
-  if (message == WM_ERASEBKGND) {
-    RECT client;
-    GetClientRect(dialog, &client);
-    FillRect((HDC)wparam, &client, GesherHostSurface(theme));
-    return TRUE;
+  if (message == WM_DPICHANGED) {
+    PostMessageW(dialog, GESHER_HOST_REFONT, 0, 0);
+    return FALSE; /* Let the dialog manager rescale the dialog and its layout. */
+  }
+  if (message == WM_SYSCOLORCHANGE
+      || (message == WM_SETTINGCHANGE && wparam == SPI_SETHIGHCONTRAST)) {
+    /* Follow a high-contrast switch while the dialog is open. */
+    GesherHostThemeDispose(theme);
+    GesherHostThemeInit(theme, dialog);
+    InvalidateRect(dialog, NULL, TRUE);
+    return FALSE;
   }
   if (message == WM_CTLCOLORDLG || message == WM_CTLCOLORSTATIC
       || message == WM_CTLCOLOREDIT || message == WM_CTLCOLORLISTBOX
       || message == WM_CTLCOLORBTN) {
     HDC dc = (HDC)wparam;
-    BOOL input = message == WM_CTLCOLOREDIT || message == WM_CTLCOLORLISTBOX;
+    /* Read-only EDITs ask with WM_CTLCOLORSTATIC; they are still input surfaces. */
+    BOOL input = message == WM_CTLCOLOREDIT || message == WM_CTLCOLORLISTBOX
+        || (message == WM_CTLCOLORSTATIC && GesherHostIsClass((HWND)lparam, L"Edit"));
     SetTextColor(dc, message == WM_CTLCOLORSTATIC
         && GetDlgCtrlID((HWND)lparam) == brand_id
         ? GesherHostAccentColor(theme) : GesherHostTextColor(theme));
@@ -253,10 +302,28 @@ static inline INT_PTR CALLBACK GesherHostPromptProc(HWND dialog, UINT message,
     if (copy == NULL) { EndDialog(dialog, IDCANCEL); return FALSE; }
     HWND heading = GesherHostControl(dialog, reading, L"STATIC", state->title,
         align, GESHER_HOST_MESSAGE_HEADING, 16, 14, 300, 24);
-    HWND details = GesherHostControl(dialog, reading, L"EDIT", copy,
-        ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER
-        | WS_TABSTOP | (state->rtl ? ES_RIGHT : ES_LEFT),
-        GESHER_HOST_MESSAGE_TEXT, 16, 44, 300, 124);
+    /* Text that fits is ordinary dialog text, which screen readers announce
+     * with the dialog like a message box; longer text gets a scrolling,
+     * selectable read-only box instead of overflowing. */
+    RECT area = {16, 44, 316, 168};
+    BOOL fits = FALSE;
+    HDC dc = MapDialogRect(dialog, &area) ? GetDC(dialog) : NULL;
+    if (dc != NULL) {
+      HGDIOBJ old_font = SelectObject(dc, (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0));
+      RECT need = {0, 0, area.right - area.left, 0};
+      DrawTextW(dc, copy, -1, &need, DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL
+                | DT_NOPREFIX | (state->rtl ? DT_RTLREADING : 0));
+      fits = need.right <= area.right - area.left && need.bottom <= area.bottom - area.top;
+      SelectObject(dc, old_font);
+      ReleaseDC(dialog, dc);
+    }
+    HWND details = fits
+        ? GesherHostControl(dialog, reading, L"STATIC", copy,
+            align | SS_NOPREFIX | SS_EDITCONTROL, GESHER_HOST_MESSAGE_TEXT, 16, 44, 300, 124)
+        : GesherHostControl(dialog, reading, L"EDIT", copy,
+            ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER
+            | WS_TABSTOP | (state->rtl ? ES_RIGHT : ES_LEFT),
+            GESHER_HOST_MESSAGE_TEXT, 16, 44, 300, 124);
     SecureZeroMemory(copy, (wcslen(copy) + 1) * sizeof(WCHAR));
     HeapFree(GetProcessHeap(), 0, copy);
     /* Create Deny first so Tab order follows the on-screen order. */
@@ -269,9 +336,7 @@ static inline INT_PTR CALLBACK GesherHostPromptProc(HWND dialog, UINT message,
       EndDialog(dialog, IDCANCEL);
       return FALSE;
     }
-    state->heading_font = GesherHostHeadingFont(dialog);
-    if (state->heading_font != NULL)
-      SendMessageW(heading, WM_SETFONT, (WPARAM)state->heading_font, TRUE);
+    GesherHostSetFont(heading, &state->heading_font, 145, FW_SEMIBOLD);
     SendMessageW(dialog, DM_SETDEFID, deny ? IDCANCEL : IDOK, 0);
     // A host prompt may originate on a background system-server thread. Request
     // the foreground once, but never keep the dialog permanently topmost.
@@ -287,6 +352,11 @@ static inline INT_PTR CALLBACK GesherHostPromptProc(HWND dialog, UINT message,
     if (state->heading_font != NULL) DeleteObject(state->heading_font);
     GesherHostThemeDispose(&state->theme);
     SetWindowLongPtrW(dialog, DWLP_USER, 0);
+    return TRUE;
+  }
+  if (message == GESHER_HOST_REFONT) {
+    GesherHostSetFont(GetDlgItem(dialog, GESHER_HOST_MESSAGE_HEADING),
+                      &state->heading_font, 145, FW_SEMIBOLD);
     return TRUE;
   }
   if (message == WM_CLOSE) { EndDialog(dialog, IDCANCEL); return TRUE; }

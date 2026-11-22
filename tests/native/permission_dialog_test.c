@@ -18,6 +18,11 @@ static enum GesherUiLanguage language;
 static WCHAR permissions[8193];
 static BOOL prompt_confirmation;
 static int prompt_action;
+static const WCHAR* prompt_message = L"com.example.app\r\nandroid.permission.CAMERA";
+static BOOL prompt_scrolls;
+static BOOL prompt_truncated;
+static WCHAR prompt_text[40002];
+static WCHAR huge_message[40001];
 
 static void Check(BOOL condition, const char* message) {
   ++checks;
@@ -106,14 +111,27 @@ static void CALLBACK InspectHostPrompt(HWND dialog, UINT message, UINT_PTR timer
       "initial prompt focus follows the safe default");
   Check((GetWindowLongW(accept, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW,
       "host prompt uses the shared modern action");
-  Check((GetWindowLongW(text, GWL_STYLE) & (ES_READONLY | ES_MULTILINE | WS_VSCROLL))
-      == (ES_READONLY | ES_MULTILINE | WS_VSCROLL), "host message is scrollable and read-only");
+  WCHAR klass[16] = {0};
+  GetClassNameW(text, klass, 16);
+  if (prompt_scrolls) {
+    Check(lstrcmpiW(klass, L"Edit") == 0
+        && (GetWindowLongW(text, GWL_STYLE) & (ES_READONLY | ES_MULTILINE | WS_VSCROLL))
+        == (ES_READONLY | ES_MULTILINE | WS_VSCROLL), "long host message is scrollable and read-only");
+  } else {
+    // Short text is plain dialog text (announced with the dialog), never a mnemonic.
+    Check(lstrcmpiW(klass, L"Static") == 0
+        && (GetWindowLongW(text, GWL_STYLE) & SS_NOPREFIX) != 0,
+        "short host message is static dialog text");
+  }
   Check(((GetWindowLongW(dialog, GWL_EXSTYLE) & WS_EX_RTLREADING) != 0)
       == GesherUiRtl(language), "host prompt title reading direction follows locale");
-  WCHAR buffer[128] = {0};
-  GetWindowTextW(text, buffer, 128);
-  Check(wcscmp(buffer, L"com.example.app\r\nandroid.permission.CAMERA") == 0,
-      "host prompt preserves its multiline content");
+  int length = GetWindowTextW(text, prompt_text, 40002);
+  if (prompt_truncated) {
+    Check(length == 32001 && wcsncmp(prompt_text, prompt_message, 32000) == 0
+        && prompt_text[32000] == 0x2026, "oversized host message is shown truncated, not dropped");
+  } else {
+    Check(wcscmp(prompt_text, prompt_message) == 0, "host prompt preserves its multiline content");
+  }
   if (prompt_action == ALLOW) {
     SendMessageW(accept, BM_CLICK, 0, 0);
   } else if (prompt_action == DENY) {
@@ -201,6 +219,22 @@ int main(void) {
       Check(accepted == (prompt_action == ALLOW), "information popup exits safely");
     }
   }
+  // A long launch failure scrolls; one beyond the EDIT limit is still presented.
+  prompt_confirmation = FALSE;
+  prompt_action = ALLOW;
+  phase = 0;
+  prompt_scrolls = TRUE;
+  prompt_message = permissions;
+  Check(GesherHostPrompt(GesherUiText(language, "brand"), prompt_message,
+      GesherUiText(language, "cp_dialog_ok"), NULL, GesherUiRtl(language), NULL),
+      "long information popup is presented");
+  for (int i = 0; i < 40000; ++i) huge_message[i] = (i % 8 == 7) ? L' ' : L'a' + (i % 7);
+  huge_message[40000] = 0;
+  prompt_message = huge_message;
+  prompt_truncated = TRUE;
+  Check(GesherHostPrompt(GesherUiText(language, "brand"), prompt_message,
+      GesherUiText(language, "cp_dialog_ok"), NULL, GesherUiRtl(language), NULL),
+      "oversized information popup is presented");
   UnhookWindowsHookEx(hook);
   SetThreadDesktop(original);
   CloseDesktop(desktop);

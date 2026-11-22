@@ -2,7 +2,8 @@
 /* Included by account_crypto.c. Uses ordinary accessible Windows controls. */
 #include "../windows/host_dialog_theme.h"
 
-enum { PERMISSION_PACKAGE = 1101, PERMISSION_DETAILS = 1102, PERMISSION_BRAND = 1103 };
+enum { PERMISSION_PACKAGE = 1101, PERMISSION_DETAILS = 1102, PERMISSION_BRAND = 1103,
+       PERMISSION_HEADING = 1104 };
 
 typedef struct {
   enum GesherUiLanguage language;
@@ -27,14 +28,6 @@ static HWND PermissionControl(HWND dialog, DWORD extra, const WCHAR* klass,
   return control;
 }
 
-static HFONT PermissionFont(HWND dialog, int scale, LONG weight) {
-  LOGFONTW font;
-  if (GetObjectW((HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0), sizeof(font), &font) == 0) return NULL;
-  font.lfHeight = MulDiv(font.lfHeight, scale, 100);
-  font.lfWeight = weight;
-  return CreateFontIndirectW(&font);
-}
-
 static INT_PTR CALLBACK PermissionDialogProc(HWND dialog, UINT message, WPARAM wparam, LPARAM lparam) {
   PermissionDialogState* state = (PermissionDialogState*)GetWindowLongPtrW(dialog, DWLP_USER);
   if (message == WM_INITDIALOG) {
@@ -49,7 +42,7 @@ static INT_PTR CALLBACK PermissionDialogProc(HWND dialog, UINT message, WPARAM w
     HWND brand = PermissionControl(dialog, reading, L"STATIC", GesherUiText(state->language, "brand"),
         alignment, PERMISSION_BRAND, 16, 10, 218, 14);
     HWND heading = PermissionControl(dialog, reading, L"STATIC", GesherUiText(state->language, "permission_heading"),
-        alignment, -1, 16, 28, 218, 24);
+        alignment, PERMISSION_HEADING, 16, 28, 218, 24);
     HWND app = PermissionControl(dialog, reading, L"STATIC", GesherUiText(state->language, "permission_app"),
         alignment, -1, 16, 58, 218, 14);
     // The authenticated package ID has its own LTR control, without bidi isolates.
@@ -69,10 +62,8 @@ static INT_PTR CALLBACK PermissionDialogProc(HWND dialog, UINT message, WPARAM w
       EndDialog(dialog, IDCANCEL);
       return FALSE;
     }
-    state->heading_font = PermissionFont(dialog, 145, FW_SEMIBOLD);
-    state->brand_font = PermissionFont(dialog, 110, FW_BOLD);
-    if (state->heading_font) SendMessageW(heading, WM_SETFONT, (WPARAM)state->heading_font, FALSE);
-    if (state->brand_font) SendMessageW(brand, WM_SETFONT, (WPARAM)state->brand_font, FALSE);
+    GesherHostSetFont(heading, &state->heading_font, 145, FW_SEMIBOLD);
+    GesherHostSetFont(brand, &state->brand_font, 110, FW_BOLD);
     SendMessageW(dialog, DM_SETDEFID, IDCANCEL, 0);
     // Request foreground once; never keep the consent window permanently topmost.
     if (!SetForegroundWindow(dialog)) {
@@ -83,6 +74,11 @@ static INT_PTR CALLBACK PermissionDialogProc(HWND dialog, UINT message, WPARAM w
     return FALSE;
   }
   if (state == NULL) return FALSE;
+  if (message == GESHER_HOST_REFONT) {
+    GesherHostSetFont(GetDlgItem(dialog, PERMISSION_HEADING), &state->heading_font, 145, FW_SEMIBOLD);
+    GesherHostSetFont(GetDlgItem(dialog, PERMISSION_BRAND), &state->brand_font, 110, FW_BOLD);
+    return TRUE;
+  }
   if (message == WM_CLOSE) { EndDialog(dialog, IDCANCEL); return TRUE; }
   if (message == WM_COMMAND) {
     int command = LOWORD(wparam);

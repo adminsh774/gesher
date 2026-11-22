@@ -546,10 +546,8 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     GetClientRect(hwnd, &client);
     // Match the Control Center's light surface and semantic text hierarchy.
     const bool high_contrast = GesherHostHighContrast() != FALSE;
-    HBRUSH surface = high_contrast ? GetSysColorBrush(COLOR_WINDOW)
-        : CreateSolidBrush(RGB(255, 255, 255));
-    FillRect(dc, &client, surface);
-    if (!high_contrast && surface != nullptr) DeleteObject(surface);
+    FillRect(dc, &client, high_contrast ? GetSysColorBrush(COLOR_WINDOW)
+        : static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
     const int w = client.right, h = client.bottom;
     const int size = std::min(kIconSize, w / 2);
     const int top = std::max(16, h * 2 / 5 - size / 2);
