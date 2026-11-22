@@ -23,7 +23,8 @@ typedef struct {
 } GesherHostTheme;
 
 static inline BOOL GesherHostHighContrast(void) {
-  HIGHCONTRASTW contrast = {0};
+  HIGHCONTRASTW contrast;
+  ZeroMemory(&contrast, sizeof(contrast));
   contrast.cbSize = sizeof(contrast);
   return SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0)
       && (contrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
@@ -79,7 +80,8 @@ static inline HBRUSH GesherHostInput(const GesherHostTheme* theme) {
 }
 
 static inline HFONT GesherHostHeadingFont(HWND window) {
-  LOGFONTW font = {0};
+  LOGFONTW font;
+  ZeroMemory(&font, sizeof(font));
   HFONT original = (HFONT)SendMessageW(window, WM_GETFONT, 0, 0);
   if (original == NULL || GetObjectW(original, sizeof(font), &font) == 0) return NULL;
   font.lfHeight = MulDiv(font.lfHeight, 145, 100);
@@ -280,7 +282,8 @@ static inline BOOL GesherHostPrompt(const WCHAR* title, const WCHAR* message,
                                      const WCHAR* positive, const WCHAR* negative,
                                      BOOL rtl, HWND owner) {
   if (title == NULL || message == NULL || positive == NULL) return FALSE;
-  GesherHostPromptState state = {0};
+  GesherHostPromptState state;
+  ZeroMemory(&state, sizeof(state));
   state.title = title;
   state.message = message;
   state.positive = positive;
