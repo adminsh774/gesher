@@ -2,6 +2,9 @@
 // Linux adapts only the Win32/storage boundary; its timing is not Windows I/O.
 #include <gesher/logging.h>
 #include <gesher/system_properties.h>
+#if LOGGING_HAS_ENVIRONMENT_OWNER
+#include <gesher/environment.h>
+#endif
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
@@ -9,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <filesystem>
 #include <map>
 #include <new>
@@ -204,6 +208,26 @@ void Records(const std::wstring& path) {
   Check(DeleteFileW(archive.c_str()), "archive cleanup");
 }
 #ifdef _WIN32
+#if LOGGING_HAS_ENVIRONMENT_OWNER
+bool OwnerMatchesNative(const char* name, const wchar_t* wide_name) {
+  const char* owned = gesher::GetEnvironment(name);
+  if (!owned) return false;
+  wchar_t native[32768];
+  DWORD length = GetEnvironmentVariableW(wide_name, native, 32768);
+  if (!length || length >= 32768) return false;
+  std::wstring decoded(length + 1, L'\0');
+  int converted = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, owned, -1,
+                                    decoded.data(), static_cast<int>(decoded.size()));
+  return converted == static_cast<int>(length + 1) &&
+         std::wmemcmp(decoded.data(), native, length + 1) == 0;
+}
+void PropertyEnvironmentOwner() {
+  Check(OwnerMatchesNative("GESHER_PROPERTY_ROOT", L"GESHER_PROPERTY_ROOT"),
+        "shared POSIX owner exposes the actual inherited property root");
+  Check(OwnerMatchesNative("GESHER_PROPERTY_ROOT_SESSION", L"GESHER_PROPERTY_ROOT_SESSION"),
+        "shared POSIX owner exposes the actual inherited property session");
+}
+#endif
 bool Child(const wchar_t* argument, DWORD expected = 0) {
   wchar_t executable[32768];
   DWORD length = GetModuleFileNameW(nullptr, executable, 32768);
@@ -236,6 +260,9 @@ void WindowsIdentity(const std::wstring& session) {
   Check(!gesher::logging::IsLoggable(3, "child", 5, 4, 1), "warm restored original area before damaging its inherited root");
   Check(SetEnvironmentVariableW(L"GESHER_PROPERTY_ROOT", L"incorrect-inherited-root"), "damage inherited root binding");
   Check(gesher::logging::IsLoggable(6, "child", 5, 4, 1), "cache lookup repairs inherited root binding");
+#if LOGGING_HAS_ENVIRONMENT_OWNER
+  PropertyEnvironmentOwner();
+#endif
   Check(Child(L"--publish-repaired-root"), "child publishes a distinct priority after inherited root repair");
   std::string repaired;
   Check(gesher::properties::Get("log.tag.child", &repaired) && repaired == "V",
@@ -313,6 +340,9 @@ int main(int argc, char** argv) {
   measure_only = argc == 2 && std::strcmp(argv[1], "--measure-only") == 0;
   Check(SetEnvironmentVariableW(L"GESHER_LOG_FILE", path.c_str()), "configure destination");
   Check(gesher::properties::Initialize(), "initialize property area");
+#if LOGGING_HAS_ENVIRONMENT_OWNER
+  PropertyEnvironmentOwner();
+#endif
   Priorities(); Records(path);
 #ifdef _WIN32
   WindowsIdentity(session);
