@@ -41,7 +41,11 @@ static void CALLBACK Inspect(HWND dialog, UINT message, UINT_PTR timer, DWORD ti
       "Deny button uses the shared modern host presentation");
   Check((GetWindowLongW(allow, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW,
       "Allow button uses the shared modern host presentation");
-  Check((GetWindowLongW(package, GWL_STYLE) & WS_BORDER) != 0,
+  /* A single-line EDIT drops WS_BORDER from its style and draws the frame inside
+   * its client area; the frame shows up as an inset of the formatting rectangle. */
+  RECT package_text = {0};
+  SendMessageW(package, EM_GETRECT, 0, (LPARAM)&package_text);
+  Check(package_text.top >= GetSystemMetrics(SM_CYBORDER),
       "package identifier has a bounded read-only surface");
   Check(GetFocus() == deny, "initial focus is Deny");
   Check(LOWORD(SendMessageW(dialog, DM_GETDEFID, 0, 0)) == IDCANCEL, "default action is Deny");

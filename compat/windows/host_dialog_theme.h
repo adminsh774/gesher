@@ -144,6 +144,22 @@ static inline void GesherHostDrawButton(const DRAWITEMSTRUCT* item,
 static inline INT_PTR GesherHostThemeEvent(HWND dialog, const GesherHostTheme* theme,
                                            UINT message, WPARAM wparam, LPARAM lparam,
                                            int brand_id) {
+  if (message == DM_GETDEFID) {
+    /* The dialog manager only promotes BS_PUSHBUTTON controls to the default
+     * button on focus. Keep that for owner-drawn buttons: Enter activates the
+     * focused button; elsewhere it uses the dialog's own (safe) default. */
+    HWND focus = GetFocus();
+    WCHAR klass[8];
+    if (focus != NULL && GetParent(focus) == dialog
+        && GetClassNameW(focus, klass, 8) && lstrcmpiW(klass, L"Button") == 0
+        && (GetWindowLongW(focus, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW
+        && IsWindowEnabled(focus)) {
+      SetWindowLongPtrW(dialog, DWLP_MSGRESULT,
+                        MAKELONG(GetDlgCtrlID(focus), DC_HASDEFID));
+      return TRUE;
+    }
+    return FALSE;
+  }
   if (message == WM_ERASEBKGND) {
     RECT client;
     GetClientRect(dialog, &client);
