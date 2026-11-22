@@ -307,6 +307,9 @@ jobs:
       - name: MediaPlayer PCM priming and playback lifecycle contracts
         run: python3 tools/test_media_player_priming.py --sanitize
 
+      - name: JNI GetEnv rejects unbridged interfaces before host allocation
+        run: python3 tools/test_jni_getenv_boundary.py --sanitize
+
       - name: JNI and mixer allocation bounds and surface image-cache lifetime
         run: |
           python3 tools/test_symbol_lookup_allocations.py
