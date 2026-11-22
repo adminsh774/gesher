@@ -3,12 +3,15 @@
 
 Pass freshly built app classes. This does not replace the Windows/ART Binder
 fixture in 94-framework-fixes.ps1 or claim native application execution.
+Native sensor policy is checked through the same authenticated caller and UID
+activity/foreground-service contracts after the original AppOps checks.
 """
 import argparse
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +50,16 @@ def main():
         subprocess.run([str(args.java_home / "bin/java"), "-XX:-UsePerfData", "--patch-module",
                         "jdk.unsupported=" + str(work / "cleaner"), "-cp", str(classes) + os.pathsep + classpath,
                         "AppOpsHost", str(library)], env=env, check=True, timeout=75)
+
+    # The immutable framework recipe invokes this checked-out contract driver
+    # with the freshly built app classes. Keep sensor identity/lifecycle checks
+    # reachable there without changing the trusted recipe or rebuilding Java.
+    sensor_args = []
+    for name in ("java-home", "framework-classes", "core-classes", "app-classes", "apksig"):
+        sensor_args.extend(["--" + name, str(getattr(args, name.replace("-", "_")))])
+    print("AppOps contracts: checking authenticated native sensor policy and lifecycle", flush=True)
+    subprocess.run([sys.executable, str(ROOT / "tools/test_sensor_access.py"), *sensor_args],
+                   check=True)
 
 
 if __name__ == "__main__":

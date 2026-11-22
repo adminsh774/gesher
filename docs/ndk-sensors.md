@@ -90,8 +90,11 @@ sampler, including the new on-change reactivation rule. Existing Java-style
 sinks retain their default epoch. `tools/test_sensor_access.py` exercises the
 actual server policy and native atomics, with optional full server/client host
 checks described in [the sensor policy test notes](../tests/sensors/README.md).
-CI selects those full checks in the framework job using the app classes it
-already builds. The native2 job also runs `tools/test_sensor_access_jni.py`
+The immutable framework CI recipe already invokes the checked-out
+`tools/test_appops.py` with the app classes it builds. That driver preserves its
+original checks, then runs the full sensor policy suite with the same five
+inputs; any child failure fails the existing framework gate. This does not rely
+on editing the pinned reusable workflow. The native2 job also runs `tools/test_sensor_access_jni.py`
 against a real host JVM and the authenticated NDK's JNI header, checking native
 thread attachment ownership, pending exceptions and a missing runtime class.
 
