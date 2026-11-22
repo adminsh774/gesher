@@ -32,11 +32,11 @@ static void CALLBACK Inspect(HWND dialog, UINT message, UINT_PTR timer, DWORD ti
   }
   HWND package = GetDlgItem(dialog, PERMISSION_PACKAGE);
   HWND details = GetDlgItem(dialog, PERMISSION_DETAILS);
-  HWND deny = GetDlgItem(dialog, IDCANCEL);
+  HWND deny = GetDlgItem(dialog, IDNO);
   HWND allow = GetDlgItem(dialog, IDYES);
   Check(package && details && deny && allow, "all interactive controls exist");
   Check(GetFocus() == deny, "initial focus is Deny");
-  Check(LOWORD(SendMessageW(dialog, DM_GETDEFID, 0, 0)) == IDCANCEL, "default action is Deny");
+  Check(LOWORD(SendMessageW(dialog, DM_GETDEFID, 0, 0)) == IDNO, "default action is Deny");
   Check((GetWindowLongW(package, GWL_EXSTYLE) & (WS_EX_RTLREADING | WS_EX_LAYOUTRTL)) == 0,
       "package identifier stays LTR in both locales");
   Check((GetWindowLongW(package, GWL_STYLE) & ES_READONLY) != 0, "package is read-only");
@@ -61,7 +61,7 @@ static void CALLBACK Inspect(HWND dialog, UINT message, UINT_PTR timer, DWORD ti
   MapWindowPoints(NULL, dialog, (POINT*)&bounds, 2);
   Check(bounds.right <= client.right && bounds.bottom <= client.bottom, "Allow fits inside dialog");
   if (action == DENY || action == ALLOW) {
-    SendMessageW(GetDlgItem(dialog, action == ALLOW ? IDYES : IDCANCEL), BM_CLICK, 0, 0);
+    SendMessageW(GetDlgItem(dialog, action == ALLOW ? IDYES : IDNO), BM_CLICK, 0, 0);
   } else if (action == CLOSE) {
     PostMessageW(dialog, WM_CLOSE, 0, 0);
   } else if (action == TAB_ALLOW) {
@@ -113,9 +113,11 @@ int main(void) {
     }
     for (action = DENY; action <= TAB_ALLOW; ++action) {
       phase = 0;
-      BOOL allowed = PermissionDialog(language, L"com.ideomobile.mercantile", permissions);
-      Check(allowed == (action == ALLOW || action == TAB_ALLOW), "only explicit Allow grants consent");
-      printf("scenario: locale=%s action=%d result=%d\n", locale ? "he" : "en", action, allowed);
+      int decision = PermissionDialog(language, L"com.ideomobile.mercantile", permissions);
+      int expected = action == ALLOW || action == TAB_ALLOW ? PERMISSION_ALLOWED
+          : action == DENY || action == ENTER ? PERMISSION_DENIED : PERMISSION_DISMISSED;
+      Check(decision == expected, "only explicit buttons record a permission decision");
+      printf("scenario: locale=%s action=%d result=%d\n", locale ? "he" : "en", action, decision);
     }
   }
   UnhookWindowsHookEx(hook);

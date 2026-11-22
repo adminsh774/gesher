@@ -402,6 +402,14 @@ Check 'services: AppOps defaults, authority, attributed delivery, foreground lif
   $appOpsOut
 } @('AppOpsContractTest all passed: 482 checks; binder=true')
 
+$permissionStateOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'RuntimePermissionStateTest') 90
+$permissionStateCode = $LASTEXITCODE
+Check 'services: runtime permission denial, rationale, fixed retry policy and owner lifetime' {
+  $global:LASTEXITCODE = $permissionStateCode
+  $permissionStateOut
+} @('RuntimePermissionStateTest all passed:', ' checks; binder=true')
+
 $uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'PackageUidIsolationContractTest' +
   (NoDrive (Join-Path $PSScriptRoot '../../dex-services/fixtures/v2only.apk'))) 90
