@@ -239,6 +239,9 @@ jobs:
           python3 -m unittest discover -s tools/tests -p test_sdk_resource_attrs_diff.py
           python3 tools/fonts/test-standalone-link.py
 
+      - name: Notification image staging, cache, cancellation and encoder ownership
+        run: python3 tools/test_notification_images.py
+
       - name: Native allocation, directory, semaphore, file-lock and socket-control contracts
         run: |
           python3 tools/test_hwui_renderer_policy.py --sanitize

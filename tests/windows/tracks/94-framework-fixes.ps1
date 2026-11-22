@@ -309,8 +309,25 @@ Check 'services: authenticated notification delegation, revocation and retained 
   $delegationOut
 } @('NotificationDelegationTest all passed:')
 
-# The format fixture calls package-private production storage methods. Put this
-# test DEX on this VM's boot path, using a fresh profile and no application UI.
+# The image fixtures call package-private owners, so load the test DEX beside
+# the production services on the boot path. Each VM creates its own data child.
+$imageBoot = $bcpFixes + ':' + (NoDrive "$Dir/services-tests.dex")
+$imageArgs = @("-Xbootclasspath:$imageBoot", "-Ximage:$(NoDrive "$root/system")/framework/boot.art", '-Xint', '-Xusejit:false')
+$imagePublicationOut = FixesRun ($imageArgs + 'com.gesher.server.NotificationImagePublicationTest') 90
+$imagePublicationCode = $LASTEXITCODE
+Check 'services: notification image preparation progress, cancellation and replacement fencing' {
+  $global:LASTEXITCODE = $imagePublicationCode
+  $imagePublicationOut
+} @('NotificationImagePublicationTest passed:')
+$imageBitmapOut = FixesRun ($imageArgs + 'com.gesher.server.NotificationImageBitmapTest') 120
+$imageBitmapCode = $LASTEXITCODE
+Check 'services: actual Bitmap PNG fidelity, mutable source invalidation and content reuse' {
+  $global:LASTEXITCODE = $imageBitmapCode
+  $imageBitmapOut
+} @('NotificationImageBitmapTest passed:', 'NOTIFICATION_IMAGE_BITMAP_METRICS')
+
+# The identity/format fixtures call package-private production storage methods.
+# Keep the shared profile across two VMs to verify persisted records and PNGs.
 $formatData = Join-Path $root 'notification-format-data'
 New-Item -ItemType Directory -Path $formatData -Force | Out-Null
 $formatSavedData = $env:ANDROID_DATA
@@ -320,14 +337,15 @@ try {
   $env:GESHER_MICROG_SPOOF = '0'
   $formatBoot = $bcpFixes + ':' + (NoDrive "$Dir/services-tests.dex")
   $formatArgs = @("-Xbootclasspath:$formatBoot", "-Ximage:$(NoDrive "$root/system")/framework/boot.art", '-Xint', '-Xusejit:false',
-    'com.gesher.server.NotificationStoreFormatRunner')
+    'com.gesher.server.NotificationIdentityDevice')
   foreach ($formatPhase in @('write', 'read')) {
     $formatOut = FixesRun ($formatArgs + $formatPhase) 90
     $formatCode = $LASTEXITCODE
-    Check "services: native Parcel notification formats and restart migration ($formatPhase)" {
+    Check "services: native notification formats, toast identity and image restart retention ($formatPhase)" {
       $global:LASTEXITCODE = $formatCode
       $formatOut
-    } @("NotificationStoreFormatDevice $formatPhase passed:")
+    } @("NotificationIdentityDevice $formatPhase passed:", "ToastIdentityDevice $formatPhase passed:",
+      "NotificationStoreFormatDevice $formatPhase passed:")
   }
 } finally {
   if ($null -eq $formatSavedData) { Remove-Item Env:ANDROID_DATA -ErrorAction SilentlyContinue }
