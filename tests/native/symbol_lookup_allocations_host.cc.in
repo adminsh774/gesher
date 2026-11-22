@@ -40,8 +40,39 @@ static void Check(bool ok) {
   }
 }
 
+#ifdef GESHER_TEST_GL_OWNERSHIP
+static void CheckGlOwnership() {
+  // Synthetic names and masks are inputs to the real registration body. No
+  // fixture implementation substitutes for aggregate or per-provider writes.
+  int first = 1, second = 2;
+  const char* owners[] = {"libEGL.so", "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so"};
+  for (unsigned mask = 0; mask < 16; ++mask) {
+    const std::string name = "allocation_fixture_gl_symbol_with_owner_mask_" + std::to_string(mask);
+    for (void* address : {static_cast<void*>(&first), static_cast<void*>(&second)}) {
+      std::string mutable_name = name;
+      gesher::bionic::gl::AddGlSymbol(mutable_name.c_str(), address, mask);
+      mutable_name[0] = 'x';
+      Check(LookupBionicSymbol(name.c_str()) == address);
+      Check(LookupBionicSymbol(mutable_name.c_str()) == nullptr);
+      Check(gesher::bionic::LookupBionicSymbol(name.c_str()) == address);
+      for (unsigned owner = 0; owner < 4; ++owner) {
+        Check(gesher::bionic::LookupOwnedSymbol(owners[owner], name.c_str()) ==
+              ((mask & (1u << owner)) ? address : nullptr));
+        Check(gesher::bionic::LookupOwnedSymbol(owners[owner], mutable_name.c_str()) == nullptr);
+      }
+    }
+  }
+  Check(LookupBionicSymbol(nullptr) == nullptr);
+  Check(gesher::bionic::LookupOwnedSymbol("unregistered_fixture_provider.so", "short") == nullptr);
+  Check(gesher::bionic::Registry().libraries.count("unregistered_fixture_provider.so") == 0);
+}
+#endif
+
 int main(int argc, char** argv) {
   const bool enforce = argc < 2 || std::strcmp(argv[1], "measure") != 0;
+#ifdef GESHER_TEST_GL_OWNERSHIP
+  CheckGlOwnership();
+#endif
   int first = 1, second = 2;
   char owned[] = "a_symbol_with_a_name_longer_than_small_string_storage";
   const std::string original(owned);

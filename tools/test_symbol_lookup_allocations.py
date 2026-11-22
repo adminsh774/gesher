@@ -2,8 +2,10 @@
 """Exercise production bionic, EGL and ARM64 symbol registries and resolvers.
 
 The expensive Windows/ART/ANGLE bootstrap is replaced by initially empty tables.
-Lookup functions and table types come from production; EGL/ARM64 registration
-uses the same owned-key insertion but does not initialize ANGLE/the translator.
+Lookup functions and table types come from production. Current EGL registration
+calls the actual AddGlSymbol and Bionic registry implementations; ARM64 uses the
+same owned-key insertion without initializing the translator. This does not
+exercise native-buffer catalogue generation or an ANGLE backend.
 --source-ref and --measure reproduce the baseline with the same fixture.
 """
 from __future__ import annotations
@@ -55,6 +57,27 @@ def main() -> None:
             source = read("compat/bionic/egl_gles.cc")
             begin = source.index(" ByName() {")
             begin = source.rfind("\n", 0, begin) + 1
+            if "void AddGlSymbol(" in source:
+                # The measured table, proc lookup and registration are complete
+                # production bodies. The following native-buffer callback needs
+                # the generated GL catalogue and is covered by the separate GL
+                # provider gate, not by a fabricated catalogue in this fixture.
+                registration = section(source, source[begin:source.index("\n", begin)],
+                                       "void RegisterNativeBufferSymbol(")
+                owned_lookup = section(read("compat/bionic/shim.cc"),
+                                       "void* LookupOwnedSymbol(", "bool HasOwnedSymbols(")
+                return ("#define BIONIC_SYSV\n#define GESHER_TEST_GL_OWNERSHIP 1\n"
+                        "using __eglMustCastToProperFunctionPointerType = void(*)();\n"
+                        "namespace gesher::bionic {\n" + implementation("bionic") + owned_lookup +
+                        "namespace gl {\n" + registration + "\n}}\n"
+                        "auto& Table() { return gesher::bionic::gl::ByName(); }\n"
+                        "void* LookupBionicSymbol(const char* name) { return reinterpret_cast<void*>("
+                        "gesher::bionic::gl::EglGetProcAddress(name)); }\n"
+                        "void AddBionicSymbol(const char* name, void* value) { "
+                        "gesher::bionic::gl::AddGlSymbol(name, value, 0); }\n")
+            if not args.source_ref:
+                raise ValueError("current EGL production registration boundary changed")
+            # Explicit historical source comparisons predate provider ownership.
             end = source.index("void Register() {", begin)
             return ("#define BIONIC_SYSV\nusing __eglMustCastToProperFunctionPointerType = void(*)();\n" +
                     source[begin:end] + "\nauto& Table() { return ByName(); }\n" +
