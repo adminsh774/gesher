@@ -561,6 +561,13 @@ jobs:
             --app-classes out/app/gesher-app-classes.jar \
             --apksig "$RUNNER_TEMP/gesher-apksig.jar"
 
+      - name: Foreground service manifest permission admission contracts
+        run: |
+          python3 tools/test_foreground_service_admission.py --java-home "$JAVA_HOME" \
+            --framework-classes out/framework/classes --core-classes out/coremod \
+            --app-classes out/app/gesher-app-classes.jar \
+            --apksig "$RUNNER_TEMP/gesher-apksig.jar"
+
       - name: Android UI mode policy, persistence and activity configuration contracts
         run: |
           python3 tools/test_ui_mode_native.py

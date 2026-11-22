@@ -402,6 +402,16 @@ Check 'services: AppOps defaults, authority, attributed delivery, foreground lif
   $appOpsOut
 } @('AppOpsContractTest all passed: 482 checks; binder=true')
 
+# Production foreground-service permission/type admission through generated AM parcels.
+# Parsed APK metadata and the notification display sink are isolated fixture boundaries.
+$foregroundAdmissionOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
+  'ForegroundServiceAdmissionTest') 90
+$foregroundAdmissionCode = $LASTEXITCODE
+Check 'services: foreground-service manifest permission and type admission' {
+  $global:LASTEXITCODE = $foregroundAdmissionCode
+  $foregroundAdmissionOut
+} @('ForegroundServiceAdmissionTest all passed:', 'checks; binder=true')
+
 $uidIsolationOut = FixesRun ($dvmFixes + 'gesher.services.ServiceFixtureRunner' +
   'PackageUidIsolationContractTest' +
   (NoDrive (Join-Path $PSScriptRoot '../../dex-services/fixtures/v2only.apk'))) 90
