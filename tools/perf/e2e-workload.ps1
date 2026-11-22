@@ -19,20 +19,71 @@ $result = [ordered]@{
   events = @(); metrics = @{}; participants = @(); evidence = @{}
 }
 
-function WritePerfJson([string] $Name, $Value) {
+function InvokePerfFileIo([scriptblock] $Operation, [Diagnostics.Stopwatch] $Clock,
+                          [double] $TimeoutSeconds = 30) {
+  if (-not $Clock) { $Clock = [Diagnostics.Stopwatch]::StartNew() }
+  for ($attempt = 0; $attempt -lt 5; $attempt++) {
+    if ($Clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw 'Workload protocol exceeded its existing deadline' }
+    try { $value = & $Operation }
+    catch {
+      $cause = $_.Exception.GetBaseException()
+      $nativeCode = $cause.HResult -band 0xffff
+      # Access denied can be permanent. Retry only native Windows transport
+      # errors, at most four times; the final error remains a failed workload.
+      if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
+          ($cause -isnot [IO.IOException] -and $cause -isnot [UnauthorizedAccessException]) -or
+          $nativeCode -notin @(5, 32) -or $attempt -eq 4) { throw }
+      $remaining = $TimeoutSeconds - $Clock.Elapsed.TotalSeconds
+      if ($remaining -le 0) { throw 'Workload protocol exceeded its existing deadline' }
+      Start-Sleep -Milliseconds ([int][Math]::Min(10, [Math]::Floor($remaining * 1000)))
+      continue
+    }
+    if ($Clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw 'Workload protocol exceeded its existing deadline' }
+    return $value
+  }
+}
+
+function ReadPerfJson([string] $Path, [Diagnostics.Stopwatch] $Clock) {
+  if (-not $Clock) { $Clock = [Diagnostics.Stopwatch]::StartNew() }
+  $text = InvokePerfFileIo -Clock $Clock -Operation {
+    # Keep one complete file object open while allowing the peer to replace it.
+    # In-place writes are denied. This is separate from post-failure diagnostics.
+    $sharing = [IO.FileShare]::Read -bor [IO.FileShare]::Delete
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharing)
+    try {
+      if ($stream.Length -gt 4MB) { throw 'JSON input exceeds the 4 MiB evidence budget' }
+      $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false, $true), $true)
+      try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+  }
+  # Parsing errors are not retried or skipped as if no message had arrived.
+  $value = $text | ConvertFrom-Json
+  if ($Clock.Elapsed.TotalSeconds -ge 30) { throw 'Workload protocol exceeded its existing deadline' }
+  return $value
+}
+
+function WritePerfJson([string] $Name, $Value, [Diagnostics.Stopwatch] $Clock) {
   $path = Join-Path $OutDir $Name
   $temporary = "$path.tmp"
-  [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
-  Move-Item -LiteralPath $temporary -Destination $path -Force
+  $text = $Value | ConvertTo-Json -Depth 20
+  if ([Text.Encoding]::UTF8.GetByteCount($text) -gt 4MB) { throw 'JSON input exceeds the 4 MiB evidence budget' }
+  [IO.File]::WriteAllText($temporary, $text, [Text.UTF8Encoding]::new($false))
+  InvokePerfFileIo -Clock $Clock -Operation {
+    if ([IO.File]::Exists($path)) {
+      [IO.File]::Replace($temporary, $path, [NullString]::Value)
+    } else {
+      [IO.File]::Move($temporary, $path)
+    }
+  }
 }
 
 function MeasurementPhase([string] $Phase, $Participants = @()) {
-  WritePerfJson 'phase.json' @{ invocation_id = $invocation; phase = $Phase; participants = @($Participants) }
   $deadline = [Diagnostics.Stopwatch]::StartNew()
+  WritePerfJson 'phase.json' @{ invocation_id = $invocation; phase = $Phase; participants = @($Participants) } $deadline
   while ($deadline.Elapsed.TotalSeconds -lt 30) {
     $ackPath = Join-Path $OutDir 'ack.json'
     if (Test-Path -LiteralPath $ackPath) {
-      $ack = Get-Content -LiteralPath $ackPath -Raw | ConvertFrom-Json
+      $ack = ReadPerfJson $ackPath $deadline
       if ($ack.invocation_id -cne $invocation) { throw 'Measurement acknowledgement belongs to another invocation' }
       if ($ack.phase -eq $Phase) { return }
     }
@@ -44,13 +95,13 @@ function MeasurementPhase([string] $Phase, $Participants = @()) {
 $script:registrationSequence = 0
 function RegisterPerfParticipants($Participants) {
   $script:registrationSequence++
-  WritePerfJson 'participants.json' @{ invocation_id = $invocation; sequence = $script:registrationSequence;
-                                      participants = @($Participants) }
   $deadline = [Diagnostics.Stopwatch]::StartNew()
+  WritePerfJson 'participants.json' @{ invocation_id = $invocation; sequence = $script:registrationSequence;
+                                      participants = @($Participants) } $deadline
   while ($deadline.Elapsed.TotalSeconds -lt 30) {
     $ackPath = Join-Path $OutDir 'participants-ack.json'
     if (Test-Path -LiteralPath $ackPath) {
-      $ack = Get-Content -LiteralPath $ackPath -Raw | ConvertFrom-Json
+      $ack = ReadPerfJson $ackPath $deadline
       if ($ack.invocation_id -cne $invocation) { throw 'Participant acknowledgement belongs to another invocation' }
       if ($ack.sequence -eq $script:registrationSequence) {
         if ($ack.verified -isnot [bool] -or -not $ack.verified) { throw 'Participant ownership was not verified' }

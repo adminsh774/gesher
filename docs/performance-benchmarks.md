@@ -209,10 +209,25 @@ a fixture; it never supplies application performance evidence. On Linux,
 Windows resource metrics remain unavailable. Windows runs still use an owned
 Job Object even when collection is disabled.
 
+Each live mailbox (`phase.json`, `ack.json`, `participants.json`, and
+`participants-ack.json`) has one writer. Publish a complete temporary file and
+replace the mailbox; never update the visible JSON in place. Windows readers
+must share deletion/rename access while retaining their opened snapshot. The
+provided Python `protocol_io` helper and PowerShell adapter use native
+replacement for existing mailboxes, with no delete-then-move interval. They
+retry only native Windows access/sharing errors 5 and 32, at most five I/O
+attempts with four delays of up to 10 ms, inside the caller's original deadline.
+Persistent denial remains a failure; generic permission errors, malformed JSON,
+identity/phase/sequence mismatches and ownership failures are not recovered as
+successful transport. The message names and payload contracts are unchanged.
+Custom workload implementations must provide compatible file sharing, or fail
+closed if their transport cannot complete within the existing attempt deadline.
+
 Run portable contracts with:
 
 ```sh
 python tools/perf/test_contracts.py -v
+python tools/perf/test_protocol.py -v
 ```
 
 On Windows, also run `python tools/perf/test_windows.py -v`. These exercise real

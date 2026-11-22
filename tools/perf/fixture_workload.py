@@ -7,6 +7,8 @@ import subprocess
 import sys
 import time
 
+import protocol_io
+
 
 def write(path, value):
     temporary = path.with_suffix('.tmp')
@@ -20,12 +22,17 @@ def main():
     invocation = request['invocation_id']
 
     def phase(name):
-        write(output / 'phase.json', {'invocation_id': invocation, 'phase': name, 'participants': []})
         deadline = time.monotonic() + 10
+        protocol_io.write_json(output / 'phase.json', {'invocation_id': invocation, 'phase': name, 'participants': []},
+                               deadline=deadline)
         while time.monotonic() < deadline:
             ack = output / 'ack.json'
-            if ack.exists() and json.loads(ack.read_text())['phase'] == name:
-                return
+            if ack.exists():
+                message = protocol_io.read_json(ack, deadline=deadline)
+                if message.get('invocation_id') != invocation:
+                    raise ValueError('fixture acknowledgement invocation mismatch')
+                if message['phase'] == name:
+                    return
             time.sleep(.005)
         raise RuntimeError('fixture acknowledgement timeout')
 
@@ -58,12 +65,13 @@ while not (folder/'child-exit').exists():
         while not (output / 'child-identity.json').exists():
             if time.monotonic() > deadline: raise RuntimeError('child identity timeout')
             time.sleep(.005)
-        participants = [json.loads((output / 'child-identity.json').read_text())]
-        write(output / 'participants.json', {'invocation_id': invocation, 'sequence': 1, 'participants': participants})
+        participants = [protocol_io.read_json(output / 'child-identity.json', deadline=deadline)]
+        protocol_io.write_json(output / 'participants.json', {'invocation_id': invocation, 'sequence': 1,
+                               'participants': participants}, deadline=deadline)
         while True:
             ack_path = output / 'participants-ack.json'
             if ack_path.exists():
-                ack = json.loads(ack_path.read_text())
+                ack = protocol_io.read_json(ack_path, deadline=deadline)
                 if ack == {'invocation_id': invocation, 'sequence': 1, 'verified': True}: break
             if time.monotonic() > deadline: raise RuntimeError('child registration timeout')
             time.sleep(.005)

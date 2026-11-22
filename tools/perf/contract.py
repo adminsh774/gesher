@@ -19,13 +19,16 @@ def _pairs(pairs):
     return value
 
 
+def parse_json(text: str) -> Any:
+    def invalid(value):
+        raise ValueError(f"Nonfinite JSON value: {value}")
+    return json.loads(text, object_pairs_hook=_pairs, parse_constant=invalid)
+
+
 def read_json(path: Path) -> Any:
     if path.stat().st_size > 4 * 1024 * 1024:
         raise ValueError("JSON input exceeds the 4 MiB evidence budget")
-    def invalid(value):
-        raise ValueError(f"Nonfinite JSON value: {value}")
-    return json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=_pairs,
-                      parse_constant=invalid)
+    return parse_json(path.read_text(encoding="utf-8-sig"))
 
 
 def write_json(path: Path, value: Any) -> None:

@@ -24,6 +24,7 @@ import uuid
 
 from contract import (artifact, hash_file, integer, number, read_json,
                       schedule, summarize, validate_result, verify_artifacts, write_json)
+import protocol_io
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -245,6 +246,7 @@ def run_attempt(plan, variant, output, frozen, invocation):
     process = None
     samples = []
     started = time.monotonic()
+    deadline = started + measurement["timeout_seconds"]
     phase, measured_start, measured_end = None, None, None
     result = {"status": "failed", "metrics": {}, "problems": [], "collection": {}}
     collector_cpu_start = time.process_time()
@@ -273,7 +275,7 @@ def run_attempt(plan, variant, output, frozen, invocation):
                 raise TimeoutError("Workload exceeded its whole-attempt deadline (including preparation)")
             signal_path = output / "phase.json"
             if signal_path.exists():
-                signal_data = read_json(signal_path)
+                signal_data = protocol_io.read_json(signal_path, deadline=deadline)
                 if signal_data.get("invocation_id") != invocation:
                     raise ValueError("Measurement phase invocation mismatch")
                 wanted = signal_data.get("phase")
@@ -290,20 +292,23 @@ def run_attempt(plan, variant, output, frozen, invocation):
                     else:
                         raise ValueError("Invalid measurement phase order")
                     phase = wanted
-                    write_json(output / "ack.json", {"invocation_id": invocation, "phase": phase})
+                    protocol_io.write_json(output / "ack.json", {"invocation_id": invocation, "phase": phase},
+                                           deadline=deadline)
             registration_path = output / "participants.json"
             if registration_path.exists():
-                registered = register_participants(read_json(registration_path), invocation=invocation,
+                registered = register_participants(protocol_io.read_json(registration_path, deadline=deadline), invocation=invocation,
                     previous=registration, phase=phase, process=process)
                 if registered is not registration:
                     registration = registered
                     verified_registrations.append({"request": registration,
                         "verified_at_attempt_ms": (time.monotonic() - started) * 1000})
-                    write_json(output / "participants-ack.json", {"invocation_id": invocation,
-                        "sequence": registration["sequence"], "verified": True})
+                    protocol_io.write_json(output / "participants-ack.json", {"invocation_id": invocation,
+                        "sequence": registration["sequence"], "verified": True}, deadline=deadline)
             if phase == "start" and now - last_sample >= measurement["sample_interval_ms"] / 1000:
                 sample()
                 last_sample = time.monotonic()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Workload exceeded its whole-attempt deadline (including preparation)")
             code = process.poll()
             if code is not None:
                 result["exit_code"] = code
@@ -332,6 +337,8 @@ def run_attempt(plan, variant, output, frozen, invocation):
         result.update(status="passed", metrics=metrics, workload_result_sha256=hash_file(output / "result.json"),
                       measured_window_ms=measured_ms, preparation_ms=(measured_start - started) * 1000)
     except (OSError, ValueError, RuntimeError, TimeoutError, KeyError, TypeError) as error:
+        if isinstance(error, TimeoutError):
+            result["status"] = "timed_out"
         result["problems"].append(str(error))
     finally:
         result["collection"] = {"supported": os.name == "nt", "enabled": measurement["collect_resources"],
