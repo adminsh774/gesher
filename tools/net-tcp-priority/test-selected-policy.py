@@ -290,6 +290,36 @@ def preceding_logging_property_source():
   subprocess.run(['git','apply','--reverse','--unidiff-zero','--check','-'],input=patch,cwd=work,check=True,capture_output=True)
   subprocess.run(['git','apply','--reverse','--unidiff-zero','-'],input=patch,cwd=work,check=True,capture_output=True)
   return (work/path).read_bytes()
+# Bionic's independently reviewed memmem search changes only this include and
+# complete wrapper. Restore those exact bytes before applying the UNCHANGED
+# OFD qualification digest. Pin the new pure-search helper separately: no other
+# shim byte, supplier, fixture, deadline or runtime gate is exempted.
+MEMMEM_HEADER='compat/bionic/memmem_search.h'
+MEMMEM_HEADER_SHA256='ae673530674a38f0fc9a0752ef138c8f9d22a2ba08cdf29a0032f6a622f3cdf0'
+MEMMEM_REPLACEMENTS=(
+ (b'#include "extra_bionic.h"\n\n#include <gesher/bionic_shim.h>\n',
+  b'#include "extra_bionic.h"\n#include "memmem_search.h"\n\n#include <gesher/bionic_shim.h>\n'),
+ (b'''void* BIONIC_SYSV Memmem(const void* h, size_t hn, const void* n, size_t nn) {
+  if (nn == 0) return const_cast<void*>(h);
+  auto hp = static_cast<const uint8_t*>(h);
+  for (size_t i = 0; i + nn <= hn; ++i) {
+    if (std::memcmp(hp + i, n, nn) == 0) return const_cast<uint8_t*>(hp + i);
+  }
+  return nullptr;
+}
+''',
+  b'''void* BIONIC_SYSV Memmem(const void* h, size_t hn, const void* n, size_t nn) {
+  if (nn == 0) return const_cast<void*>(h);
+  return const_cast<void*>(search::FindBytes(h, hn, n, nn));
+}
+'''),
+)
+def preceding_memmem_source(actual):
+ assert hashlib.sha256((ROOT/MEMMEM_HEADER).read_bytes()).hexdigest()==MEMMEM_HEADER_SHA256,MEMMEM_HEADER
+ for before,after in MEMMEM_REPLACEMENTS:
+  assert actual.count(after)==1 and before not in actual,'exact reviewed memmem substitution changed'
+  actual=actual.replace(after,before,1)
+ return actual
 # Valid pipes can now fail a control operation explicitly. These two exact
 # non-socket dispatch substitutions are the only PollFdsImpl changes allowed;
 # normalize them before comparing every byte of the original native poll core.
@@ -320,6 +350,7 @@ def preceding_ofd_sources():
  assert [line.decode().split(' b/',1)[1] for line in patch.splitlines() if line.startswith(b'diff --git ')]==paths
  for path,digest in qualification['source_sha256'].items():
   source=preceding_logging_property_source() if path=='compat/posix/src/system_properties.cc' else (ROOT/path).read_bytes()
+  if path=='compat/bionic/shim.cc':source=preceding_memmem_source(source)
   assert hashlib.sha256(source).hexdigest()==digest,path
  with tempfile.TemporaryDirectory(prefix='gesher-ofd-qualification-') as temporary:
   work=Path(temporary)
@@ -518,6 +549,13 @@ def transition_negative_controls():
   ('compat/posix/src/system_properties.cc',b'SetWideEnvironment(L"GESHER_PROPERTY_ROOT", root.c_str())',b'_wputenv_s(L"GESHER_PROPERTY_ROOT", root.c_str())'),
   ('compat/posix/include/gesher/system_properties.h',b'uint32_t generation = 0;',b'uint64_t generation = 0;'),
   ('tools/net-tcp-priority/qualified/native13-property-source.patch',b'@@',b'@x'),
+  # The memmem normalization admits its exact reviewed delta only. The old
+  # whole-file digest must still reject any unrelated shim change afterwards.
+  ('compat/bionic/shim.cc',b'size_t n = std::strlen(s) + 1;',b'size_t n = std::strlen(s) + 2;'),
+  ('compat/bionic/shim.cc',b'return const_cast<void*>(search::FindBytes(h, hn, n, nn));',b'return const_cast<void*>(search::FindBytes(n, nn, h, hn));'),
+  ('compat/bionic/shim.cc',b'#include "memmem_search.h"\n',b''),
+  ('compat/bionic/shim.cc',b'#include "memmem_search.h"\n',b'#include "memmem_search.h"\n#include "memmem_search.h"\n'),
+  (MEMMEM_HEADER,b'if (needle_size == 0) return haystack_data;',b'if (needle_size == 0) return nullptr;'),
  ]
  for name,before,after in cases:
   target=ROOT/name
