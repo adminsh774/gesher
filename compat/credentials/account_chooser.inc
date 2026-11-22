@@ -7,6 +7,7 @@ enum {
   ACCOUNT_CHOOSER_MAX_PACKAGE_CHARS = 1024,
   ACCOUNT_CHOOSER_LIST = 1001,
   ACCOUNT_CHOOSER_ADD = 1002,
+  ACCOUNT_CHOOSER_BRAND = 1003,
   ACCOUNT_CHOOSER_TIMER = 1
 };
 
@@ -18,6 +19,9 @@ typedef struct {
   enum GesherUiLanguage language;
   BOOL can_add;
   BOOL ended;
+  HFONT heading_font;
+  HFONT brand_font;
+  GesherHostTheme theme;
   jsize count;
   jint result;
   WCHAR* prompt;
@@ -122,25 +126,46 @@ static INT_PTR CALLBACK AccountChooserDialog(HWND dialog, UINT message, WPARAM w
       AccountChooserFinish(dialog, state, -1);
       return FALSE;
     }
+    GesherHostThemeInit(&state->theme, dialog);
     BOOL rtl = GesherUiRtl(state->language);
-    HWND prompt = AccountChooserControl(dialog, rtl ? WS_EX_RTLREADING : 0, L"STATIC",
+    DWORD reading = rtl ? WS_EX_RTLREADING : 0;
+    DWORD alignment = rtl ? SS_RIGHT : SS_LEFT;
+    HWND brand = AccountChooserControl(dialog, reading, L"STATIC",
+        GesherUiText(state->language, "brand"), alignment,
+        ACCOUNT_CHOOSER_BRAND, 16, 10, 288, 14);
+    HWND prompt = AccountChooserControl(dialog, reading, L"STATIC",
         state->prompt != NULL ? state->prompt : GesherUiText(state->language, "chooser_prompt"),
-        (rtl ? SS_RIGHT : SS_LEFT) | SS_ENDELLIPSIS, -1, 10, 8, 280, 12);
-    HWND package = AccountChooserControl(dialog, 0, L"STATIC", state->package_name,
-        SS_LEFT | SS_ENDELLIPSIS, -1, 10, 23, 280, 18);
-    HWND list = AccountChooserControl(dialog, WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-        WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-        ACCOUNT_CHOOSER_LIST, 10, 46, 280, 122);
-    HWND select = AccountChooserControl(dialog, 0, L"BUTTON", GesherUiText(state->language, "chooser_select"),
-        WS_TABSTOP | BS_PUSHBUTTON, IDOK, 124, 184, 78, 16);
-    HWND cancel = AccountChooserControl(dialog, 0, L"BUTTON", GesherUiText(state->language, "chooser_cancel"),
-        WS_TABSTOP | BS_DEFPUSHBUTTON, IDCANCEL, 212, 184, 78, 16);
-    HWND add = state->can_add ? AccountChooserControl(dialog, 0, L"BUTTON", GesherUiText(state->language, "chooser_add"),
-        WS_TABSTOP | BS_PUSHBUTTON, ACCOUNT_CHOOSER_ADD, 10, 184, 98, 16) : NULL;
-    if (prompt == NULL || package == NULL || list == NULL || select == NULL
-        || cancel == NULL || (state->can_add && add == NULL)) {
+        alignment | SS_ENDELLIPSIS, -1, 16, 30, 288, 26);
+    // A package identifier remains LTR even when the host UI uses Hebrew.
+    HWND package = AccountChooserControl(dialog, WS_EX_LTRREADING, L"STATIC",
+        state->package_name, SS_LEFT | SS_ENDELLIPSIS, -1, 16, 58, 288, 18);
+    HWND list = AccountChooserControl(dialog, reading, L"LISTBOX", L"",
+        WS_TABSTOP | WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+        ACCOUNT_CHOOSER_LIST, 16, 82, 288, 126);
+    HWND select = AccountChooserControl(dialog, 0, L"BUTTON",
+        GesherUiText(state->language, "chooser_select"),
+        WS_TABSTOP | BS_OWNERDRAW, IDOK, 140, 218, 80, 22);
+    HWND cancel = AccountChooserControl(dialog, 0, L"BUTTON",
+        GesherUiText(state->language, "chooser_cancel"),
+        WS_TABSTOP | BS_OWNERDRAW, IDCANCEL, 228, 218, 76, 22);
+    HWND add = state->can_add ? AccountChooserControl(dialog, 0, L"BUTTON",
+        GesherUiText(state->language, "chooser_add"),
+        WS_TABSTOP | BS_OWNERDRAW, ACCOUNT_CHOOSER_ADD, 16, 218, 114, 22) : NULL;
+    if (!brand || !prompt || !package || !list || !select || !cancel
+        || (state->can_add && !add)) {
       AccountChooserFinish(dialog, state, -1);
       return FALSE;
+    }
+    state->heading_font = GesherHostHeadingFont(dialog);
+    if (state->heading_font != NULL)
+      SendMessageW(prompt, WM_SETFONT, (WPARAM)state->heading_font, TRUE);
+    LOGFONTW brand_font;
+    if (GetObjectW((HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0),
+                   sizeof(brand_font), &brand_font) != 0) {
+      brand_font.lfWeight = FW_BOLD;
+      state->brand_font = CreateFontIndirectW(&brand_font);
+      if (state->brand_font != NULL)
+        SendMessageW(brand, WM_SETFONT, (WPARAM)state->brand_font, TRUE);
     }
     for (jsize i = 0; i < state->count; ++i) {
       LRESULT added = SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)state->labels[i]);
@@ -170,10 +195,15 @@ static INT_PTR CALLBACK AccountChooserDialog(HWND dialog, UINT message, WPARAM w
   }
   if (message == WM_DESTROY) {
     KillTimer(dialog, ACCOUNT_CHOOSER_TIMER);
+    if (state->heading_font != NULL) DeleteObject(state->heading_font);
+    if (state->brand_font != NULL) DeleteObject(state->brand_font);
+    GesherHostThemeDispose(&state->theme);
     SetWindowLongPtrW(dialog, DWLP_USER, 0);
     return TRUE;
   }
-  if (message != WM_COMMAND) return FALSE;
+  if (message != WM_COMMAND)
+    return GesherHostThemeEvent(dialog, &state->theme, message, wparam, lparam,
+                                ACCOUNT_CHOOSER_BRAND);
   int command = LOWORD(wparam);
   if (command == IDCANCEL) {
     AccountChooserFinish(dialog, state, -1);
@@ -263,8 +293,8 @@ static jint ChoiceDialog(JNIEnv* env, jstring package_name, jobjectArray labels,
   DLGTEMPLATE* dialog = (DLGTEMPLATE*)buffer.words;
   dialog->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER | DS_SETFONT;
   dialog->dwExtendedStyle = GesherUiRtl(state.language) ? WS_EX_RTLREADING : 0;
-  dialog->cx = 300;
-  dialog->cy = 210;
+  dialog->cx = 320;
+  dialog->cy = 248;
   WORD* at = (WORD*)(dialog + 1);
   *at++ = 0; /* No menu. */
   *at++ = 0; /* Predefined dialog class. */
