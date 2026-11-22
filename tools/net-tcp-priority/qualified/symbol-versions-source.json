@@ -1,0 +1,29 @@
+{
+  "after_sha256": {
+    "compat/bionic/shim.cc": "91f2a16dee86eb7531997728c80e9fe8ea1e6157e5a3010b67d90635fa3d02f3",
+    "compat/elf/include/gesher/elf_loader.h": "957b1b4c2eefe5c77c42ad14273be39e109ffa9d603813939ba4e82f31407ee7"
+  },
+  "baseline": "751d82310f7c4c470c098ccebfd5d2d04699a0cd",
+  "baseline_policy_sha256": "2e30041395ec03b831b6a0a844b61a4f2c5dc1d8341d4f328dcecb803408335d",
+  "before_sha256": {
+    "compat/bionic/shim.cc": "f62b6eda571010c22926ba109f81677125434d85eb1872354102c3fc717b2670",
+    "compat/elf/include/gesher/elf_loader.h": "f89f251948f91bcca8b43f7a95410e39040016e38b649c35d45771b4fa50515a"
+  },
+  "coupled_paths": [
+    "compat/elf/include/gesher/elf_loader.h"
+  ],
+  "feature_head": "bcb3d1278d84d29a71d36bb40a01f16e2045b33f",
+  "patch_sha256": "7f1f5c32f861ebc1d4ca6ec1f10552a165b1603905eabbaf15ff19a0535b68d2",
+  "paths": [
+    "compat/bionic/shim.cc",
+    "compat/elf/include/gesher/elf_loader.h"
+  ],
+  "protected_paths": [
+    "compat/bionic/shim.cc"
+  ],
+  "unchanged_sha256": {
+    "compat/bionic/extra_bionic.h": "d0107054021c62fd7edc2b14dcec7c408ad2568a76b3497d2d5b5c15860cdb8f",
+    "compat/bionic/include/gesher/bionic_shim.h": "ee2f3fb2c6fea311f8a42c0547cd0765313fc1488a0a5c484ba1f54c070a99e2",
+    "compat/bionic/shim_internal.h": "eac2550acbd74dd5da75f5087860748e45ef3115a7e3276e00e00ac441283f6d"
+  }
+}

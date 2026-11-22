@@ -20,6 +20,7 @@
 
 #include "translator.h"
 #include "guest_counter.h"
+#include "host_call.h"
 #include <gesher/arm64_va_list.h>
 
 #include <windows.h>
@@ -44,17 +45,6 @@
 #include "dynarmic/interface/exclusive_monitor.h"
 
 namespace A64 = Dynarmic::A64;
-
-// A guest -> host call, marshalled to System V by gesher_call_host_sysv.
-struct HostCall {
-  void* fn;              // the host System V function
-  const uint64_t* gpr;   // X0..X5 -> rdi,rsi,rdx,rcx,r8,r9
-  const uint64_t* xmm;   // V0..V7 low 64 bits -> xmm0..xmm7
-  const uint64_t* stack; // host stack arguments: X6, X7, then guest stack args
-  uint64_t nstack;       // count of `stack`
-  uint64_t out_xmm0;     // written by the thunk: the result's xmm0 low 64 bits
-  uint64_t out_rdx;      // written by the thunk: the result's rdx
-};
 
 // What gesher_guest_entry_shim builds from a System V call (thunks.S).
 struct EntryFrame {
@@ -164,8 +154,8 @@ constexpr uint32_t kBrk = 0xD4200000;
 struct Trampoline {
   void* host_fn;
   int va_list_index;
-  uint32_t* guest_code = nullptr;
   int pointer_variadic_fixed = -1;
+  uint32_t* guest_code = nullptr;
 };
 Trampoline g_tramps[kMaxTramps];
 std::atomic<size_t> g_tramp_count{0};
@@ -1138,7 +1128,7 @@ class Env final : public A64::UserCallbacks {
         slot = reinterpret_cast<uint64_t>(&va.tag);
       }
     }
-    HostCall call{fn, gpr, xmm, stack, nstack, 0, 0};
+    HostCall call{fn, gpr, xmm, stack, nstack, 0, 0, 0};
     // A host->guest call made by this host function runs below the guest's
     // live frames.
     uint64_t saved_stack_cur = stack_cur_;
@@ -1160,7 +1150,7 @@ class Env final : public A64::UserCallbacks {
     stack_cur_ = saved_stack_cur;
     jit->SetRegister(0, rax);
     jit->SetRegister(1, call.out_rdx);
-    jit->SetVector(0, A64::Vector{call.out_xmm0, 0});
+    jit->SetVector(0, A64::Vector{call.out_xmm0, call.out_xmm0_hi});
   }
 
   std::vector<std::unique_ptr<A64::Jit>> jits_;
@@ -1882,7 +1872,7 @@ void ApiUnbindHostFunction(void* fn) {
     if (entry == g_tramp_by_fn.end()) return;
     const size_t index = entry->second;
     uint32_t* code = g_tramps[index].guest_code;
-    g_tramps[index] = {nullptr, -1, code};
+    g_tramps[index] = {nullptr, -1, -1, code};
     std::fill(code, code + kTrampWords, kBrk);
     g_tramp_by_fn.erase(entry);
     g_free_tramps.push_back(index);
@@ -1999,7 +1989,7 @@ void AddVaListFunction(const void* fn, int index) {
 void AddPointerVariadicFunction(const void* fn, void* va_fn, int fixed_arguments) {
   // The va_list must fit after the fixed arguments in the host GP registers.
   if (fn == nullptr || va_fn == nullptr || fixed_arguments < 0 || fixed_arguments >= 6) return;
-  Trampoline signature{va_fn, -1, nullptr, fixed_arguments};
+  Trampoline signature{va_fn, -1, fixed_arguments};
   {
     std::lock_guard<std::mutex> lock(g_va_mutex);
     g_pointer_variadic_functions[fn] = signature;
@@ -2024,8 +2014,8 @@ void* BindHost(void* fn, int va_list_index) {
   uint32_t* p = g_free_tramps.empty() ? AllocGuestCode(kTrampWords) : g_tramps[index].guest_code;
   if (p == nullptr) return nullptr;
   if (!g_free_tramps.empty()) g_free_tramps.pop_back();
-  signature.guest_code = p;
   g_tramps[index] = signature;
+  g_tramps[index].guest_code = p;
   p[0] = Svc(static_cast<uint32_t>(index + 1));
   p[1] = kRet;
   for (size_t i = 2; i < kTrampWords; ++i) p[i] = kBrk;
@@ -2254,7 +2244,11 @@ extern "C" __declspec(dllexport) const gesher_arm64_api* gesher_arm64_init(
     g_tlsdesc_unresolved_weak = EmitGuestCode(kTlsDescUnresolvedWeak,
         sizeof(kTlsDescUnresolvedWeak) / sizeof(kTlsDescUnresolvedWeak[0]));
   }
-  InitGuestLibc();
+  if (g_return_stub == 0 || g_tlsdesc_static == nullptr) {
+    std::fputs("gesher arm64: cannot emit the translator's guest stubs\n", stderr);
+    return nullptr;
+  }
+  if (!InitGuestLibc()) return nullptr;
   // First in the chain, so an execute fault in guest code (a host call to a
   // guest callback) is redirected before gesher-base turns it into a signal.
   AddVectoredExceptionHandler(1, VectoredHandler);

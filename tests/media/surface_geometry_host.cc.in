@@ -10,7 +10,19 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
+
+// <gesher/perf_trace.h>'s timing sites as production runs them without
+// GESHER_PERF_TRACE (docs/media.md, "Measuring playback"): off.
+namespace gesher::perf {
+inline bool Enabled() { return false; }
+inline int64_t Now() { return 0; }
+struct Site {
+  constexpr explicit Site(const char*, int64_t = 0) {}
+  void Add(int64_t, int64_t = 0) {}
+};
+}  // namespace gesher::perf
 
 @CONSTANTS@
 constexpr int ANDROID_NATIVE_WINDOW_MAGIC = 0x574e444f;
@@ -116,6 +128,7 @@ class Window {
 }
 @PRODUCTION@
 @ASSERTIONS@
+@RELEASE_ASSERTIONS@
 int main() {
   auto queue = android::sp<gesher::media::QueueSurface>::make(4, 6);
   surface_contract::Run(queue.get(), 4, 6);
@@ -123,5 +136,5 @@ int main() {
   surface_contract::Run(window.get(), 4, 6);
   std::printf("surface geometry contracts: %d checks, %d failures\n",
               surface_contract::checks, surface_contract::failures);
-  return surface_contract::failures != 0;
+  return surface_release_contract::Run() != 0 || surface_contract::failures != 0;
 }

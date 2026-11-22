@@ -1,0 +1,95 @@
+diff --git a/compat/bionic/shim.cc b/compat/bionic/shim.cc
+index 9387904e0c..0c0d85c2fb 100644
+--- a/compat/bionic/shim.cc
++++ b/compat/bionic/shim.cc
+@@ -1090 +1090 @@ void* DlOpenImpl(const char* filename) {
+-void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
++void* DlSymImpl(void* handle, const char* symbol, const char* version) {
+@@ -1091,0 +1092,2 @@ void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
++  using gesher::elf::LookupStatus;
++  LookupStatus status = LookupStatus::kNotFound;
+@@ -1097,0 +1100,3 @@ void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
++    // These existing virtual providers have no ELF version table. Bionic's
++    // check_symbol_version allows their actual unversioned exports to match
++    // a version request; this does not declare any named version supported.
+@@ -1098,0 +1104 @@ void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
++    if (p) status = LookupStatus::kResolved;
+@@ -1102,2 +1108,5 @@ void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
+-    p = gesher::elf::LookupGlobal(symbol);
+-    if (p == nullptr) p = LookupBionicSymbol(symbol);
++    p = gesher::elf::LookupGlobalVersion(symbol, version, &status);
++    if (status == LookupStatus::kNotFound) {
++      p = LookupBionicSymbol(symbol);
++      if (p) status = LookupStatus::kResolved;
++    }
+@@ -1105,2 +1114,6 @@ void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
+-    p = gesher::elf::Lookup(static_cast<gesher::elf::Library*>(handle), symbol);
+-    if (p == nullptr) p = LookupBionicSymbol(symbol);
++    auto* library = static_cast<gesher::elf::Library*>(handle);
++    p = gesher::elf::LookupVersion(library, symbol, version, &status);
++    if (status == LookupStatus::kNotFound) {
++      p = LookupBionicSymbol(symbol);
++      if (p) status = LookupStatus::kResolved;
++    }
+@@ -1108,2 +1121,8 @@ void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
+-  if (p == nullptr) {
+-    t_dlerror = std::string("undefined symbol: ") + symbol;
++  // A selected IFUNC can return zero successfully. Do not replace its result
++  // with an unrelated builtin or overwrite the caller's pending dlerror.
++  // A selected TLS definition still fails if its current-thread storage is
++  // unavailable. Keep that failure separate from absence and null IFUNC success.
++  if (status != LookupStatus::kResolved) {
++    t_dlerror = std::string(status == LookupStatus::kUnavailable
++        ? "symbol address unavailable: " : "undefined symbol: ") + symbol;
++    if (version != nullptr) t_dlerror += std::string(", version ") + version;
+@@ -1111 +1130,6 @@ void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
+-    if (TraceDl()) std::fprintf(stderr, "gesher dl: dlsym(%p, \"%s\") = null\n", handle, symbol);
++    if (TraceDl()) {
++      if (version == nullptr)
++        std::fprintf(stderr, "gesher dl: dlsym(%p, \"%s\") = null\n", handle, symbol);
++      else
++        std::fprintf(stderr, "gesher dl: dlvsym(%p, \"%s\", \"%s\") = null\n", handle, symbol, version);
++    }
+@@ -1114,0 +1139,6 @@ void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
++void* BIONIC_SYSV DlSym(void* handle, const char* symbol) {
++  return DlSymImpl(handle, symbol, nullptr);
++}
++void* BIONIC_SYSV DlVSym(void* handle, const char* symbol, const char* version) {
++  return DlSymImpl(handle, symbol, version);
++}
+@@ -1440 +1470 @@ void RegisterLibc(SymbolTable& t) {
+-  ENTRY("dlvsym", DlSym);
++  ENTRY("dlvsym", DlVSym);
+@@ -1489 +1519,3 @@ void InstallBionicShim() {
+-  gesher::elf::SetBionicResolver([](const char* name) { return LookupBionicSymbol(name); });
++  gesher::elf::SetBionicResolver(
++      [](const char* name) { return LookupBionicSymbol(name); },
++      [](const char* soname) { return PlatformLibraryHandle(soname) != nullptr; });
+diff --git a/compat/elf/include/gesher/elf_loader.h b/compat/elf/include/gesher/elf_loader.h
+index 04ec21b540..ef340baf95 100644
+--- a/compat/elf/include/gesher/elf_loader.h
++++ b/compat/elf/include/gesher/elf_loader.h
+@@ -30,0 +31,4 @@ using SymbolResolver = std::function<void*(const char* name)>;
++// Identifies existing virtual libraries supplied by the unversioned resolver.
++// This validates VERNEED provider identity; it does not advertise named ABI
++// versions. Bionic permits versioned references to unversioned definitions.
++using LibraryProvider = std::function<bool(const char* soname)>;
+@@ -35 +39 @@ using SymbolResolver = std::function<void*(const char* name)>;
+-void SetBionicResolver(SymbolResolver resolver);
++void SetBionicResolver(SymbolResolver resolver, LibraryProvider library_provider = {});
+@@ -68 +72,2 @@ Library* LoadFromMemory(const char* name, const void* data, size_t size, std::st
+-// or nullptr. STT_GNU_IFUNC symbols are resolved to their target.
++// or nullptr. STT_GNU_IFUNC symbols are resolved to their target; STT_TLS
++// symbols identify the calling thread's instance of the selected object.
+@@ -70,0 +76,9 @@ void* Lookup(Library* library, const char* name);
++// Explicit version lookup (dlvsym). nullptr version is ordinary lookup;
++// non-default/hidden definitions can be selected by their exact version name.
++// Selection and address availability are separate: an IFUNC may successfully
++// resolve to nullptr, while missing current-thread TLS storage is unavailable.
++// A selected-but-unavailable symbol must not fall back to another provider.
++enum class LookupStatus { kNotFound, kResolved, kUnavailable };
++void* LookupVersion(Library* library, const char* name, const char* version,
++                    LookupStatus* status = nullptr);
++
+@@ -74,0 +89 @@ void* LookupGlobal(const char* name);
++void* LookupGlobalVersion(const char* name, const char* version, LookupStatus* status = nullptr);
