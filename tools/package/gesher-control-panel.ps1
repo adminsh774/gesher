@@ -27,6 +27,8 @@ $script:PanelRequestFile = Join-Path $root 'data/system/control-panel-request'
 $script:PanelReopen = ($env:GESHER_PANEL_REOPEN -eq '1')
 # Apps whose tasks are windows of their own (ADR 0088; AppWindows.java): separate.<package>=true.
 $script:AppWindowsFile = Join-Path $root 'data/system/app-windows.properties'
+# Gesher's own proxy (ProxySetting.java, docs/network.md): proxy=<every app>, proxy.<package>=<one app>.
+$script:ProxyFile = Join-Path $root 'data/system/proxy.properties'
 Remove-Item Env:GESHER_PANEL_REOPEN -ErrorAction SilentlyContinue
 $script:PanelInstanceCreated = $false
 $script:PanelInstance = [System.Threading.Mutex]::new($false, 'Local\Gesher.ControlPanel', [ref] $script:PanelInstanceCreated)
@@ -73,6 +75,121 @@ function Set-AppSeparateWindows([string] $pkg, [bool] $separate) {
     $directory = Split-Path -Parent $script:AppWindowsFile
     if (-not (Test-Path -LiteralPath $directory)) { [void](New-Item -ItemType Directory -Path $directory) }
     [IO.File]::WriteAllLines($script:AppWindowsFile, $lines, [Text.UTF8Encoding]::new($false))
+}
+
+# A proxy setting as ProxySetting.parse saves it: 'direct', 'windows' or host:port (an
+# http:// prefix and a trailing slash dropped); $null when it is not one.
+function ConvertTo-ProxyValue([string] $value) {
+    if ($null -eq $value) { return $null }
+    $v = $value.Trim()
+    $lower = $v.ToLowerInvariant()
+    if ($lower -in 'direct', 'none', 'off') { return 'direct' }
+    if ($lower -in 'windows', 'default') { return 'windows' }
+    if ($lower.StartsWith('http://')) { $v = $v.Substring(7) }
+    if ($v.EndsWith('/')) { $v = $v.Substring(0, $v.Length - 1) }
+    $colon = $v.LastIndexOf(':')
+    if ($colon -le 0 -or $colon -eq $v.Length - 1) { return $null }
+    $hostName = $v.Substring(0, $colon)
+    if ($hostName -cnotmatch '^(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\])$') { return $null }
+    $port = 0
+    if (-not [int]::TryParse($v.Substring($colon + 1), [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture, [ref] $port)) { return $null }
+    if ($port -lt 1 -or $port -gt 65535) { return $null }
+    return $v
+}
+
+# The saved settings: key 'proxy' (every app) or 'proxy.<package>' -> 'direct', 'windows' or host:port.
+function Get-ProxySettings {
+    $settings = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    if (-not (Test-Path -LiteralPath $script:ProxyFile)) { return ,$settings }
+    foreach ($line in Get-Content -LiteralPath $script:ProxyFile -Encoding UTF8) {
+        if ($line -match '^\s*(?:[#!]|$)') { continue }
+        if ($line -notmatch '^\s*(proxy(?:\.[A-Za-z0-9_.]+)?)\s*[=:\s]\s*(.*?)\s*$') { continue }
+        $key = $Matches[1]
+        # java.util.Properties escapes ':' and '=' in values (store writes host\:port).
+        $value = ConvertTo-ProxyValue ($Matches[2] -replace '\\(.)', '$1')
+        if ($value) { $settings[$key] = $value }
+    }
+    return ,$settings
+}
+
+# Saves the proxy of every app ($pkg empty) or of one package, as ProxySetting.save does:
+# 'windows' for every app removes the setting; $value $null removes a package's own setting
+# (it uses every app's again). App processes started from now on use it.
+function Set-ProxySetting([string] $pkg, [string] $value) {
+    if ($pkg -and $pkg -notmatch '^[A-Za-z0-9_.]+$') { throw "Invalid package: $pkg" }
+    if ($null -ne $value -and $value -ne '') {
+        $value = ConvertTo-ProxyValue $value
+        if (-not $value) { throw 'Invalid proxy setting' }
+    } else { $value = $null }
+    $key = if ($pkg) { "proxy.$pkg" } else { 'proxy' }
+    if (-not $pkg -and $value -eq 'windows') { $value = $null }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    if (Test-Path -LiteralPath $script:ProxyFile) {
+        foreach ($line in Get-Content -LiteralPath $script:ProxyFile -Encoding UTF8) {
+            if ($line -cmatch ('^\s*' + [regex]::Escape($key) + '\s*[=:\s]')) { continue }
+            $lines.Add($line)
+        }
+    } else {
+        $lines.Add('#Gesher''s proxy: gesher-app proxy [PACKAGE] host:port|direct|windows')
+    }
+    if ($value) { $lines.Add($key + '=' + ($value -replace '([\\:=#!])', '\$1')) }
+    $directory = Split-Path -Parent $script:ProxyFile
+    if (-not (Test-Path -LiteralPath $directory)) { [void](New-Item -ItemType Directory -Path $directory) }
+    [IO.File]::WriteAllLines($script:ProxyFile, $lines, [Text.UTF8Encoding]::new($false))
+}
+
+# A saved setting as the panel shows it.
+function Get-ProxyDisplayText([string] $value) {
+    switch ($value) {
+        'direct' { return Get-GesherText 'cp_proxy_mode_direct' }
+        'windows' { return Get-GesherText 'cp_proxy_mode_windows' }
+        default { return $value }
+    }
+}
+
+# Fills a mode ComboBox and its address TextBox for a saved value ($null: the package
+# uses every app's setting, with -WithInherit; every app's Windows' settings otherwise).
+function Initialize-ProxyEditor($combo, $address, [string] $value, [switch] $WithInherit) {
+    $combo.Items.Clear()
+    $modes = [System.Collections.Generic.List[object]]::new()
+    if ($WithInherit) { $modes.Add(@('inherit', (Get-GesherText 'cp_proxy_mode_inherit'))) }
+    $modes.Add(@('windows', (Get-GesherText 'cp_proxy_mode_windows')))
+    $modes.Add(@('direct', (Get-GesherText 'cp_proxy_mode_direct')))
+    $modes.Add(@('server', (Get-GesherText 'cp_proxy_mode_server')))
+    foreach ($mode in $modes) {
+        $item = [System.Windows.Controls.ComboBoxItem]::new()
+        $item.Tag = $mode[0]
+        $item.Content = $mode[1]
+        [void]$combo.Items.Add($item)
+    }
+    $selected = if (-not $value) { if ($WithInherit) { 'inherit' } else { 'windows' } }
+        elseif ($value -eq 'direct' -or $value -eq 'windows') { $value } else { 'server' }
+    $address.Text = if ($selected -eq 'server') { $value } else { '' }
+    foreach ($item in $combo.Items) { if ($item.Tag -eq $selected) { $combo.SelectedItem = $item } }
+    $address.IsEnabled = ($selected -eq 'server')
+    $combo.Add_SelectionChanged({
+        param($sender, $e)
+        $isServer = ($sender.SelectedItem -and $sender.SelectedItem.Tag -eq 'server')
+        $address.IsEnabled = $isServer
+        if ($isServer) { [void]$address.Focus() }
+    }.GetNewClosure())
+}
+
+# The editor's setting: @{ Valid; Value } (Value $null = every app's setting for a package).
+function Read-ProxyEditor($combo, $address) {
+    $mode = if ($combo.SelectedItem) { [string]$combo.SelectedItem.Tag } else { 'windows' }
+    switch ($mode) {
+        'inherit' { return @{ Valid = $true; Value = $null } }
+        'server' {
+            $value = ConvertTo-ProxyValue $address.Text
+            if (-not $value -or $value -eq 'direct' -or $value -eq 'windows') {
+                return @{ Valid = $false; Value = $null; Text = [string]$address.Text }
+            }
+            return @{ Valid = $true; Value = $value }
+        }
+        default { return @{ Valid = $true; Value = $mode } }
+    }
 }
 
 # Helper to query device running state
@@ -437,7 +554,8 @@ function Get-InstalledApps {
                         <TextBlock Text="$(Get-GesherText 'cp_apps_title')" FontSize="16" FontWeight="Bold" Foreground="#101828"/>
                         <TextBlock Text="$(Get-GesherText 'cp_drag_drop_hint')" FontSize="12" Foreground="#667085" Margin="0,2,0,0"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button Name="BtnProxyAll" Content="$(Get-GesherText 'cp_btn_proxy_all')" ToolTip="$(Get-GesherText 'cp_proxy_desc')" Margin="0,0,8,0"/>
                         <Button Name="BtnInstallApk" Style="{StaticResource PrimaryButton}" Content="$(Get-GesherText 'cp_btn_install_apk')"/>
                     </StackPanel>
                 </Grid>
@@ -471,9 +589,11 @@ function Get-InstalledApps {
                                         <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="12,0,12,0">
                                             <TextBlock Text="{Binding Label}" FontSize="14" FontWeight="SemiBold" Foreground="#101828"/>
                                             <TextBlock Text="{Binding Package}" FontSize="12" Foreground="#667085" Margin="0,2,0,0"/>
+                                            <TextBlock Text="{Binding ProxyText}" Visibility="{Binding ProxyVisibility}" FontSize="12" Foreground="#175CD3" Margin="0,2,0,0"/>
                                         </StackPanel>
                                         <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
                                             <CheckBox Content="$(Get-GesherText 'cp_separate_windows')" ToolTip="$(Get-GesherText 'cp_separate_windows_tip')" IsChecked="{Binding SeparateWindows, Mode=OneWay}" Tag="{Binding Package}" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                                            <Button Content="$(Get-GesherText 'cp_btn_proxy')" ToolTip="$(Get-GesherText 'cp_btn_proxy_tip')" Tag="{Binding Package}" Margin="0,0,8,0"/>
                                             <Button Content="$(Get-GesherText 'cp_btn_launch')" Tag="{Binding Package}" Visibility="{Binding LaunchVisibility}" Margin="0,0,8,0"/>
                                             <Button Style="{StaticResource DangerButton}" Content="$(Get-GesherText 'cp_btn_uninstall')" Tag="{Binding Package}"/>
                                         </StackPanel>
@@ -547,6 +667,7 @@ $statusMessage = $window.FindName('StatusMessage')
 $activityBar = $window.FindName('ActivityBar')
 $servicesCards = $window.FindName('ServicesCards')
 $applicationsSection = $window.FindName('ApplicationsSection')
+$btnProxyAll = $window.FindName('BtnProxyAll')
 $updateVersionText = $window.FindName('UpdateVersionText')
 $updateStatusText = $window.FindName('UpdateStatusText')
 $automaticUpdateChecks = $window.FindName('AutomaticUpdateChecks')
@@ -687,6 +808,8 @@ function Update-AppsView($installed) {
     $signature += "`n$($iconStamps[$icoFile])"
     $separateApps = Get-SeparateWindowApps
     $signature += "`n" + (@($separateApps | Sort-Object) -join ',')
+    $proxySettings = Get-ProxySettings
+    $signature += "`n" + (@($proxySettings.Keys | Sort-Object | ForEach-Object { "$_=$($proxySettings[$_])" }) -join ',')
     $script:ViewState.AppFiles = $appFiles.ToArray()
     if ($script:ViewState.AppsSignature -ceq $signature) { return }
 
@@ -700,12 +823,18 @@ function Update-AppsView($installed) {
                 $imgSource = Get-PanelAppIcon $resolvedIco $iconStamps[$resolvedIco] $icons
             } catch { }
         }
+        $appProxy = $null
+        $proxyText = if ($proxySettings.TryGetValue("proxy.$($app.Package)", [ref] $appProxy)) {
+            Get-GesherText 'cp_proxy_app_value' @((Get-ProxyDisplayText $appProxy))
+        } else { '' }
         $items.Add([PSCustomObject]@{
             Package = $app.Package
             Label = $app.Label
             IconImage = $imgSource
             SeparateWindows = $separateApps.Contains([string]$app.Package)
             LaunchVisibility = if ($app.Launchable) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+            ProxyText = $proxyText
+            ProxyVisibility = if ($proxyText) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
         })
     }
     $appsList.ItemsSource = $items
@@ -1944,6 +2073,118 @@ $script:OnAppUninstall = {
     }
 }
 
+# The proxy of every app ($pkg empty) or of one app (proxy.<package>, over every app's
+# setting); app processes started from now on use it. True when it was saved.
+function Show-ProxyDialog([string] $pkg = '', [string] $label = $pkg) {
+    [xml]$dialogXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="460" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        FlowDirection="$flowDirection"
+        FontFamily="Segoe UI, Tahoma, Arial"
+        Background="#FFFFFF">
+    <Window.Resources>
+        <Style TargetType="Button">
+            <Setter Property="Padding" Value="16,8"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="BorderBrush" Value="#D0D5DD"/>
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="Foreground" Value="#344054"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+    <Border Padding="22">
+        <StackPanel>
+            <TextBlock Name="DialogHeading" FontSize="15" FontWeight="Bold" Foreground="#101828" TextWrapping="Wrap"/>
+            <TextBlock Name="DialogPackage" FontSize="12" Foreground="#667085" Margin="0,2,0,0"/>
+            <TextBlock Name="DialogDetail" FontSize="12" Foreground="#475467" TextWrapping="Wrap" Margin="0,10,0,14"/>
+            <StackPanel Orientation="Horizontal">
+                <ComboBox Name="DialogProxyMode" Width="190" Padding="8,7" VerticalContentAlignment="Center" Margin="0,0,8,0"/>
+                <TextBox Name="DialogProxyAddress" Width="170" Padding="6,7" VerticalContentAlignment="Center" FlowDirection="LeftToRight"/>
+            </StackPanel>
+            <TextBlock Name="DialogError" FontSize="12" Foreground="#B42318" TextWrapping="Wrap" Margin="0,8,0,0" Visibility="Collapsed"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+                <Button Name="BtnCancel" IsCancel="True" MinWidth="85" Margin="0,0,8,0"/>
+                <Button Name="BtnSave" IsDefault="True" MinWidth="85" Background="#1570EF" BorderBrush="#1570EF" Foreground="#FFFFFF"/>
+            </StackPanel>
+        </StackPanel>
+    </Border>
+</Window>
+"@
+    $dialog = [System.Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dialogXaml))
+    $heading = if ($pkg) { Get-GesherText 'cp_proxy_app_title' @($label) } else { Get-GesherText 'cp_btn_proxy_all' }
+    $dialog.Title = $heading
+    $dialog.FindName('DialogHeading').Text = $heading
+    $packageText = $dialog.FindName('DialogPackage')
+    if ($pkg -and $label -ne $pkg) { $packageText.Text = $pkg } else { $packageText.Visibility = [System.Windows.Visibility]::Collapsed }
+    $dialog.FindName('DialogDetail').Text = if ($pkg) { Get-GesherText 'cp_proxy_app_desc' } else { Get-GesherText 'cp_proxy_desc' }
+    $dialog.FindName('BtnCancel').Content = Get-GesherText 'cp_update_cancel'
+    $dialog.FindName('BtnSave').Content = Get-GesherText 'cp_proxy_save'
+    $mode = $dialog.FindName('DialogProxyMode')
+    $address = $dialog.FindName('DialogProxyAddress')
+    $address.ToolTip = Get-GesherText 'cp_proxy_address_hint'
+    $current = $null
+    [void](Get-ProxySettings).TryGetValue($(if ($pkg) { "proxy.$pkg" } else { 'proxy' }), [ref] $current)
+    Initialize-ProxyEditor $mode $address $current -WithInherit:([bool]$pkg)
+    $dialog.Owner = $window
+    if ($window.Icon) { $dialog.Icon = $window.Icon }
+    $state = @{ Saved = $false }
+    $dialog.FindName('BtnSave').Add_Click({
+        $choice = Read-ProxyEditor $mode $address
+        $errorText = $dialog.FindName('DialogError')
+        if (-not $choice.Valid) {
+            $errorText.Text = Get-GesherText 'cp_proxy_invalid' @($choice.Text)
+            $errorText.Visibility = [System.Windows.Visibility]::Visible
+            [void]$address.Focus()
+            return
+        }
+        try {
+            Set-ProxySetting $pkg $choice.Value
+            $state.Saved = $true
+            $dialog.Close()
+        } catch {
+            $errorText.Text = Get-GesherText 'cp_proxy_save_failed' @($_.Exception.Message)
+            $errorText.Visibility = [System.Windows.Visibility]::Visible
+        }
+    })
+    $dialog.ShowDialog() | Out-Null
+    return $state.Saved
+}
+
+$script:OnAppProxy = {
+    param($pkg)
+    if ($script:IsBusy) { return }
+    $item = $appsList.ItemsSource | Where-Object { $_.Package -eq $pkg } | Select-Object -First 1
+    $label = if ($item -and $item.Label) { $item.Label } else { $pkg }
+    if (Show-ProxyDialog -pkg $pkg -label $label) {
+        Refresh-Dashboard
+        $statusMessage.Text = Get-GesherText 'cp_proxy_saved'
+    }
+}
+
+$btnProxyAll.Add_Click({
+    if ($script:IsBusy) { return }
+    if (Show-ProxyDialog) { $statusMessage.Text = Get-GesherText 'cp_proxy_saved' }
+})
+
 # Attach click events through visual tree dispatcher
 $appsList.AddHandler([System.Windows.Controls.Button]::ClickEvent, [System.Windows.RoutedEventHandler]{
     param($sender, $e)
@@ -1959,6 +2200,8 @@ $appsList.AddHandler([System.Windows.Controls.Button]::ClickEvent, [System.Windo
             & $script:OnAppLaunch $pkg
         } elseif ($btn.Content -eq (Get-GesherText 'cp_btn_uninstall')) {
             & $script:OnAppUninstall $pkg
+        } elseif ($btn.Content -eq (Get-GesherText 'cp_btn_proxy')) {
+            & $script:OnAppProxy $pkg
         }
     }
 })
