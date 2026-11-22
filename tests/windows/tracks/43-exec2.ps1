@@ -5,6 +5,9 @@
 # programs come from .github/workflows/exec.yml (the "exec" artifact):
 # libexec2test.so (the driver) and libexec2child.so (the program it starts).
 
+& "$PSScriptRoot/../child-usage-contracts.ps1" -Dir $Dir -Mode Native
+if ($LASTEXITCODE -ne 0) { $failed++ }
+
 if (-not (Test-Path "$Dir/libexec2test.so")) {
   Write-Host 'FAIL  exec2: the exec2 artifact (libexec2test.so) is missing'
   $failed++

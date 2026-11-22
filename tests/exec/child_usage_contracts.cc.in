@@ -1,0 +1,451 @@
+// Production sections are inserted verbatim. On Windows all child processes,
+// process-time samples, waits, callbacks and duplicate handles are real APIs.
+// On Linux only the explicitly isolated windows.h boundary is simulated.
+#include <windows.h>
+#include <gesher/child_usage.h>
+#include <atomic>
+#include <cerrno>
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <string>
+#include <thread>
+#ifdef _WIN32
+#include <io.h>
+#include <psapi.h>
+#endif
+@RESOURCE_HEADER@
+
+#define BIONIC_SYSV
+#define JNICALL
+using jint = int32_t;
+using jobject = void*;
+struct JNIEnv {};
+std::atomic<int> checks{0}, failures{0};
+void Require(bool ok, const char* why) {
+  ++checks;
+  if (!ok) { ++failures; std::printf("FAIL child usage: %s\n", why); }
+}
+namespace ex {
+@EXIT_STATUS@
+}
+namespace gesher::bionic {
+constexpr int kSigchld = 17, kCldExited = 1, kEFAULT = 14, kEINVAL = 22, kENOSYS = 38;
+@RESOURCE_TYPES@
+std::atomic<void (*)()> signal_hook{nullptr};
+std::atomic<unsigned> signals{0};
+void DeliverExternalSignal(int, int, int, int, bool) {
+  ++signals;
+  auto hook = signal_hook.load();
+  if (hook) hook();
+}
+void InterruptibleSleep(int ms, void*, int* error) { Sleep(static_cast<DWORD>(ms)); *error = 0; }
+@NATIVE_CHILDREN@
+@NATIVE_WAIT@
+@RESOURCE_QUERIES@
+}
+namespace java {
+@JAVA_CHILDREN@
+@JAVA_WAIT@
+void Insert(int pid, HANDLE h) { @JAVA_INSERT@ }
+}
+
+namespace cu = gesher::child_usage;
+namespace guest = gesher::bionic;
+namespace gesher {
+int FailWithLastError() { return errno = child_usage::LinuxError(GetLastError()), -1; }
+}
+namespace posix {
+struct timeval { long tv_sec, tv_usec; };
+@POSIX_TYPES@
+bool Writable(void* p, size_t length) { return cu::Writable(p, length); }
+@POSIX_QUERY@
+}
+[[maybe_unused]] constexpr bool kHasUsage = @HAS_USAGE@;
+uint64_t Ticks(FILETIME v) { return (static_cast<uint64_t>(v.dwHighDateTime) << 32) | v.dwLowDateTime; }
+cu::Cpu Measured(HANDLE p) {
+  FILETIME c{}, e{}, k{}, u{};
+  Require(GetProcessTimes(p, &c, &e, &k, &u) != 0, "oracle reads the retained real process");
+  return {Ticks(u), Ticks(k)};
+}
+cu::Cpu Snapshot() {
+  cu::Cpu cpu{};
+  Require(cu::Snapshot(&cpu) == 0, "shared owner snapshot succeeds");
+  return cpu;
+}
+bool Equal(cu::Cpu a, cu::Cpu b) { return a.user_100ns == b.user_100ns && a.kernel_100ns == b.kernel_100ns; }
+cu::Cpu Add(cu::Cpu a, cu::Cpu b) { return {a.user_100ns + b.user_100ns, a.kernel_100ns + b.kernel_100ns}; }
+uint64_t Micros(guest::LinuxTimeval t) {
+  Require(t.tv_sec >= 0 && t.tv_usec >= 0 && t.tv_usec < 1000000, "timeval is nonnegative and normalized");
+  return static_cast<uint64_t>(t.tv_sec) * 1000000 + static_cast<uint64_t>(t.tv_usec);
+}
+void Queries(cu::Cpu expected) {
+  guest::LinuxRusage usage{};
+  Require(guest::Getrusage(-1, &usage) == 0, "guest RUSAGE_CHILDREN query succeeds");
+  Require(Micros(usage.ru_utime) == expected.user_100ns / 10 &&
+          Micros(usage.ru_stime) == expected.kernel_100ns / 10, "guest rusage sees exact cumulative CPU at microsecond boundary");
+  guest::LinuxTms t{};
+  Require(guest::Times(&t) >= 0, "guest times succeeds");
+  Require(static_cast<uint64_t>(t.tms_cutime) == expected.user_100ns / 100000 &&
+          static_cast<uint64_t>(t.tms_cstime) == expected.kernel_100ns / 100000,
+          "guest times uses the same total at CLK_TCK=100");
+  posix::rusage native{};
+  Require(posix::getrusage(RUSAGE_CHILDREN, &native) == 0, "POSIX DLL-facing rusage succeeds");
+  Require(static_cast<uint64_t>(native.ru_utime.tv_sec) * 1000000 + native.ru_utime.tv_usec == expected.user_100ns / 10 &&
+          static_cast<uint64_t>(native.ru_stime.tv_sec) * 1000000 + native.ru_stime.tv_usec == expected.kernel_100ns / 10,
+          "POSIX and guest queries see the same native/Java total");
+}
+
+struct Worker { HANDLE process; HANDLE ready = nullptr, finish = nullptr; };
+#ifdef _WIN32
+int ChildMain(int argc, char** argv) {
+  if (argc != 5) return 90;
+  HANDLE ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, argv[2]);
+  HANDLE finish = OpenEventA(SYNCHRONIZE, FALSE, argv[3]);
+  if (!ready || !finish) return 91;
+  FILETIME c{}, e{}, k{}, u{};
+  if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 92;
+  uint64_t start = Ticks(u) + Ticks(k), count = 1;
+  volatile uint64_t observed = 0;
+  do {
+    for (unsigned i = 0; i < 100000; ++i) count = count * 6364136223846793005ULL + 1;
+    observed = count;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 93;
+  } while (Ticks(u) + Ticks(k) - start < 500000);  // 50 ms actual CPU, never wall time.
+  if (!observed || !SetEvent(ready)) return 94;
+  if (WaitForSingleObject(finish, 10000) != WAIT_OBJECT_0) return 95;
+  CloseHandle(ready); CloseHandle(finish);
+  return std::atoi(argv[4]);
+}
+Worker Spawn(DWORD code) {
+  static unsigned serial = 0;
+  std::string prefix = "Local\\gesher-child-usage-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(++serial);
+  std::string ready_name = prefix + "-ready", finish_name = prefix + "-finish";
+  Worker worker{};
+  worker.ready = CreateEventA(nullptr, TRUE, FALSE, ready_name.c_str());
+  worker.finish = CreateEventA(nullptr, TRUE, FALSE, finish_name.c_str());
+  char exe[32768];
+  Require(GetModuleFileNameA(nullptr, exe, sizeof(exe)) != 0, "resolve worker executable");
+  std::string command = "\"" + std::string(exe) + "\" --child " + ready_name + " " + finish_name + " " + std::to_string(code);
+  STARTUPINFOA si{}; si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  Require(CreateProcessA(exe, command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi) != 0,
+          "CreateProcess starts an independent CPU-burning child");
+  worker.process = pi.hProcess;
+  CloseHandle(pi.hThread);
+  Require(WaitForSingleObject(worker.ready, 10000) == WAIT_OBJECT_0, "child reports measured CPU while remaining alive");
+  return worker;
+}
+void Finish(Worker& worker) {
+  Require(SetEvent(worker.finish) != 0, "release the real child");
+  Require(WaitForSingleObject(worker.process, 10000) == WAIT_OBJECT_0, "actual process wait confirms termination");
+  CloseHandle(worker.ready); CloseHandle(worker.finish);
+}
+#else
+Worker Spawn(DWORD code) { return {boundary::Spawn(code)}; }
+void Finish(Worker& worker) { boundary::Finish(worker.process); }
+#endif
+HANDLE Retain(HANDLE process) {
+  HANDLE result = nullptr;
+  Require(DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &result,
+                          PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, 0) != 0,
+          "fixture transfers an independently owned child handle");
+  return result;
+}
+void WatchFinished(int pid) {
+  for (int i = 0; i < 1000; ++i) {
+    { std::lock_guard<std::mutex> lock(guest::g_children_mutex);
+      auto it = guest::g_children.find(pid);
+      if (it != guest::g_children.end() && it->second.exited) return;
+    }
+    Sleep(1);
+  }
+  Require(false, "production child-exit callback runs before the deadline");
+}
+std::atomic<int> callback_pid{0}, callback_result{0};
+void ReapInsideCallback() { callback_result = guest::Waitpid(callback_pid, nullptr, 0); }
+
+void Provider() {
+  cu::Cpu before = Snapshot();
+  Worker worker = Spawn(STILL_ACTIVE);
+  cu::Token token = 0, duplicate = 0;
+  Require(cu::Register(worker.process, &token) == 0 && token != 0, "register real child identity");
+  Require(cu::Register(worker.process, &duplicate) == ERROR_ALREADY_EXISTS, "same live identity cannot register twice");
+  cu::Cpu output{11, 22};
+  Require(cu::Collect(token, &output) == ERROR_IO_INCOMPLETE && Equal(output, {11, 22}), "live collect fails without modifying output");
+  Require(Equal(Snapshot(), before), "live registration and failed wait never count CPU");
+  Finish(worker);
+  Require(Equal(Snapshot(), before), "exited but unreaped child is absent from totals");
+  cu::Cpu expected = Measured(worker.process);
+  Require(expected.user_100ns + expected.kernel_100ns > 0, "actual child has measurable CPU");
+  DWORD code = 0; Require(GetExitCodeProcess(worker.process, &code) && code == STILL_ACTIVE,
+                          "terminated child can really have exit code 259");
+  Require(cu::Collect(token, &output) == 0 && Equal(output, expected), "successful reap returns exact GetProcessTimes CPU even for exit 259");
+  Require(Equal(Snapshot(), Add(before, expected)), "successful reap commits exactly once");
+  Require(cu::Collect(token, &output) == ERROR_NOT_FOUND && Equal(Snapshot(), Add(before, expected)), "repeat collection cannot count twice");
+  CloseHandle(worker.process);
+
+  worker = Spawn(37);
+  Require(cu::Register(worker.process, &token) == 0, "register concurrent collection child");
+  Finish(worker);
+  before = Snapshot(); expected = Measured(worker.process);
+  DWORD results[2]{};
+  std::thread a([&] { cu::Cpu sample{}; results[0] = cu::Collect(token, &sample); });
+  std::thread b([&] { cu::Cpu sample{}; results[1] = cu::Collect(token, &sample); });
+  a.join(); b.join();
+  Require((results[0] == 0 && results[1] == ERROR_NOT_FOUND) || (results[1] == 0 && results[0] == ERROR_NOT_FOUND),
+          "two concurrent collectors have exactly one winner");
+  Require(Equal(Snapshot(), Add(before, expected)), "concurrent consumption sums one real sample");
+  CloseHandle(worker.process);
+
+  worker = Spawn(0); before = Snapshot();
+  Require(cu::Register(worker.process, &token) == 0 && cu::Forget(token) == 0, "registration rollback releases its own record");
+  Finish(worker);
+  Require(cu::Collect(token, &output) == ERROR_NOT_FOUND && Equal(Snapshot(), before), "forgotten child is not reported as reaped");
+  CloseHandle(worker.process);
+  Require(cu::Register(nullptr, &token) != 0 && cu::Register(GetCurrentProcess(), &token) != 0,
+          "null and parent-process handles never invent a child");
+}
+
+void Native() {
+  Worker worker = Spawn(37);
+  int pid = static_cast<int>(GetProcessId(worker.process));
+  cu::Cpu before = Snapshot();
+  guest::Track(pid, Retain(worker.process));
+  int status = 123;
+  guest::LinuxRusage usage; std::memset(&usage, 0x5a, sizeof(usage));
+  guest::LinuxRusage sentinel = usage;
+  Require(guest::Wait4(pid, &status, 1, &usage) == 0 && status == 123 &&
+          std::memcmp(&usage, &sentinel, sizeof(usage)) == 0, "native WNOHANG leaves outputs and accounting unchanged");
+  Require(Equal(Snapshot(), before), "native registration is not a reap");
+  Finish(worker); WatchFinished(pid);
+  cu::Cpu expected = Measured(worker.process);
+  Require(Equal(Snapshot(), before), "native exit watcher does not preemptively count CPU");
+  Require(guest::Wait4(pid, &status, 0, &usage) == pid && status == ex::WaitStatus(37), "production wait4 preserves actual child status");
+  Require(Micros(usage.ru_utime) == expected.user_100ns / 10 && Micros(usage.ru_stime) == expected.kernel_100ns / 10,
+          "production wait4 writes that child's measured user/system CPU");
+  Require(Equal(Snapshot(), Add(before, expected)), "native wait4 commits its child once");
+  Queries(Add(before, expected));
+  errno = 0;
+  Require(guest::Waitpid(pid, nullptr, 0) == -1 && errno == 10 && Equal(Snapshot(), Add(before, expected)),
+          "waitpid after wait4 is ECHILD without another charge");
+  CloseHandle(worker.process);
+
+  worker = Spawn(19); pid = static_cast<int>(GetProcessId(worker.process)); before = Snapshot();
+  guest::Track(pid, Retain(worker.process));
+  Finish(worker); WatchFinished(pid); expected = Measured(worker.process);
+  Require(guest::Waitpid(pid, &status, 0) == pid, "waitpid also collects CPU without per-wait rusage");
+  Require(Equal(Snapshot(), Add(before, expected)), "status-only waits contribute to cumulative queries");
+  Queries(Add(before, expected));
+  CloseHandle(worker.process);
+
+  // Native SIGCHLD delivery can re-enter waitpid on the callback thread.
+  // Unregister must not join that thread, and its context must outlive reap.
+  worker = Spawn(29); pid = static_cast<int>(GetProcessId(worker.process)); before = Snapshot();
+  callback_pid = pid; callback_result = 0; guest::signal_hook = ReapInsideCallback;
+  guest::Track(pid, Retain(worker.process)); Finish(worker);
+  for (unsigned i = 0; i < 1000 && callback_result == 0; ++i) Sleep(1);
+  guest::signal_hook = nullptr;
+  Require(callback_result == pid, "callback may synchronously reap itself without deadlock or freed context");
+  Require(Equal(Snapshot(), Add(before, Measured(worker.process))), "callback re-entry accounts for one real child");
+  CloseHandle(worker.process);
+}
+
+void Java() {
+  Worker worker = Spawn(23);
+  int pid = static_cast<int>(GetProcessId(worker.process));
+  cu::Cpu before = Snapshot();
+  java::Insert(pid, Retain(worker.process));
+  Require(Equal(Snapshot(), before), "Java registration is not a reap");
+  Finish(worker);
+  cu::Cpu expected = Measured(worker.process);
+  Require(java::WaitForProcessExit(nullptr, nullptr, pid) == 23, "production Java reaper returns the real exit status");
+  Require(Equal(Snapshot(), Add(before, expected)), "Java reaper commits to the same process ledger as native wait4");
+  Queries(Add(before, expected));
+  Require(java::WaitForProcessExit(nullptr, nullptr, pid) == 0 && Equal(Snapshot(), Add(before, expected)),
+          "repeated Java wait preserves ECHILD behavior without duplicate accounting");
+  CloseHandle(worker.process);
+
+  if (!kHasUsage) return;
+  worker = Spawn(41); pid = static_cast<int>(GetProcessId(worker.process)); before = Snapshot();
+  java::Insert(pid, Retain(worker.process));
+  int statuses[2]{};
+  std::thread a([&] { statuses[0] = java::WaitForProcessExit(nullptr, nullptr, pid); });
+  std::thread b([&] { statuses[1] = java::WaitForProcessExit(nullptr, nullptr, pid); });
+  Sleep(20); Finish(worker); expected = Measured(worker.process);
+  a.join(); b.join();
+  Require((statuses[0] == 41 && statuses[1] == 0) || (statuses[1] == 41 && statuses[0] == 0),
+          "concurrent Java waiters have one successful consumer");
+  Require(Equal(Snapshot(), Add(before, expected)), "concurrent Java waits count once");
+  CloseHandle(worker.process);
+}
+
+#if @HOST_ONLY@
+void Faults() {
+  if (!kHasUsage) return;
+  Worker worker{};
+  boundary::Process* p = nullptr;
+  int pid = 0;
+  cu::Token token = 0;
+  cu::Cpu before = Snapshot(), output{44, 55};
+
+  @GENERATION_CONTROL@
+
+  worker = Spawn(0); pid = static_cast<int>(GetProcessId(worker.process)); before = Snapshot();
+  guest::Track(pid, Retain(worker.process)); Finish(worker);
+  Require(guest::Wait4(pid, nullptr, 0, reinterpret_cast<guest::LinuxRusage*>(uintptr_t{1})) == -1 && errno == 14,
+          "invalid wait4 output returns EFAULT after consuming the exited child");
+  Require(Equal(Snapshot(), Add(before, Measured(worker.process))) && guest::Waitpid(pid, nullptr, 0) == -1 && errno == 10,
+          "copy-out failure cannot resurrect or double count a consumed child");
+  CloseHandle(worker.process);
+
+  guest::Child synthetic{}; synthetic.exited = true; synthetic.status = 7 << 8;
+  guest::g_children.emplace(9999, synthetic); before = Snapshot();
+  guest::LinuxRusage no_measurement{};
+  Require(guest::Wait4(9999, nullptr, 0, &no_measurement) == -1 && errno == 38 && Equal(Snapshot(), before),
+          "inline synthetic child cannot report fabricated CPU");
+  Require(guest::Waitpid(9999, nullptr, 0) == 9999 && Equal(Snapshot(), before),
+          "ordinary synthetic status wait remains isolated from real CPU totals");
+
+  // Distinct identities deliberately reuse the same PID. A stale token cannot
+  // consume the replacement, even after the old record and handle disappear.
+  worker = Spawn(0); p = static_cast<boundary::Process*>(worker.process);
+  DWORD recycled_pid = p->pid;
+  Require(cu::Register(worker.process, &token) == 0 && cu::Forget(token) == 0, "retire first PID generation");
+  Finish(worker); CloseHandle(worker.process);
+  worker = Spawn(0); p = static_cast<boundary::Process*>(worker.process); p->pid = recycled_pid;
+  cu::Token replacement = 0;
+  Require(cu::Register(worker.process, &replacement) == 0 && replacement != token, "reused PID receives a distinct token");
+  Finish(worker);
+  Require(cu::Collect(token, &output) == ERROR_NOT_FOUND && cu::Collect(replacement, &output) == 0,
+          "stale PID generation cannot consume or block replacement");
+  CloseHandle(worker.process);
+
+  // Fractional 100 ns units are accumulated before conversion, not rounded per
+  // child. Both exported time formats are checked against the aggregate.
+  boundary::next_user = 9; boundary::next_kernel = 99999;
+  before = Snapshot();
+  for (int i = 0; i < 2; ++i) {
+    worker = Spawn(0); Require(cu::Register(worker.process, &token) == 0, "register fractional sample");
+    Finish(worker); Require(cu::Collect(token, &output) == 0, "collect fractional sample"); CloseHandle(worker.process);
+  }
+  Queries(Add(before, {18, 199998}));
+  boundary::next_user = 123456789; boundary::next_kernel = 23456789;
+  for (const auto& process : boundary::processes)
+    Require(process.get() == boundary::current || process->handles == 0, "all child handles are released exactly once");
+}
+
+void UnavailableQueries(DWORD error) {
+  cu::Cpu output{44, 55};
+  Require(cu::Snapshot(&output) == error && Equal(output, {44, 55}), "incomplete aggregate reports its error without partial or invented output");
+  guest::LinuxRusage usage; std::memset(&usage, 0x5a, sizeof(usage));
+  guest::LinuxRusage original = usage;
+  Require(guest::Getrusage(-1, &usage) == -1 && errno == cu::LinuxError(error) && !std::memcmp(&usage, &original, sizeof(usage)),
+          "guest rusage reports unavailable accounting without modifying output");
+  guest::LinuxTms ticks{11, 22, 33, 44}, saved = ticks;
+  Require(guest::Times(&ticks) == -1 && errno == cu::LinuxError(error) && !std::memcmp(&ticks, &saved, sizeof(ticks)),
+          "times reports unavailable accounting without modifying output");
+  posix::rusage host; std::memset(&host, 0x5a, sizeof(host));
+  posix::rusage saved_host = host;
+  Require(posix::getrusage(-1, &host) == -1 && errno == cu::LinuxError(error) && !std::memcmp(&host, &saved_host, sizeof(host)),
+          "POSIX queries share the same truthful unavailable state");
+}
+
+void SampleFailure(const char* mode) {
+  Worker worker = Spawn(37);
+  auto* p = static_cast<boundary::Process*>(worker.process);
+  int pid = static_cast<int>(p->pid);
+  bool is_java = std::strcmp(mode, "java-sample-failure") == 0;
+  if (is_java) java::Insert(pid, Retain(worker.process));
+  else guest::Track(pid, Retain(worker.process));
+  Finish(worker); p->fail_sample = true;
+  if (is_java) {
+    // Java invokes this native reaper once and publishes its returned status
+    // to public waitFor/exitValue. There is deliberately no hypothetical retry.
+    Require(java::WaitForProcessExit(nullptr, nullptr, pid) == 37,
+            "one-shot Java reaper publishes actual exit 37 even when CPU sampling fails");
+    Require(java::g_children.empty(), "Java has no unreachable retained child after its one reaper call");
+  } else {
+    int status = 0;
+    if (std::strcmp(mode, "wait4-sample-failure") == 0) {
+      guest::LinuxRusage usage; std::memset(&usage, 0x5a, sizeof(usage));
+      guest::LinuxRusage original = usage;
+      Require(guest::Wait4(pid, &status, 0, &usage) == -1 && errno == 13 && !std::memcmp(&usage, &original, sizeof(usage)),
+              "wait4 consumes completed child but reports failed CPU output without fabricating usage");
+    } else {
+      Require(guest::Waitpid(pid, &status, 0) == pid, "status-only native wait succeeds despite unavailable accounting");
+    }
+    Require(status == ex::WaitStatus(37) && guest::g_children.empty(), "native exit status stays authentic and child ownership is retired");
+    Require(guest::Waitpid(pid, nullptr, 0) == -1 && errno == 10, "failed usage output cannot leave a second reap");
+  }
+  Require(p->handles == 1, "provider and production reaper release every owned handle without another call");
+  UnavailableQueries(ERROR_ACCESS_DENIED);
+  p->fail_sample = false;
+  UnavailableQueries(ERROR_ACCESS_DENIED);  // No valid-looking partial total after the handle is gone.
+  CloseHandle(worker.process);
+  Require(p->handles == 0, "only the independent test oracle handle remained");
+}
+
+void Overflow() {
+  Worker worker = Spawn(0);
+  cu::Token token = 0;
+  cu::Cpu output{};
+  Require(cu::Register(worker.process, &token) == 0, "register initial CPU sample"); Finish(worker);
+  Require(cu::Collect(token, &output) == 0, "collect initial CPU sample"); CloseHandle(worker.process);
+  boundary::next_user = UINT64_MAX; boundary::next_kernel = 0;
+  worker = Spawn(0); Require(cu::Register(worker.process, &token) == 0, "register overflow sample"); Finish(worker);
+  output = {44, 55}; bool consumed = false;
+  Require(cu::Collect(token, &output, &consumed) == ERROR_ARITHMETIC_OVERFLOW && consumed && Equal(output, {44, 55}),
+          "overflow consumes the completed child without partial output");
+  Require(cu::Forget(token) == ERROR_NOT_FOUND, "overflow leaves no stranded registration");
+  UnavailableQueries(ERROR_ARITHMETIC_OVERFLOW);
+  CloseHandle(worker.process);
+  for (const auto& process : boundary::processes)
+    Require(process.get() == boundary::current || process->handles == 0, "overflow releases every child handle");
+}
+#endif
+
+int main(int argc, char** argv) {
+#ifdef _WIN32
+  if (argc > 1 && std::strcmp(argv[1], "--child") == 0) return ChildMain(argc, argv);
+#else
+  boundary::current = static_cast<boundary::Process*>(boundary::Spawn(0));
+  boundary::current->pid = 1;
+  if (argc > 1 && std::strcmp(argv[1], "normal") != 0) {
+    if (std::strcmp(argv[1], "overflow") == 0) Overflow();
+    else SampleFailure(argv[1]);
+    std::printf("CONTROLLED HOST failure contract: %d checks, %d failed\n", checks.load(), failures.load());
+    return failures ? 1 : 0;
+  }
+#endif
+  Provider(); Native(); Java();
+#if @HOST_ONLY_REPEAT@
+  Faults();
+#endif
+#ifdef _WIN32
+  HMODULE peer = LoadLibraryA("child-usage-peer.dll");
+  Require(peer != nullptr, "load peer DLL containing its own static provider object");
+  auto snapshot = reinterpret_cast<DWORD (*)(cu::Cpu*)>(GetProcAddress(peer, "peer_snapshot"));
+  auto registration = reinterpret_cast<DWORD (*)(HANDLE, cu::Token*)>(GetProcAddress(peer, "peer_register"));
+  Require(snapshot && registration, "peer exports resolve");
+  if (snapshot && registration) {
+    cu::Cpu from_peer{}; Require(snapshot(&from_peer) == 0 && Equal(from_peer, Snapshot()), "DLL queries share executable-owned totals");
+    Worker worker = Spawn(0); cu::Token token = 0; cu::Cpu before = Snapshot();
+    Require(registration(worker.process, &token) == 0, "DLL registers into executable owner");
+    Finish(worker); cu::Cpu sample{};
+    Require(cu::Collect(token, &sample) == 0 && Equal(sample, Measured(worker.process)), "executable consumes DLL-registered child");
+    Require(snapshot(&from_peer) == 0 && Equal(from_peer, Add(before, sample)), "DLL immediately observes successful reap");
+    CloseHandle(worker.process);
+  }
+  if (peer) FreeLibrary(peer);
+  std::printf("REAL WINDOWS child usage: %d checks, %d failed\n", checks.load(), failures.load());
+#else
+  std::printf("CONTROLLED HOST child usage: %d checks, %d failed\n", checks.load(), failures.load());
+#endif
+  return failures ? 1 : 0;
+}

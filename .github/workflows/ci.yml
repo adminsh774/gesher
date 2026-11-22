@@ -101,6 +101,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '21.0.13'
+      - name: Real child CPU accounting, production reapers and shared DLL owner
+        shell: pwsh
+        run: python tools/test_child_usage_contracts.py
       - name: Build actual app identity restart implementation
         shell: cmd
         run: cl /nologo /std:c++17 /EHsc /W4 /WX /D_WIN32_WINNT=0x0A00 compat\framework\services_zygote.cc tests\clipboard\standalone_restart_windows_test.cc /Fe:app-identity-restart.exe user32.lib
@@ -268,6 +271,7 @@ jobs:
           python3 tools/test_pthread_attribute_contracts.py --sanitize
           python3 tools/test_bionic_wait_contracts.py --sanitize
           python3 tools/test_libcore_process_logging.py --sanitize
+          python3 tools/test_child_usage_contracts.py --sanitize
           python3 tools/test_debug_memory_contracts.py --sanitize
           python3 tools/test_bionic_dns_contracts.py --sanitize
           python3 tools/test_ordinary_os_contracts.py --sanitize
@@ -2041,6 +2045,7 @@ jobs:
             results.txt
             ci-owners.json
             dist/realtime-signals-evidence/**/*.json
+            dist/child-usage-evidence/*
             ${{ runner.temp }}/gesher-root/devsvc-toast-*-projection.jsonl
             ${{ runner.temp }}/gesher-root/logs/system_server.log
           if-no-files-found: error

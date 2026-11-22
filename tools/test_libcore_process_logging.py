@@ -37,6 +37,8 @@ def main():
     process = (args.source_root / "compat/libcore/process.cc").read_text()
     spawn = (args.source_root / "compat/elf/exec/exec_spawn.cc").read_text()
     pieces = {
+        "@HAS_DUPLICATE_WAIT@": str(int("DuplicateHandle(GetCurrentProcess(), it->second.process" in process)),
+        "@HAS_SHARED_OWNER@": str(int("std::shared_ptr<ChildProcess>" in process)),
         "@WAIT_FOR_PROCESS_EXIT@": between(
             process, "jint JNICALL WaitForProcessExit(", "// Process.destroy():"),
         "@EXIT_STATUS@": between(spawn, "int ExitStatus(DWORD code)", "int WaitStatus(DWORD code)"),

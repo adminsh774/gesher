@@ -23,13 +23,16 @@
 // error=2, No such file or directory".
 
 #include <fcntl.h>
+#include <errno.h>
 #include <io.h>
 #include <stdio.h>
 
 #include <jni.h>
 #include <nativehelper/JNIHelp.h>
+#include <gesher/child_usage.h>
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -52,7 +55,13 @@ constexpr int kSigkill = 9;
 constexpr DWORD kPipeBuffer = 256 * 1024;
 
 std::mutex g_mutex;
-std::map<jint, HANDLE> g_children;  // pid -> process handle, until waited for
+struct ChildProcess {
+  HANDLE process;
+  gesher::child_usage::Token usage_token;
+  ChildProcess(HANDLE handle, gesher::child_usage::Token token) : process(handle), usage_token(token) {}
+  ~ChildProcess() { CloseHandle(process); }
+};
+std::map<jint, std::shared_ptr<ChildProcess>> g_children;  // pid -> owned generation, until reaped
 
 // The program being started, for the log line of a failure.
 thread_local const char* t_program = "";
@@ -175,9 +184,24 @@ jint JNICALL ForkAndExec(JNIEnv* env, jobject, jbyteArray prog, jbyteArray arg_b
   }
   CloseHandle(pi.hThread);
   jint pid = static_cast<jint>(pi.dwProcessId);
+  gesher::child_usage::Token usage_token = 0;
+  DWORD usage_error = gesher::child_usage::Register(pi.hProcess, &usage_token);
+  if (usage_error) {
+    TerminateProcess(pi.hProcess, 127);
+    CloseHandle(pi.hProcess);
+    cleanup();
+    return ThrowIOException(env, gesher::child_usage::LinuxError(usage_error)), -1;
+  }
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_children[pid] = pi.hProcess;
+    if (g_children.count(pid)) {
+      gesher::child_usage::Forget(usage_token);
+      TerminateProcess(pi.hProcess, 127);
+      CloseHandle(pi.hProcess);
+      cleanup();
+      return ThrowIOException(env, EAGAIN), -1;
+    }
+    g_children[pid] = std::make_shared<ChildProcess>(pi.hProcess, usage_token);
   }
 
   // The parent's ends become fds that FileInputStream/FileOutputStream own.
@@ -200,20 +224,33 @@ jint JNICALL ForkAndExec(JNIEnv* env, jobject, jbyteArray prog, jbyteArray arg_b
 }
 
 jint JNICALL WaitForProcessExit(JNIEnv*, jobject, jint pid) {
-  HANDLE h = nullptr;
+  std::shared_ptr<ChildProcess> child;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_children.find(pid);
     if (it == g_children.end()) return 0;  // waitpid's ECHILD: the JDK answers 0
-    h = it->second;
+    // Share this immutable generation while blocked: another waiter can retire
+    // the map entry without invalidating our handle. No per-wait duplication
+    // can fail and replace an otherwise authentic child status.
+    child = it->second;
   }
-  WaitForSingleObject(h, INFINITE);
+  HANDLE h = child->process;
+  gesher::child_usage::Token token = child->usage_token;
+  if (WaitForSingleObject(h, INFINITE) != WAIT_OBJECT_0) return -1;
   DWORD code = 0;
-  GetExitCodeProcess(h, &code);
+  if (!GetExitCodeProcess(h, &code)) return -1;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_children.erase(pid);
-    CloseHandle(h);
+    auto it = g_children.find(pid);
+    if (it == g_children.end() || it->second.get() != child.get()) return 0;
+    gesher::child_usage::Cpu cpu{};
+    bool consumed = false;
+    gesher::child_usage::Collect(token, &cpu, &consumed);
+    if (!consumed) gesher::child_usage::AbandonReaped(token);
+    // The OS wait and status query succeeded. An accounting failure cannot
+    // change that status or leave a child that Java's one-shot reaper cannot
+    // retry. The provider retires its handles and makes CPU queries fail.
+    g_children.erase(it);
   }
   int status = ex::ExitStatus(code);
   // stdout and stderr can share the app's log handle. A single fprintf can
@@ -254,7 +291,7 @@ void JNICALL DestroyProcess(JNIEnv*, jclass, jint pid) {
 void JNICALL DestroyProcessForcibly(JNIEnv*, jclass, jint pid) {
   std::lock_guard<std::mutex> lock(g_mutex);
   auto it = g_children.find(pid);
-  if (it != g_children.end()) TerminateProcess(it->second, 0x80 + kSigkill);
+  if (it != g_children.end()) TerminateProcess(it->second->process, 0x80 + kSigkill);
 }
 
 void JNICALL InitIDs(JNIEnv*, jclass) {}

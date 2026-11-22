@@ -2,6 +2,7 @@
 # Headers in include/ shadow or extend mingw's; implementations in src/.
 add_library(gesher_posix STATIC
   ${CMAKE_CURRENT_LIST_DIR}/src/binder.cc
+  ${CMAKE_CURRENT_LIST_DIR}/src/child_usage.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/crash.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/dirent.cc
   ${CMAKE_CURRENT_LIST_DIR}/src/dlfcn.cc
@@ -79,6 +80,8 @@ target_link_options(gesher_posix INTERFACE -Wl,-u,gesher_signal_mailbox_anchor)
 # DLL callers resolve the futex queue in the executable. Force a private anchor:
 # an import library can satisfy the public owner symbol without extracting it.
 target_link_options(gesher_posix INTERFACE -Wl,-u,gesher_futex_owner_anchor_v1)
+# Reaped-child CPU totals must also be shared by Bionic/libcore callers in DLLs.
+target_link_options(gesher_posix INTERFACE -Wl,-u,gesher_child_usage_owner_anchor_v1)
 # posix_memalign() memory goes to free()/realloc() (src/memalign.cc).
 target_link_options(gesher_posix INTERFACE -Wl,--wrap=free -Wl,--wrap=realloc)
 target_include_directories(gesher_posix BEFORE PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)

@@ -7,6 +7,7 @@
 // RegisterExtra) before the core files, so their definitions win.
 
 #include "extra_bionic.h"
+#include "resource_usage.h"
 
 #include <gesher/bionic_shim.h>
 #include <gesher/elf_loader.h>
@@ -314,28 +315,23 @@ int BIONIC_SYSV BarrierattrDestroy(int*) { return 0; }
 int64_t FileTime100ns(FILETIME f) {
   return (static_cast<int64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
 }
-struct LinuxTimeval {
-  int64_t tv_sec, tv_usec;
-};
-struct LinuxRusage {
-  LinuxTimeval ru_utime, ru_stime;
-  int64_t ru_maxrss, ru_ixrss, ru_idrss, ru_isrss, ru_minflt, ru_majflt, ru_nswap, ru_inblock,
-      ru_oublock, ru_msgsnd, ru_msgrcv, ru_nsignals, ru_nvcsw, ru_nivcsw;
-};
-static_assert(sizeof(LinuxRusage) == 144, "struct rusage");
 LinuxTimeval Tv(int64_t t100) { return {t100 / 10000000, (t100 % 10000000) / 10}; }
 int BIONIC_SYSV Getrusage(int who, LinuxRusage* ru) {
-  if (ru == nullptr) return errno = kEFAULT, -1;
+  if (who != -1 && who != 0 && who != 1) return errno = kEINVAL, -1;
+  if (!child_usage::Writable(ru, sizeof(*ru))) return errno = kEFAULT, -1;
+  if (who == -1) {
+    child_usage::Cpu cpu{};
+    DWORD error = child_usage::Snapshot(&cpu);
+    if (error) return errno = child_usage::LinuxError(error), -1;
+    ChildRusage(cpu, ru);
+    return 0;
+  }
   std::memset(ru, 0, sizeof(*ru));
   FILETIME c, e, k, u;
   if (who == 1) {  // RUSAGE_THREAD
     if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return errno = kEINVAL, -1;
   } else if (who == 0) {  // RUSAGE_SELF
     if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return errno = kEINVAL, -1;
-  } else if (who == -1) {  // RUSAGE_CHILDREN: none tracked
-    return 0;
-  } else {
-    return errno = kEINVAL, -1;
   }
   ru->ru_utime = Tv(FileTime100ns(u));
   ru->ru_stime = Tv(FileTime100ns(k));
@@ -351,11 +347,16 @@ struct LinuxTms {
 };
 int64_t BIONIC_SYSV Times(LinuxTms* t) {
   if (t != nullptr) {
+    if (!child_usage::Writable(t, sizeof(*t))) return errno = kEFAULT, -1;
+    child_usage::Cpu cpu{};
+    DWORD error = child_usage::Snapshot(&cpu);
+    if (error) return errno = child_usage::LinuxError(error), -1;
     FILETIME c, e, k, u;
-    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return errno = EIO, -1;
     t->tms_utime = FileTime100ns(u) / 100000;  // clock ticks of 10 ms (_SC_CLK_TCK 100)
     t->tms_stime = FileTime100ns(k) / 100000;
-    t->tms_cutime = t->tms_cstime = 0;
+    t->tms_cutime = static_cast<int64_t>(cpu.user_100ns / 100000);
+    t->tms_cstime = static_cast<int64_t>(cpu.kernel_100ns / 100000);
   }
   return static_cast<int64_t>(GetTickCount64() / 10);
 }

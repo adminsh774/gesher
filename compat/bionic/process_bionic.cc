@@ -48,11 +48,13 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
 #include "exec_spawn.h"
 #include "spawn_actions.h"
+#include "resource_usage.h"
 #include "system_cacerts.h"
 
 // gesher-base: kill() of a process other than this one's children (signal
@@ -70,11 +72,25 @@ constexpr int kCldExited = 1;  // siginfo si_code for a normal child exit
 
 // --- the shim's children -------------------------------------------------------
 
+struct ChildWatch {
+  int pid;
+  child_usage::Token generation;
+  // One reference belongs to the child record, one to the one-shot callback.
+  // A SIGCHLD handler may reap from inside that same callback: never join it.
+  std::atomic<unsigned> references{2};
+};
+void ReleaseWatch(ChildWatch* watch) {
+  if (watch && watch->references.fetch_sub(1, std::memory_order_acq_rel) == 1) delete watch;
+}
+
 struct Child {
   HANDLE process = nullptr;
   bool exited = false;
   int status = 0;  // Linux waitpid status word, once reaped by the watcher
   HANDLE wait = nullptr;
+  child_usage::Token usage_token = 0;
+  ChildWatch* callback = nullptr;
+  DWORD status_error = ERROR_SUCCESS;
   // The pipe whose byte the fork child read ahead of its parent's write (ChildReadsParentByte):
   // until the parent writes it, the child is not waited for. On Linux it cannot have exited
   // before then; Dart's Process.start registers the pid between fork and that write, and a
@@ -87,33 +103,56 @@ std::mutex g_children_mutex;
 std::map<int, Child> g_children;  // pid -> child
 
 void CALLBACK OnChildExit(void* param, BOOLEAN) {
-  int pid = static_cast<int>(reinterpret_cast<intptr_t>(param));
+  auto* watch = static_cast<ChildWatch*>(param);
+  int pid = watch->pid;
   int sig_status = 0;
   bool deliver = false;
   {
     std::lock_guard<std::mutex> lock(g_children_mutex);
     auto it = g_children.find(pid);
-    if (it != g_children.end() && !it->second.exited) {
+    if (it != g_children.end() && it->second.usage_token == watch->generation && !it->second.exited) {
       DWORD code = 0;
-      GetExitCodeProcess(it->second.process, &code);
-      it->second.status = ex::WaitStatus(code);
+      if (!GetExitCodeProcess(it->second.process, &code)) {
+        it->second.status_error = GetLastError();
+        if (!it->second.status_error) it->second.status_error = ERROR_INVALID_HANDLE;
+      }
+      else it->second.status = ex::WaitStatus(code);
       it->second.exited = true;
       sig_status = it->second.status;
-      deliver = true;
+      deliver = it->second.status_error == ERROR_SUCCESS;
     }
   }
   if (deliver) DeliverExternalSignal(kSigchld, 0, kCldExited, sig_status, false);
+  ReleaseWatch(watch);
 }
 
-void Track(int pid, HANDLE process) {
+DWORD Track(int pid, HANDLE process) {
+  child_usage::Token token = 0;
+  DWORD error = child_usage::Register(process, &token);
+  if (error) return error;
+  auto* callback = new (std::nothrow) ChildWatch{pid, token};
+  if (!callback) { child_usage::Forget(token); return ERROR_NOT_ENOUGH_MEMORY; }
   std::lock_guard<std::mutex> lock(g_children_mutex);
+  if (g_children.count(pid)) {
+    delete callback;
+    child_usage::Forget(token);
+    return ERROR_ALREADY_EXISTS;
+  }
   Child& c = g_children[pid];
   c.process = process;
   c.exited = false;
   c.status = 0;
-  RegisterWaitForSingleObject(&c.wait, process, OnChildExit,
-                              reinterpret_cast<void*>(static_cast<intptr_t>(pid)), INFINITE,
-                              WT_EXECUTEONLYONCE);
+  c.usage_token = token;
+  c.callback = callback;
+  if (!RegisterWaitForSingleObject(&c.wait, process, OnChildExit, callback, INFINITE,
+                                  WT_EXECUTEONLYONCE)) {
+    error = GetLastError();
+    g_children.erase(pid);
+    delete callback;  // No callback was registered.
+    child_usage::Forget(token);
+    return error ? error : ERROR_INVALID_HANDLE;
+  }
+  return ERROR_SUCCESS;
 }
 
 // --- the environment and working directory as UTF-8 ----------------------------
@@ -238,7 +277,12 @@ int SpawnPrepared(const ex::Launch& launch, const std::vector<std::string>& env,
   if (werr != 0) return errno = ex::ErrnoFromWin32(werr), -1;
   CloseHandle(pi.hThread);
   int pid = static_cast<int>(pi.dwProcessId);
-  Track(pid, pi.hProcess);
+  werr = Track(pid, pi.hProcess);
+  if (werr) {
+    TerminateProcess(pi.hProcess, 127);
+    CloseHandle(pi.hProcess);
+    return errno = child_usage::LinuxError(werr), -1;
+  }
   return pid;
 }
 
@@ -552,10 +596,10 @@ int BIONIC_SYSV Execvpe(const char* file, char* const argv[], char* const envp[]
 
 constexpr int kWNOHANG = 1;
 
-int CollectOne(int pid, int* status, int options) {
+int CollectOne(int pid, int* status, int options, LinuxRusage* usage = nullptr) {
   for (;;) {
     {
-      std::lock_guard<std::mutex> lock(g_children_mutex);
+      std::unique_lock<std::mutex> lock(g_children_mutex);
       if (g_children.empty()) return errno = 10 /*ECHILD*/, -1;
       // A specific pid, or any (-1/0).
       bool found = false;
@@ -563,11 +607,43 @@ int CollectOne(int pid, int* status, int options) {
         if (pid > 0 && kv.first != pid) continue;
         found = true;
         if (kv.second.exited && kv.second.gate == 0) {
-          if (status != nullptr) *status = kv.second.status;
+          Child& child = kv.second;
+          child_usage::Cpu cpu{};
+          DWORD usage_error = ERROR_SUCCESS;
+          if (child.process) {
+            if (child.status_error) {
+              DWORD code = 0;
+              if (!GetExitCodeProcess(child.process, &code))
+                return errno = child_usage::LinuxError(GetLastError()), -1;
+              child.status = ex::WaitStatus(code);
+              child.status_error = ERROR_SUCCESS;
+            }
+            bool consumed = false;
+            usage_error = child_usage::Collect(child.usage_token, &cpu, &consumed);
+            if (!consumed) return errno = child_usage::LinuxError(usage_error), -1;
+          } else if (usage) {
+            // The pending fork-removal work owns inline synthetic children.
+            // No independently executing process exists to measure here.
+            return errno = kENOSYS, -1;
+          }
           int got = kv.first;
-          if (kv.second.wait != nullptr) UnregisterWaitEx(kv.second.wait, nullptr);
-          if (kv.second.process != nullptr) CloseHandle(kv.second.process);
+          Child retired = child;
           g_children.erase(kv.first);
+          lock.unlock();
+          if (retired.wait != nullptr) UnregisterWaitEx(retired.wait, nullptr);
+          if (retired.process != nullptr) CloseHandle(retired.process);
+          ReleaseWatch(retired.callback);
+          // Like wait4's copy-to-user, output failure does not resurrect an
+          // already consumed child or undo its accounting.
+          if (status) {
+            if (!child_usage::Writable(status, sizeof(*status))) return errno = kEFAULT, -1;
+            *status = retired.status;
+          }
+          if (usage) {
+            if (usage_error) return errno = child_usage::LinuxError(usage_error), -1;
+            if (!child_usage::Writable(usage, sizeof(*usage))) return errno = kEFAULT, -1;
+            ChildRusage(cpu, usage);
+          }
           return got;
         }
         if (pid > 0) break;
@@ -585,8 +661,8 @@ int CollectOne(int pid, int* status, int options) {
 
 int BIONIC_SYSV Waitpid(int pid, int* status, int options) { return CollectOne(pid, status, options); }
 int BIONIC_SYSV Wait(int* status) { return CollectOne(-1, status, 0); }
-int BIONIC_SYSV Wait4(int pid, int* status, int options, void* /*rusage*/) {
-  return CollectOne(pid, status, options);
+int BIONIC_SYSV Wait4(int pid, int* status, int options, LinuxRusage* usage) {
+  return CollectOne(pid, status, options, usage);
 }
 
 // --- system / popen ------------------------------------------------------------

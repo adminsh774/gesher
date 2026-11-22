@@ -21,6 +21,8 @@
 #include <unistd.h>
 #include <windows.h>
 #include <psapi.h>
+#include <gesher/child_usage.h>
+#include <limits.h>
 
 #include <mutex>
 #include <string>
@@ -299,8 +301,21 @@ int getrusage(int who, struct rusage* usage) {
     return errno = EINVAL, -1;
   }
   if (usage == nullptr) return errno = EFAULT, -1;
+  if (who == RUSAGE_CHILDREN) {
+    gesher::child_usage::Cpu cpu{};
+    DWORD error = gesher::child_usage::Snapshot(&cpu);
+    if (error) return errno = gesher::child_usage::LinuxError(error), -1;
+    if (cpu.user_100ns / 10000000 > LONG_MAX || cpu.kernel_100ns / 10000000 > LONG_MAX)
+      return errno = EOVERFLOW, -1;
+    if (!Writable(usage, sizeof(*usage))) return errno = EFAULT, -1;
+    memset(usage, 0, sizeof(*usage));
+    usage->ru_utime = {static_cast<long>(cpu.user_100ns / 10000000),
+                      static_cast<long>((cpu.user_100ns % 10000000) / 10)};
+    usage->ru_stime = {static_cast<long>(cpu.kernel_100ns / 10000000),
+                      static_cast<long>((cpu.kernel_100ns % 10000000) / 10)};
+    return 0;
+  }
   memset(usage, 0, sizeof(*usage));
-  if (who == RUSAGE_CHILDREN) return 0;  // children's times are not collected
   FILETIME create, exit, kernel, user;
   BOOL ok = who == RUSAGE_THREAD
                 ? GetThreadTimes(GetCurrentThread(), &create, &exit, &kernel, &user)

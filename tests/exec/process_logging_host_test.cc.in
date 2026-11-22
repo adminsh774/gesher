@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -22,11 +23,40 @@ using jobject = void*;
 struct JNIEnv {};
 #define JNICALL
 constexpr DWORD INFINITE = 0xffffffffu;
+constexpr DWORD WAIT_OBJECT_0 = 0, ERROR_SUCCESS = 0;
+constexpr DWORD PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, SYNCHRONIZE = 0x100000;
+constexpr bool FALSE = false;
+constexpr bool kHasDuplicateWait = @HAS_DUPLICATE_WAIT@;
+constexpr bool kHasSharedOwner = @HAS_SHARED_OWNER@;
+
+namespace gesher::child_usage {
+using Token = uint64_t;
+struct Cpu { uint64_t user_100ns = 0, kernel_100ns = 0; };
+DWORD Collect(Token token, Cpu* cpu, bool* consumed = nullptr) {
+  if (!token || !cpu) std::abort();
+  if (consumed) *consumed = true;
+  return ERROR_SUCCESS;
+}
+DWORD AbandonReaped(Token) { std::abort(); }
+}
+bool CloseHandle(HANDLE handle);
+struct ChildProcess {
+  HANDLE process;
+  gesher::child_usage::Token usage_token = 1;
+  ChildProcess(HANDLE handle) : process(handle) {}
+  ~ChildProcess() { if (kHasSharedOwner) CloseHandle(process); }
+  operator HANDLE() const { return process; }
+};
+struct ChildRef : std::shared_ptr<ChildProcess> {
+  ChildRef(HANDLE h) : std::shared_ptr<ChildProcess>(std::make_shared<ChildProcess>(h)) {}
+  operator HANDLE() const { return get()->process; }
+};
 
 std::mutex g_mutex;
-std::map<jint, HANDLE> g_children;
+std::map<jint, ChildRef> g_children;
 const HANDLE kChild = reinterpret_cast<HANDLE>(uintptr_t{0x101});
 const HANDLE kOtherChild = reinterpret_cast<HANDLE>(uintptr_t{0x102});
+const HANDLE kChildWait = reinterpret_cast<HANDLE>(uintptr_t{0x103});
 const intptr_t kRedirectedSink = 0x201;
 const char kAppRecord[] = "gesher-app: window \"GamePlay\": Win32 popup, input attached\n";
 
@@ -87,14 +117,21 @@ void SinkWrite(const std::string& text) {
   }
 }
 
+HANDLE GetCurrentProcess() { return reinterpret_cast<HANDLE>(uintptr_t{0x99}); }
+bool DuplicateHandle(HANDLE, HANDLE source, HANDLE, HANDLE* duplicate, DWORD rights, bool, DWORD) {
+  Check(source == kChild && rights == (PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE),
+        "retains only wait/query access to the actual child");
+  *duplicate = kChildWait;
+  return true;
+}
 DWORD WaitForSingleObject(HANDLE handle, DWORD timeout) {
-  Check(handle == kChild && timeout == INFINITE, "waits for the actual child");
+  Check(handle == (kHasDuplicateWait ? kChildWait : kChild) && timeout == INFINITE, "waits for the actual child");
   ++waits;
   return 0;
 }
 
 bool GetExitCodeProcess(HANDLE handle, DWORD* code) {
-  Check(handle == kChild && waits == 1, "reads status after the child wait");
+  Check(handle == (kHasDuplicateWait ? kChildWait : kChild) && waits == 1, "reads status after the child wait");
   ++exit_queries;
   *code = exit_code;
   return true;
@@ -174,7 +211,8 @@ void CheckCleanup(jint pid, int status, int expected) {
   Check(waits == 1 && exit_queries == 1, "waits and queries exactly once");
   Check(g_children.count(pid) == 0 && g_children.size() == 1 && g_children.at(7) == kOtherChild,
         "removes only the waited child");
-  Check(closed.size() == 1 && closed[0] == kChild, "closes only the child, never the borrowed sink");
+  Check(closed.size() == (kHasDuplicateWait ? 2u : 1u) && closed[0] == kChild &&
+        (!kHasDuplicateWait || closed[1] == kChildWait), "closes only owned child handles, never the borrowed sink");
 }
 
 void Case(jint pid, DWORD code, int expected) {
@@ -242,5 +280,6 @@ int main() {
   }
 
   std::printf("process logging: %d checks, %d failed\n", checks, failures);
+  g_children.clear();  // Retire test-owned handles before the recording vector's destructor.
   return failures ? 1 : 0;
 }

@@ -65,3 +65,6 @@ Check 'exec: ProcessBuilder runs an ELF executable (stdin/stdout/stderr pipes, e
   & "$Dir/dalvikvm.exe" "-Xbootclasspath:$bcp" "-Ximage:$(NoDrive "$root/system")/framework/boot.art" `
     -Xint '-Xusejit:false' -cp (NoDrive "$Dir/exec-test.dex") gesher.ExecTest (NoDrive (Resolve-Path $Dir).Path)
 } @('ExecTest all passed')
+
+& "$PSScriptRoot/../child-usage-contracts.ps1" -Dir $Dir -Mode Java -BootRoot $root -BootClasspath $bcp
+if ($LASTEXITCODE -ne 0) { $failed++ }
