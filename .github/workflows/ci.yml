@@ -139,6 +139,7 @@ jobs:
           tests/windows/shell/MicrogDefaultsChecks.ps1
           tests/windows/shell/ControlPanelRefreshChecks.ps1
           tests/windows/shell/ControlPanelIconCacheChecks.ps1
+          tests/windows/shell/ControlPanelProxyChecks.ps1
           tests/windows/shell/ControlPanelVirtualizationChecks.ps1
           tests/windows/shell/ControlPanelActionChecks.ps1
           tests/windows/shell/ControlPanelRequestChecks.ps1

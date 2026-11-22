@@ -243,7 +243,9 @@ processes of packages without it; gesher-app applies it in its own process
   return it.
 - **Gesher's own proxy**, over Windows' settings (`com.gesher.net.ProxySetting`): for every
   app or for one package, saved in `<data>/system/proxy.properties` by
-  `gesher-app proxy [PACKAGE] host:port|direct|windows` (no argument shows them; `direct`
+  `gesher-app proxy [PACKAGE] host:port|direct|windows` or in the control panel ("Proxy for
+  every app" above the app list, and each app's "Proxy" button, where "Same as every app"
+  removes the package's own setting) (no argument shows them; `direct`
   is no proxy; `windows` for a package is Windows' settings over every app's setting), or for
   one launch (`gesher-app launch PACKAGE --proxy host:port`). The system server gives an app
   process its setting (the launch's, else the package's, else every app's) as
