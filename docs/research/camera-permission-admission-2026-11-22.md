@@ -93,6 +93,15 @@ After another bounded issue-56 PR merges, rebase and refresh the pin to a review
 published recipe containing the union of merged and new gates. Selecting one
 competing branch's old pin can silently omit another branch's coverage.
 
+The first published CI run, [45021346640](https://github.com/gesher-runtime/gesher/actions/runs/45021346640),
+correctly rejected the changed shared devices track in its WinRT source gate:
+the manifest still expected `b3f3f90ccd1c4c4cc849def7bcdceac03b83be4e`.
+The reviewed camera fixture additions change that track's blob to
+`1060ef95189434f10f57b9d10abf61274b9e19f3`. The gate now pins that exact reviewed
+blob; its other nine geocoder pins, actual checkout identity assertion and all
+hash comparisons remain intact. Running the same gate against the source tree
+passes; an isolated changed-file negative control is still rejected.
+
 Actual Windows CI results belong to the published commit/run. No Linux host
 result, prepared gate or APK build is described as physical-camera or matching
 Android-device execution. This does not complete C07's active capture revocation,
