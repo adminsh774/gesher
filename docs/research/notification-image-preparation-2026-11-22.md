@@ -169,6 +169,77 @@ are component elapsed samples under the track's interpreter configuration,
 not process CPU, RSS, ordinary APK notification latency, or a whole-app result.
 No target improvement percentage is asserted before observing those results.
 
+## Windows PNG oracle correction
+
+The first published head `4c9625ca8554bc02bbd4c6e29a8f1ea539587e67` failed both new
+PNG checks on Windows 2022 and 2025 in [CI run 45026032260](https://github.com/gesher-runtime/gesher/actions/runs/45026032260):
+jobs [137227756931](https://github.com/gesher-runtime/gesher/actions/runs/45026032260/job/137227756931)
+and [137227756917](https://github.com/gesher-runtime/gesher/actions/runs/45026032260/job/137227756917).
+The combined assertions reported a dimension change and failed restart retention;
+both were immediately preceded by HWUI's `Not supported on Windows` message. The
+artifacts retained logs, not the PNG files or actual decoded dimensions, so those
+logs alone did not prove a bad encoder, lost file or dimension mismatch.
+
+The exact pinned Android 16 source explains the failure. [BitmapFactory.java](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/graphics/java/android/graphics/BitmapFactory.java)
+opens `decodeFile`'s path with `IoBridge.open` and dispatches a seekable descriptor
+to `nativeDecodeFileDescriptor`. [BitmapFactory.cpp](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/libs/hwui/jni/BitmapFactory.cpp)
+returns null unconditionally under `_WIN32` in that method, with the observed
+message. Gesher builds that host source in `cmake/aosp/hwui.cmake`; its JNI table
+patch does not replace this branch. The cached framework compile artifact's
+`javap` output independently confirms the same Java call chain. This is a
+pre-existing **unimplemented file-descriptor Bitmap decoder API**, which remains
+unfixed by this notification work. Neither open #226 (clipboard fixture) nor
+#235 (WebView geometry) supplies that API.
+
+The notification production path does not decode its PNG with BitmapFactory:
+`NotificationManagerService.showToast` gives the saved file URI to the Windows
+toast XML, or the same path to the native notification bridge. The PNG creation
+and file-lifetime oracle now reads the actual saved file using `Files.readAllBytes`
+and passes exactly those bytes to the existing real native
+`BitmapFactory.decodeByteArray`/Skia decoder. It still fails for missing files,
+invalid PNG headers, null native decoding, dimension changes and every prior
+opaque/translucent/RGB565 pixel assertion. Mutable-source, alpha-metadata,
+same-length corruption, abandoned-stage and cache-decision assertions remain.
+This is a test-boundary correction, not evidence that `decodeFile` works or that
+Windows has displayed a toast.
+
+An explicit old-writer control uses the original compress-to-byte-array,
+temporary-file write and rename sequence on the same actual Bitmap before testing
+the new store. It requires the saved PNG's native byte decoding and all pixel
+comparisons to pass; it separately prints whether `decodeFile` returned null.
+If that API is available, its dimensions and pixels must also agree. On the
+current Windows runtime the expected diagnostic is `byte_decoder=passed
+file_descriptor_decoder=null`; its first observed target result remains pending.
+
+Every saved-image check emits its canonical pathname, byte count, SHA256, raw
+33-byte PNG header and native decoded dimensions. Restart write records the
+canonical path, length and SHA256 in a separate fixture receipt. The second VM
+must read that receipt without recreating it, verify the exact persisted file
+identity/content, decode that file's bytes and check all four pixels of both red
+and blue icons. Existing notification and toast-format migration assertions are
+unchanged. Track94 now retains these diagnostics and all 31 component samples in
+`results.txt` even when the gate passes; its shared `Check` helper ordinarily
+suppresses successful child output. The artifacts preserve diagnostic text,
+headers, hashes and raw samples, not complete PNG binaries.
+
+No production source, native patch, timeout, retry or accepted test failure is
+changed by this correction. A fresh Windows 2022/2025 run remains necessary to
+establish actual PNG fidelity, restart retention and the old-writer control.
+
+Local correction checks pass: complete services javac/D8 compilation against the
+actual framework and Android libcore inputs; the unchanged owner/service suites
+(446/46 checks); PowerShell parsing of track94; and syntax checking of the narrow
+ART runner. Independent QA passed the exact correction tree
+`28e4484bb270f88404f1bc11372003d99e1a69e6` and ran a corrected 17-check host
+file/header/receipt probe with a known 74-byte 2x2 PNG and an independently
+calculated SHA256. Its rejection helper asserts outside the catch, so it cannot
+swallow its own acceptance failure. It verifies rejection of missing, truncated
+and malformed files and changed receipts for a different pathname, length and
+same-length content corruption. The author's earlier 12-check probe had that
+catch defect and is not relied on as negative-control evidence. The independent
+probe does not invoke an Android native decoder and is not target PNG-fidelity
+evidence.
+
 ## Reproduction
 
 Run the standalone owner with a JDK on PATH:

@@ -321,10 +321,14 @@ Check 'services: notification image preparation progress, cancellation and repla
 } @('NotificationImagePublicationTest passed:')
 $imageBitmapOut = FixesRun ($imageArgs + 'com.gesher.server.NotificationImageBitmapTest') 120
 $imageBitmapCode = $LASTEXITCODE
+# Check suppresses passing child output. Keep the actual PNG/control evidence
+# and all component samples in results.txt on success as well as on failure.
+($imageBitmapOut -split "`r?`n" | Where-Object { $_ -match '^NOTIFICATION_(PNG_|IMAGE_BITMAP_METRICS)' }) | ForEach-Object { Write-Host $_ }
 Check 'services: actual Bitmap PNG fidelity, mutable source invalidation and content reuse' {
   $global:LASTEXITCODE = $imageBitmapCode
   $imageBitmapOut
-} @('NotificationImageBitmapTest passed:', 'NOTIFICATION_IMAGE_BITMAP_METRICS')
+} @('NotificationImageBitmapTest passed:', 'NOTIFICATION_IMAGE_BITMAP_METRICS',
+  'NOTIFICATION_PNG_ORIGINAL_WRITER_CONTROL', 'NOTIFICATION_PNG_DECODE')
 
 # The identity/format fixtures call package-private production storage methods.
 # Keep the shared profile across two VMs to verify persisted records and PNGs.
@@ -341,11 +345,14 @@ try {
   foreach ($formatPhase in @('write', 'read')) {
     $formatOut = FixesRun ($formatArgs + $formatPhase) 90
     $formatCode = $LASTEXITCODE
+    ($formatOut -split "`r?`n" | Where-Object { $_ -match '^NOTIFICATION_PNG_' }) | ForEach-Object { Write-Host $_ }
+    $formatExpected = @("NotificationIdentityDevice $formatPhase passed:", "ToastIdentityDevice $formatPhase passed:",
+      "NotificationStoreFormatDevice $formatPhase passed:")
+    if ($formatPhase -eq 'read') { $formatExpected += 'NOTIFICATION_PNG_RESTART_VERIFIED' }
     Check "services: native notification formats, toast identity and image restart retention ($formatPhase)" {
       $global:LASTEXITCODE = $formatCode
       $formatOut
-    } @("NotificationIdentityDevice $formatPhase passed:", "ToastIdentityDevice $formatPhase passed:",
-      "NotificationStoreFormatDevice $formatPhase passed:")
+    } $formatExpected
   }
 } finally {
   if ($null -eq $formatSavedData) { Remove-Item Env:ANDROID_DATA -ErrorAction SilentlyContinue }

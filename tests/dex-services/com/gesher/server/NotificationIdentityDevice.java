@@ -3,11 +3,11 @@ package com.gesher.server;
 
 import android.app.Notification;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
 import java.io.File;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 
 /** Narrow ART gate using real Android Parcel and production store files, without UI. */
 public final class NotificationIdentityDevice {
@@ -41,14 +41,30 @@ public final class NotificationIdentityDevice {
             return (File)publish.invoke(prepared);
         }
     }
+    static File imageReceipt(String key) {
+        return new File(Device.dataDir(), "notification-image-" + NotificationIdentity.digest(key) + ".receipt");
+    }
+    static void rememberImage(String key, File file) throws Exception {
+        NotificationPngFixture.Saved png = new NotificationPngFixture.Saved(file);
+        Files.write(imageReceipt(key).toPath(), png.receipt().getBytes(StandardCharsets.UTF_8));
+    }
     static void retainedImage(String key, int color) throws Exception {
         Method path = NotificationIcons.class.getDeclaredMethod("largeFile", String.class, String.class);
         path.setAccessible(true);
         File file = (File)path.invoke(null, PKG, key);
-        Bitmap bitmap = BitmapFactory.decodeFile(file.getPath());
-        check(bitmap != null && bitmap.getWidth() == 2 && bitmap.getHeight() == 2
-                && bitmap.getPixel(0, 0) == color, "Retained toast image did not survive process restart");
-        bitmap.recycle();
+        NotificationPngFixture.Saved png = new NotificationPngFixture.Saved(file);
+        String written = new String(Files.readAllBytes(imageReceipt(key).toPath()), StandardCharsets.UTF_8);
+        check(png.receipt().equals(written), "Retained toast image path or bytes changed after process restart");
+        Bitmap bitmap = png.decode();
+        try {
+            check(bitmap.getWidth() == 2 && bitmap.getHeight() == 2,
+                    "Retained toast image dimensions changed after process restart");
+            for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+                check(bitmap.getPixel(x, y) == color, "Retained toast image pixels changed after process restart");
+            }
+        } finally { bitmap.recycle(); }
+        System.out.println("NOTIFICATION_PNG_RESTART_VERIFIED path=" + png.path + " bytes=" + png.bytes.length
+                + " sha256=" + png.sha256);
     }
     public static void main(String[] args) throws Exception {
         System.loadLibrary("android_runtime");
@@ -64,6 +80,7 @@ public final class NotificationIdentityDevice {
                 check(first != null && second != null && !first.equals(second), "Large icon paths alias");
                 check(!java.util.Arrays.equals(Files.readAllBytes(first.toPath()), Files.readAllBytes(second.toPath())),
                         "Distinct notification icons overwrote image content");
+                rememberImage(A, first); rememberImage(B, second);
                 String longPackage = "com." + "a".repeat(200);
                 check(android.content.pm.parsing.FrameworkParsingPackageUtils.validateName(longPackage, true, true) == null,
                         "Long-package fixture rejected by Android's package validator");

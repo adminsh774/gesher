@@ -42,6 +42,7 @@ def main():
         sources.append(ROOT / 'tests/notification-identity/ToastTagProbe.java')
     else:
         sources.append(ROOT / 'tests/dex-services/com/gesher/server/NotificationIdentityDevice.java')
+        sources.append(ROOT / 'tests/dex-services/com/gesher/server/NotificationPngFixture.java')
         sources.append(ROOT / 'tests/dex-services/com/gesher/server/ToastIdentityDevice.java')
         sources.append(ROOT / 'tests/dex-services/com/gesher/server/NotificationStoreFormatDevice.java')
     subprocess.run([str(a.java_home / 'bin/javac'), '-source', '17', '-target', '17',

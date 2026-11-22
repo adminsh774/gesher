@@ -28,20 +28,54 @@ public final class NotificationImageBitmapTest {
         int[] result = new int[bitmap.getWidth() * bitmap.getHeight()];
         bitmap.getPixels(result, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight()); return result;
     }
-    private static void equal(File file, Bitmap input) {
-        Bitmap decoded = BitmapFactory.decodeFile(file.getPath());
-        check(decoded != null && decoded.getWidth() == input.getWidth() && decoded.getHeight() == input.getHeight(), "PNG dimensions changed");
-        check(Arrays.equals(pixels(input), pixels(decoded)), "PNG pixels differ from actual Bitmap source"); decoded.recycle();
+    private static void equal(File file, Bitmap input) throws Exception {
+        Bitmap decoded = new NotificationPngFixture.Saved(file).decode();
+        try {
+            check(decoded.getWidth() == input.getWidth() && decoded.getHeight() == input.getHeight(),
+                    "PNG dimensions changed: source=" + input.getWidth() + "x" + input.getHeight()
+                    + " decoded=" + decoded.getWidth() + "x" + decoded.getHeight());
+            check(Arrays.equals(pixels(input), pixels(decoded)), "PNG pixels differ from actual Bitmap source");
+        } finally { decoded.recycle(); }
     }
-    private static void equalToDirectPng(File file, Bitmap input) {
+    private static void equalToDirectPng(File file, Bitmap input) throws Exception {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         check(input.compress(Bitmap.CompressFormat.PNG, 100, bytes), "direct reference encoder failed");
         byte[] body = bytes.toByteArray();
         Bitmap reference = BitmapFactory.decodeByteArray(body, 0, body.length);
-        Bitmap actual = BitmapFactory.decodeFile(file.getPath());
-        check(reference != null && actual != null && Arrays.equals(pixels(reference), pixels(actual)),
-                "transparent image differs from direct Bitmap PNG encoding");
-        reference.recycle(); actual.recycle();
+        check(reference != null, "native reference PNG byte decoder returned null");
+        try {
+            Bitmap actual = new NotificationPngFixture.Saved(file).decode();
+            try {
+                check(reference.getWidth() == actual.getWidth() && reference.getHeight() == actual.getHeight()
+                                && Arrays.equals(pixels(reference), pixels(actual)),
+                        "transparent image differs from direct Bitmap PNG encoding");
+            } finally { actual.recycle(); }
+        } finally { reference.recycle(); }
+    }
+
+    private static void originalWriterControl(Bitmap input) throws Exception {
+        // The pre-JAVA-07 large-icon pipeline: compress to byte[], write .tmp,
+        // then rename. This isolates the descriptor decoder from our new store.
+        ByteArrayOutputStream encoded = new ByteArrayOutputStream();
+        check(input.compress(Bitmap.CompressFormat.PNG, 100, encoded), "original writer encoder failed");
+        File file = new File(Device.dataDir(), "original-writer-control.png");
+        File temp = new File(file.getPath() + ".tmp");
+        try {
+            try (OutputStream out = new FileOutputStream(temp)) { out.write(encoded.toByteArray()); }
+            check(temp.renameTo(file), "original writer rename failed");
+            equal(file, input);
+            Bitmap byDescriptor = BitmapFactory.decodeFile(file.getPath());
+            System.out.println("NOTIFICATION_PNG_ORIGINAL_WRITER_CONTROL file=" + file.getCanonicalPath()
+                    + " byte_decoder=passed file_descriptor_decoder="
+                    + (byDescriptor == null ? "null" : byDescriptor.getWidth() + "x" + byDescriptor.getHeight()));
+            if (byDescriptor != null) {
+                try {
+                    check(byDescriptor.getWidth() == input.getWidth() && byDescriptor.getHeight() == input.getHeight()
+                                    && Arrays.equals(pixels(input), pixels(byDescriptor)),
+                            "available file-descriptor decoder differs from the original writer source");
+                } finally { byDescriptor.recycle(); }
+            }
+        } finally { Files.deleteIfExists(temp.toPath()); Files.deleteIfExists(file.toPath()); }
     }
     private static void correctness() throws Exception {
         Object owner = new Object();
@@ -49,6 +83,7 @@ public final class NotificationImageBitmapTest {
         for (int i = 0; i < input.length; ++i) input[i] = 0xff000000 | ((i * 0x3d17) & 0xffffff);
         Bitmap bitmap = Bitmap.createBitmap(1031, 7, Bitmap.Config.ARGB_8888);
         bitmap.setPixels(input, 0, 1031, 0, 0, 1031, 7);
+        originalWriterControl(bitmap);
         File png = publish("primary", owner, bitmap, true); equal(png, bitmap);
         publish("primary", owner, bitmap, false);
         Bitmap same = bitmap.copy(Bitmap.Config.ARGB_8888, true);
