@@ -6,6 +6,9 @@ named mutexes, and real CryptoAPI memory stores containing isolated test inputs.
 No test certificate is installed in a user's or machine's system trust store.
 --source-ref builds the exact earlier production files with this same fixture;
 use --measure-only for the old void-returning, pre-failure-contract baseline.
+Production Windows measurements use the paired CMake targets, which link the
+project crypto archive with its complete Gesher POSIX dependencies. The source
+staging mode below supplies their exact historical baseline files.
 """
 from __future__ import annotations
 
@@ -32,18 +35,34 @@ def main() -> int:
     parser.add_argument("--crypto-library", type=Path)
     parser.add_argument("--fetch", action="store_true")
     parser.add_argument("--source-ref")
+    parser.add_argument("--stage-source", type=Path,
+                        help="copy the exact --source-ref trust sources for the production CMake measurement targets")
     parser.add_argument("--measure-only", action="store_true")
     parser.add_argument("--corpus", type=Path, help="also verify at least 100 real Android bundled roots")
     parser.add_argument("--sanitize", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.stage_source:
+        if not args.source_ref:
+            parser.error("--stage-source requires --source-ref")
+        revision = subprocess.check_output(["git", "rev-parse", "--verify", args.source_ref + "^{commit}"],
+                                           cwd=ROOT, text=True).strip()
+        # Resolve once and read every input before publishing any output. No
+        # source rewriting or current-header fallback is allowed for baseline.
+        staged = {name: subprocess.check_output(["git", "show", f"{revision}:compat/net/{name}"], cwd=ROOT)
+                  for name in ("trust_store.cc", "trust_store.h", "javacrypto.cc")}
+        args.stage_source.mkdir(parents=True, exist_ok=True)
+        for name, content in staged.items():
+            (args.stage_source / name).write_bytes(content)
+            print(f"TRUST_STAGED source={revision} path=compat/net/{name} sha256={hashlib.sha256(content).hexdigest()}", flush=True)
+        return 0
     if args.compile_only and not args.output:
         parser.error("--compile-only requires --output")
     compiler = shlex.split(args.cxx)
     windows = os.name == "nt" or "mingw" in compiler[0] or bool(args.output and args.output.suffix == ".exe")
     if windows and not args.crypto_library:
-        parser.error("Windows compilation requires --crypto-library from the actual Windows build")
+        parser.error("standalone Windows compilation requires --crypto-library; use the paired CMake targets for the production archive")
     with tempfile.TemporaryDirectory(prefix="gesher-trust-store-") as temporary:
         work = Path(temporary)
         source = args.boringssl_source.resolve()

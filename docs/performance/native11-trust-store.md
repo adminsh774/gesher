@@ -13,7 +13,7 @@ The original source baseline is
 `a6be01164ff09de1a87382aad864a6253264b77b`. Its `trust_store.cc` SHA-256 is
 `fb686a33c2285e876b270e2194d07b3e3cc1e75dd9181a357781f3d5eabd7e74`.
 Both comparison executables compile the exact production `trust_store.cc`,
-`trust_store.h` and `javacrypto.cc`; the source runner prints each content hash.
+`trust_store.h` and `javacrypto.cc`; the source runner/stager prints content hashes.
 There is no handwritten slow baseline.
 
 ## Contract and implementation
@@ -240,9 +240,9 @@ Windows binaries. CI adds these gates without removing any existing gate:
 - `artifact-preflight`: pinned BoringSSL host sanitizer contracts.
 - `build`: actual CMake `trust_store_contract_test` for correctness, plus
   separate candidate and exact original-source measurement executables built
-  with the same Python runner, compiler, flags and production crypto archive.
-  The paired experiment does not compare differently configured CMake/runner
-  binaries; it controls compiler configuration as well as fixture/library input.
+  by one CMake function with the same compiler, flags, production crypto archive
+  and complete `gesher_posix` dependency graph. The paired experiment controls
+  compiler configuration and runtime dependencies as well as fixture input.
 - `test-native (windows-2022)` and `test-native (windows-2025)`: real Windows
   contracts, all shipped Android roots, and three alternating original/source
   pairs. Logs record elapsed time, process CPU, conversion and I/O counts;
@@ -254,3 +254,59 @@ Workflow policy checks are
 `tools/net-tcp-priority/test-selected-policy.py` and
 `.github/scripts/test_automerge_workflows.py`. No merge-authorization label,
 automerge rule or required-status policy is changed by this experiment.
+
+## Production archive link repair
+
+CI run [45027365466](https://github.com/gesher-runtime/gesher/actions/runs/45027365466),
+build job `137223238291`, checked out merge
+`32345ebe7486f818b2ba83bf29b09fc833ce777f`. Its CMake correctness executable
+linked successfully. The standalone baseline measurement failed because the
+actual project-built BoringSSL archive references `gesher_strerror`,
+`gesher_pthread_key_create` and `gesher_errno_from_crt`, while the standalone
+link command omitted the production POSIX dependency graph. Earlier local
+checks had used an upstream standalone BoringSSL archive, which did not expose
+those imports and therefore did not reproduce the project link boundary.
+
+Both Windows measurement variants now use matched CMake targets alongside the
+unchanged correctness target. They inherit the actual product's compiler
+settings, POSIX headers, library dependencies and link options. Both use the
+same current `boringssl_crypto` and `gesher_posix` libraries. Only the three
+trust-source files and their void/bool return-contract macro differ. This is an
+explicit change from the former standalone runner boundary, applied equally
+to baseline and candidate. It does not compare an entire historical runtime
+with an entire current runtime.
+
+`tools/test_trust_store.py --stage-source <directory> --source-ref <commit>`
+resolves the commit once and reads all three historical files before writing
+any output. CMake stages baseline `a6be01164ff09de1a87382aad864a6253264b77b` at
+build time, with its own matching header. Missing source fails the build;
+there is no fallback to the candidate header. The measurement targets are
+excluded from an ordinary default build and built explicitly by CI after the
+pinned baseline commit is fetched.
+
+For local link verification, a bounded CMake build included the unchanged
+production `compat/posix/posix.cmake` and `cmake/aosp/boringssl.cmake`, the actual
+root compile settings, and the actual trust-target definitions. It built the
+complete POSIX library and pinned BoringSSL with LLVM-MinGW 20261006 / Clang
+23.1.3, plus the pinned Android 16 r4 Binder header and ICU timezone input.
+The old standalone baseline command reproduced all three missing symbols.
+The correctness, baseline and candidate executables then all compiled and
+linked with the real libraries; no substitute symbol implementations were
+added. Compile and link commands for both measurement variants matched after
+normalizing source/output paths and the return-contract macro. Link maps
+identified the actual `errno.cc` and `pthread.cc` providers.
+
+Production CI commands after normal project configuration:
+
+```sh
+git fetch --no-tags --depth=1 origin a6be01164ff09de1a87382aad864a6253264b77b
+ninja -C out trust_store_contract_test
+ninja -C out trust_store_baseline_test trust_store_candidate_test
+```
+
+The production trust implementation, both raw host sample histories, the
+correctness gate, and the three alternating Windows measurement pairs remain
+unchanged. Local link verification does not execute Windows or establish a
+performance improvement. The independent production-source review remains
+incomplete; the scoped build/link review cannot replace it. The PR remains
+draft pending that review and actual Windows performance evidence.
