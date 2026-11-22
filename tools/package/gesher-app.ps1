@@ -256,9 +256,15 @@ $dalvikvm = Join-Path $here 'dalvikvm.exe'
 # visible console - Windows PowerShell turns each line into an ErrorRecord,
 # which this script's ErrorActionPreference=Stop would make terminating: a
 # successful start or install would be reported with ART's first log line.
+# A VM that could not be started at all (missing or damaged dalvikvm.exe) sets
+# no exit code under Continue, so that case still fails here.
+# Pass '-X...:value' options inside an array (@dvm): a literal colon argument
+# written directly to this function is split in two by PowerShell's binder.
 function Invoke-Dalvikvm {
   $ErrorActionPreference = 'Continue'
+  $global:LASTEXITCODE = $null
   & $dalvikvm @args
+  if ($null -eq $global:LASTEXITCODE) { throw "gesher-app: could not start $dalvikvm" }
 }
 
 # Keep the profile choice local to child processes, so disabling the marker in
