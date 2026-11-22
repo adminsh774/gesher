@@ -2,10 +2,17 @@
 package com.gesher.server;
 
 import android.Manifest;
+import android.app.IApplicationThread;
+import android.app.servertransaction.ClientTransaction;
+import android.app.servertransaction.ResumeActivityItem;
+import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.pm.PermissionInfo;
 import android.os.Binder;
 import android.os.IBinder;
+import android.os.RemoteException;
 import com.android.internal.pm.parsing.pkg.PackageImpl;
+import com.android.internal.pm.pkg.component.ParsedActivityImpl;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -13,6 +20,7 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 
@@ -47,6 +55,216 @@ public final class SensorAccessLifecycleHost {
         @Override public void linkToDeath(IBinder.DeathRecipient recipient, int flags) { deaths.add(recipient); }
         @Override public boolean unlinkToDeath(IBinder.DeathRecipient recipient, int flags) { return deaths.remove(recipient); }
         void die() { for (var recipient : new ArrayList<>(deaths)) recipient.binderDied(); }
+    }
+
+    /** Real device-mode launch and policy, with only the client transaction sink isolated.
+     * The sink never acknowledges resume: an app may register/poll inside onResume. */
+    private static final class LaunchFixture implements AutoCloseable {
+        final PackageManagerService pm;
+        final ActivityTaskManagerService atm;
+        final Object process, record, session;
+        final ApkPackage owner;
+        final Class<?> recordType = Class.forName("com.gesher.server.ActivityTaskManagerService$ActivityRecord");
+        final Class<?> stateType = Class.forName("com.gesher.server.ActivityTaskManagerService$State");
+        final Token token = new Token();
+        final ExecutorService notifications;
+        int transactions;
+        boolean rejectDispatch, resumeSent;
+        Runnable duringDispatch;
+
+        @SuppressWarnings("unchecked") LaunchFixture() throws Exception {
+            Class<?> fixture = Class.forName("gesher.services.AppOpsContractTest$Harness");
+            Method packageFactory = fixture.getEnclosingClass().getDeclaredMethod("pkg",
+                    String.class, int.class, byte.class, int.class);
+            packageFactory.setAccessible(true);
+            owner = (ApkPackage)packageFactory.invoke(null, "fixture.sensor.launch", UID, (byte)7, 36);
+            // Complete declared manifest input before real PM admission.
+            PackageImpl parsed = (PackageImpl)PackageImpl.forTesting(owner.packageName, owner.apkPath);
+            parsed.setEnabled(true); parsed.setTargetSdkVersion(36);
+            ParsedActivityImpl component = new ParsedActivityImpl();
+            component.setPackageName(owner.packageName); component.setName(owner.packageName + ".Sensor");
+            component.setEnabled(true); parsed.addActivity(component); parsed.hideAsFinal();
+            set(owner, "parsed", parsed);
+            pm = new PackageManagerService(List.of(owner), false);
+            set(pm, "mPackageEventSender", (java.util.function.Consumer<Intent>)event -> { });
+            Object catalog = get(pm.permissions(), "mCatalog");
+            set(catalog, "mLoaded", true); set(catalog, "mFrameworkRead", true);
+            atm = new ActivityTaskManagerService(pm);
+            ActivityManagerService am = new ActivityManagerService(atm, pm, null);
+            IApplicationThread receiver = new IApplicationThread.Default() {
+                private final Binder binder = new Binder();
+                @Override public IBinder asBinder() { return binder; }
+                @Override public void scheduleTransaction(ClientTransaction transaction) throws RemoteException {
+                    if (rejectDispatch) throw new RemoteException("Explicit failed lifecycle enqueue");
+                    transactions++;
+                    for (var item : transaction.getTransactionItems())
+                        if (item instanceof ResumeActivityItem) resumeSent = true;
+                    Runnable action = duringDispatch;
+                    duringDispatch = null;
+                    if (action != null) action.run();
+                    // No ActivityClient.activityResumed: that is sent after onResume returns.
+                }
+            };
+            Class<?> processType = Class.forName("com.gesher.server.ActivityTaskManagerService$ProcessRecord");
+            Constructor<?> processConstructor = processType.getDeclaredConstructor(
+                    ActivityTaskManagerService.class, int.class, IApplicationThread.class);
+            processConstructor.setAccessible(true);
+            long identity = Binder.clearCallingIdentity();
+            try {
+                Binder.restoreCallingIdentity(((long)UID << 32) | PID);
+                process = processConstructor.newInstance(atm, PID, receiver);
+            } finally { Binder.restoreCallingIdentity(identity); }
+            set(process, "packageName", owner.packageName); set(process, "processName", owner.packageName);
+            set(process, "packageCode", owner); set(process, "ready", true);
+            ((List<Object>)get(atm, "mProcesses")).add(process);
+            ActivityInfo info = new ActivityInfo();
+            info.packageName = owner.packageName; info.name = component.getName();
+            info.applicationInfo = owner.applicationInfo(0);
+            info.screenOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+            Constructor<?> activity = recordType.getDeclaredConstructor(ActivityTaskManagerService.class,
+                    ActivityInfo.class, Intent.class, int.class, int.class, String.class,
+                    recordType, String.class, int.class);
+            activity.setAccessible(true);
+            record = activity.newInstance(atm, info, new Intent(), 1, PID, owner.packageName, null, null, -1);
+            set(record, "app", process);
+            ((List<Object>)get(atm, "mActivities")).add(record);
+            ((List<Object>)get(process, "activities")).add(record);
+            ((List<Integer>)get(atm, "mTaskOrder")).add(1);
+            SensorAccessService access = am.sensorAccess();
+            notifications = (ExecutorService)get(access, "notifications");
+            CountDownLatch blocked = new CountDownLatch(1);
+            notifications.execute(() -> { blocked.countDown(); try { new CountDownLatch(1).await(); }
+                catch (InterruptedException done) { Thread.currentThread().interrupt(); } });
+            blocked.await();
+            identity = Binder.clearCallingIdentity();
+            try {
+                Binder.restoreCallingIdentity(((long)UID << 32) | PID);
+                session = call(access, "openSubscription", new Class<?>[]{IBinder.class}, token);
+            } finally { Binder.restoreCallingIdentity(identity); }
+        }
+        void start() throws Exception { call(atm, "realStartActivity", new Class<?>[]{recordType}, record); }
+        boolean active() throws Exception { return (state(session).flags() & SensorAccessPolicy.ACTIVE) != 0; }
+        void refresh() throws Exception { call(atm, "updateIdle", new Class<?>[0]); }
+        Object otherRecord() throws Exception {
+            Constructor<?> constructor = recordType.getDeclaredConstructor(ActivityTaskManagerService.class,
+                    ActivityInfo.class, Intent.class, int.class, int.class, String.class,
+                    recordType, String.class, int.class);
+            constructor.setAccessible(true);
+            return constructor.newInstance(atm, get(record, "info"), new Intent(), 1,
+                    PID, owner.packageName, null, null, -1);
+        }
+        @SuppressWarnings({"rawtypes", "unchecked"}) void setActivityState(String value) throws Exception {
+            set(record, "state", Enum.valueOf((Class)stateType, value));
+        }
+        void excluded(Object target, String field, Object denied, Object restored, String label) throws Exception {
+            set(target, field, denied); refresh(); check(!active(), label);
+            set(target, field, restored); refresh(); check(active(), "Current visible launch recovers after " + label);
+        }
+        @Override public void close() {
+            token.die();
+            notifications.shutdownNow();
+        }
+    }
+
+    @SuppressWarnings("unchecked") private static void launchBeforeAcknowledgement() throws Exception {
+        try (LaunchFixture h = new LaunchFixture()) {
+            check(!h.active(), "Pre-launch subscription is inactive");
+            long before = state(h.session).generation();
+            h.start();
+            check(h.transactions == 1 && h.resumeSent, "Real launch enqueues the resume transaction");
+            check(h.active(), "Successful visible launch publishes active policy without a resume acknowledgement");
+            check(get(h.record, "state").toString().equals("LAUNCHING")
+                    && state(h.session).generation() > before,
+                    "Existing inactive subscriber observes activation while client onResume is outstanding");
+            h.excluded(h.record, "launchingPaused", true, false, "Paused launch is not resume authority");
+            h.excluded(h.record, "nativeUiCount", 1, 0, "Native-covered launch is inactive");
+            h.excluded(h.record, "chooserCoverCount", 1, 0, "Chooser-covered launch is inactive");
+            h.excluded(h.record, "finishing", true, false, "Finishing launch is inactive");
+            h.excluded(h.record, "waitingFor", h.record, null, "Launch waiting for another activity is inactive");
+            h.excluded(h.process, "ready", false, true, "Unready process is inactive");
+            h.excluded(h.process, "dead", true, false, "Dead process is inactive");
+            h.excluded(h.process, "exiting", true, false, "Exiting process is inactive");
+            h.excluded(h.process, "pidSuperseded", true, false, "Retired PID is inactive");
+            h.excluded(h.process, "packageCode", null, h.owner, "Unadmitted process is inactive");
+            h.excluded(h.record, "targetCode", null, h.owner, "Retired target code is inactive");
+            ((PackageImpl)h.owner.parsed).setEnabled(false); h.refresh();
+            check(!h.active(), "Disabled package does not gain early launch authority");
+            ((PackageImpl)h.owner.parsed).setEnabled(true); h.refresh();
+            check(h.active(), "Enabled current package restores eligible launch");
+            ParsedActivityImpl component = (ParsedActivityImpl)h.owner.parsed.getActivities().get(0);
+            component.setEnabled(false); h.refresh();
+            check(!h.active(), "Disabled activity does not gain early launch authority");
+            component.setEnabled(true); h.refresh();
+            check(h.active(), "Enabled current activity restores eligible launch");
+            Set<Integer> hidden = (Set<Integer>)get(h.atm, "mHiddenTasks");
+            hidden.add(1); h.refresh(); check(!h.active(), "Hidden task launch is inactive");
+            hidden.remove(1); h.refresh(); check(h.active(), "Visible launch returns after task reveal");
+            List<Object> records = (List<Object>)get(h.atm, "mActivities");
+            Object above = h.otherRecord();
+            records.add(above); h.refresh(); check(!h.active(), "Covered non-top launch is inactive");
+            records.remove(above); h.refresh(); check(h.active(), "Top launch returns after cover removal");
+            // A removed record cannot retain authority through its process.activities entry.
+            records.remove(h.record); h.refresh(); check(!h.active(), "Detached launch is inactive");
+            records.add(h.record); h.refresh(); check(h.active(), "Current launch record restored");
+            call(h.atm, "finish", new Class<?>[]{h.recordType, String.class, int.class, Intent.class},
+                    h.record, "sensor-contract", 0, null);
+            check(!h.active(), "Real cancellation revokes an outstanding launch without client acknowledgement");
+        }
+        try (LaunchFixture h = new LaunchFixture()) {
+            h.rejectDispatch = true;
+            h.start();
+            check(h.transactions == 0 && !h.active(), "Failed enqueue does not activate a launch");
+            h.refresh(); check(!h.active(), "A later state refresh cannot admit the failed enqueue");
+        }
+        try (LaunchFixture h = new LaunchFixture()) {
+            h.start(); check(h.active(), "Initial attempt activates before failed re-enqueue control");
+            // The retained-record retry boundary resets these existing lifecycle
+            // fields. The production attempt must discard its own previous success.
+            h.setActivityState("INITIALIZING"); set(h.record, "launchScheduled", false);
+            h.rejectDispatch = true;
+            h.start();
+            check(!h.active(), "Failed re-enqueue immediately clears the prior successful launch policy");
+            h.refresh(); check(!h.active(), "Old successful dispatch cannot survive a failed new attempt");
+        }
+        try (LaunchFixture h = new LaunchFixture()) {
+            set(h.record, "chooserCoverCount", 1);
+            h.start();
+            check(h.transactions == 1 && !h.resumeSent && !h.active(),
+                    "Actual launch into paused state does not gain early resume authority");
+        }
+        for (String change : List.of("cancel", "hide", "retire")) {
+            try (LaunchFixture h = new LaunchFixture()) {
+                h.duringDispatch = () -> {
+                    try {
+                        if (change.equals("cancel"))
+                            call(h.atm, "finish", new Class<?>[]{h.recordType, String.class, int.class, Intent.class},
+                                    h.record, "canceled-during-dispatch", 0, null);
+                        else if (change.equals("hide")) ((Set<Integer>)get(h.atm, "mHiddenTasks")).add(1);
+                        else set(h.process, "ready", false);
+                    } catch (Exception failure) { throw new AssertionError(failure); }
+                };
+                h.start();
+                check(!h.active(), "Successful enqueue cannot revive target changed during dispatch: " + change);
+            }
+        }
+        try (LaunchFixture h = new LaunchFixture()) {
+            h.start(); check(h.active(), "Stop fixture reaches active launch");
+            h.setActivityState("STOPPING");
+            call(h.atm, "activityStopped", new Class<?>[]{h.recordType, android.os.Bundle.class,
+                    android.os.PersistableBundle.class}, h.record, null, null);
+            check(!h.active(), "Real stopped acknowledgement revokes the final visible activity");
+            call(h.atm, "resume", new Class<?>[]{h.recordType}, h.record);
+            check(h.active() && get(h.record, "state").toString().equals("RESUMING"),
+                    "Successful re-resume publishes active state without waiting for client acknowledgement");
+            h.setActivityState("STOPPING");
+            call(h.atm, "activityStopped", new Class<?>[]{h.recordType, android.os.Bundle.class,
+                    android.os.PersistableBundle.class}, h.record, null, null);
+            h.rejectDispatch = true;
+            call(h.atm, "resume", new Class<?>[]{h.recordType}, h.record);
+            check(!h.active() && get(h.record, "state").toString().equals("STOPPED"),
+                    "Failed re-resume preserves the stopped state and does not grant delivery");
+            h.refresh(); check(!h.active(), "Failed resume stays denied on later refresh");
+        }
     }
     @SuppressWarnings({"unchecked", "rawtypes"})
     private static void lifecycle(int targetSdk, boolean permission, boolean debuggable) throws Exception {
@@ -147,6 +365,7 @@ public final class SensorAccessLifecycleHost {
         lifecycle(30, false, false);
         lifecycle(36, true, false);
         lifecycle(36, false, true);
+        launchBeforeAcknowledgement();
         System.out.println("Sensor caller identity + real lifecycle hooks: " + checks + " checks passed");
     }
 }

@@ -16,6 +16,16 @@ Outgoing Binder Parcel callbacks are deliberately delayed rather than replaced b
 a fake transport. Actual ART/Binder transport and the native sensor queue belong
 to the integrated Windows guest fixture; these tests alone do not establish them.
 
+The controller suite also calls the real device-mode `realStartActivity` with a
+declared activity and an admitted process. Its isolated client records the actual
+transaction but never acknowledges resume. A previously inactive subscription
+must become active after a successful visible launch; failed dispatch and retry,
+paused/hidden/covered/retired targets, and cancellation during dispatch must not
+gain that authority. Real stop and re-resume hooks check revocation, activation,
+and failed-resume state restoration. Against the preceding production app jar,
+the first successful-launch assertion fails because the policy stays inactive;
+the regression does not depend on inspecting a new private flag.
+
 `tools/test_sensor_access_jni.py --java-home <JDK> --jni-include
 <libnativehelper/include_jni>` compiles the actual JNI initialization entrypoint
 and atomic receiver against a real host JVM. Real native threads cover first-use

@@ -43,6 +43,19 @@ debuggability and the declared high-rate permission from that record. The privat
 transport returns only the caller's policy. It does not expose an unrestricted
 `isUidActive` API or trust a package name passed to an NDK manager function.
 
+A foreground launch becomes eligible after its launch/resume transaction is
+successfully enqueued, without waiting for the application's `onResume` to
+return. The server requires the current admitted process and target code, a
+visible top activity selected for resume, and no native/chooser cover or pending
+pause handoff. A per-attempt dispatch result prevents a failed retry from
+inheriting a previous launch's eligibility. The server publishes the recomputed
+state immediately after dispatch, so a subscription opened during startup can
+receive the subsequent activation. Cancellation, hidden tasks and retired owners
+remain ineligible; a stopped acknowledgement publishes revocation. A successful
+re-resume also publishes without waiting for its acknowledgement, while failed
+enqueue restores the preceding state. Existing visible paused activities retain
+their foreground classification.
+
 The Java client subscribes once and receives ordered policy notifications.
 Connection loss revokes access; stale connection/generation messages cannot
 revive it. Native policy flags and generation share one atomic word. The sampler
@@ -68,6 +81,8 @@ The implementation was checked against these primary sources:
 - [Android 16 sensor header](https://android.googlesource.com/platform/frameworks/native/+/android-16.0.0_r4/include/android/sensor.h): ABI, reporting modes and capability definitions.
 - [Android 16 SensorEventQueue](https://android.googlesource.com/platform/frameworks/native/+/android-16.0.0_r4/libs/sensor/SensorEventQueue.cpp): default registration and read semantics.
 - [Android 16 SensorService](https://android.googlesource.com/platform/frameworks/native/+/android-16.0.0_r4/services/sensorservice/SensorService.cpp): `getSensorList`, `enable`, `setEventRate`, `hasSensorAccessLocked`, `UidPolicy`, and high-rate/microphone-policy checks.
+- [Android 16 ActivityTaskSupervisor](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java): `realStartActivityLocked` updates the selected activity and process state after launch dispatch without awaiting a client resume acknowledgement.
+- [Android 16 ResumeActivityItem](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r4/core/java/android/app/servertransaction/ResumeActivityItem.java): the client sends `activityResumed` from `postExecute`, after `handleResumeActivity` returns.
 - [SensorEventConnection at 3f678a9](https://android.googlesource.com/platform/frameworks/native/+/3f678a903819c7aae6a757bda4076d6f43f04927/services/sensorservice/SensorEventConnection.cpp): permission adjustment precedes the service's hardware period clamp for both registration and rate changes.
 - [Public NDK sensor reference](https://developer.android.com/ndk/reference/group/sensor): supported API and application-visible contracts.
 
@@ -114,6 +129,15 @@ establish the 5 ms permission cap. The production host bridge tests separately
 cover that cap, effective metadata, and permission denial for debuggable apps.
 The actual server/controller host suite also verifies that the authenticated
 package's debug flag reaches its sensor policy alongside the rate restriction.
+
+The guest intentionally waits for its native worker inside `onResume`; this
+retains the device-mode regression for activation before the resume
+acknowledgement. The host controller suite also executes the real launch method
+with a recording client that never acknowledges resume. It checks existing
+subscription activation, failed enqueue/retry, cancellation during dispatch,
+visibility and ownership exclusions, and stop/re-resume publication. Those host
+checks exercise server ordering; remote Binder delivery still requires the
+unchanged Windows guest tests on both ABIs.
 
 Local Linux host tests, the Windows object cross-build against the repository's
 patched AOSP Looper headers, and NDK compilation establish bounded pieces of the

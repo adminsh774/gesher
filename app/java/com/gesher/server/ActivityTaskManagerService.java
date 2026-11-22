@@ -280,6 +280,8 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         boolean deferredHistory;
         boolean historyEntry;
         boolean launchScheduled;
+        /** The current launch transaction was accepted, without waiting for onResume. */
+        boolean launchDispatched;
         boolean launchingPaused;
         /**
          * The configuration it was launched or relaunched with, or told of last: its
@@ -552,7 +554,13 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             }
             for (ActivityRecord activity : app.activities) {
                 if (activity.finishing || mHiddenTasks.contains(activity.taskId)) continue;
-                if (activity.state == State.RESUMED || activity.state == State.RESUMING) {
+                boolean visibleLaunch = activity.state == State.LAUNCHING
+                        && activity.launchDispatched && !activity.launchingPaused
+                        && activity.nativeUiCount == 0 && activity.chooserCoverCount == 0
+                        && activity.waitingFor == null && topOf(activity.taskId) == activity
+                        && activityEnabled(activity);
+                if (activity.state == State.RESUMED || activity.state == State.RESUMING
+                        || visibleLaunch) {
                     state = android.app.AppOpsManager.UID_STATE_TOP;
                     capabilities = android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_LOCATION
                             | android.app.ActivityManager.PROCESS_CAPABILITY_FOREGROUND_CAMERA
@@ -4209,6 +4217,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                     r.app = null;
                     r.launchGeneration = null;
                     r.launchScheduled = false;
+                    r.launchDispatched = false;
                     r.state = State.STOPPED;
                     r.idle = false;
                     r.stopWhenIdle = false;
@@ -4468,6 +4477,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             finishDisabledActivity(r); return;
         }
         boolean current;
+        ProcessRecord launchProcess;
         synchronized (this) {
             if (r.state != State.INITIALIZING || r.launchScheduled || r.finishing || r.deferredHistory
                     || r.waitingFor != null || r.app == null || !r.app.ready || r.nativeUiCount > 0) return;
@@ -4479,7 +4489,11 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             }
             current = mActivities.contains(r) && r.state != State.DESTROYED && activityCodeCurrent(r)
                     && (r.sourceLifetime == null || r.sourceLifetime.getAsBoolean());
-            if (current) r.launchScheduled = true;
+            launchProcess = r.app;
+            if (current) {
+                r.launchScheduled = true;
+                r.launchDispatched = false;
+            }
         }
         if (!current) {
             mExitStatus.unavailable(r.launchGeneration); r.finishing = true; remove(r); return;
@@ -4540,8 +4554,17 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             r.launchingPaused = !andResume;
             setState(r, State.LAUNCHING);
         }
-        schedule(r, t, andResume ? "LaunchActivityItem, ResumeActivityItem"
+        boolean dispatched = schedule(r, t, andResume ? "LaunchActivityItem, ResumeActivityItem"
                 : "LaunchActivityItem, PauseActivityItem");
+        synchronized (this) {
+            // AOSP scores the selected launch after enqueueing its transaction;
+            // onResume's client acknowledgement is not the foreground boundary.
+            // Recompute from current ownership/visibility after the IPC: a failed
+            // or superseded dispatch must not revive an earlier launch's grant.
+            if (dispatched && r.app == launchProcess && r.state == State.LAUNCHING
+                    && !r.finishing && mActivities.contains(r)) r.launchDispatched = true;
+            updateIdle();
+        }
     }
 
     /** The ActivityWindowInfo of an activity in a task of {@code task} bounds (null: display). */
@@ -4921,6 +4944,8 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
      */
     private void resume(ActivityRecord r) {
         if (!activityEnabled(r)) { finishDisabledActivity(r); return; }
+        State previous;
+        ProcessRecord resumeProcess;
         synchronized (this) {
             if (!mActivities.contains(r) || r.finishing || r.app == null || !r.app.ready
                     || r.nativeUiCount > 0
@@ -4930,6 +4955,8 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
                     || mHiddenTasks.contains(r.taskId) || topOf(r.taskId) != r
                     || (r.state != State.PAUSED && r.state != State.STARTED
                         && r.state != State.STOPPING && r.state != State.STOPPED)) return;
+            previous = r.state;
+            resumeProcess = r.app;
             r.state = State.RESUMING;
             r.stopWhenIdle = false;
             r.idle = false;
@@ -4947,9 +4974,14 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         }
         t.addTransactionItem(new ResumeActivityItem(r.token, false /* isForward */,
                 false /* shouldSendCompatFakeFocus */));
-        schedule(r, t, (config != null ? config + ", " : "")
+        boolean dispatched = schedule(r, t, (config != null ? config + ", " : "")
                 + (results != null && !relaunch ? "ActivityResultItem, " : "")
                 + "ResumeActivityItem");
+        synchronized (this) {
+            if (!dispatched && r.app == resumeProcess && r.state == State.RESUMING)
+                r.state = previous;
+            updateIdle();
+        }
     }
 
     /** ActivityRecord.deliverNewIntentLocked: onNewIntent, around a pause if resumed. */
@@ -5429,13 +5461,16 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
         schedule(r, t, "DestroyActivityItem");
     }
 
-    private void schedule(ActivityRecord r, ClientTransaction t, String what) {
-        if (r.app == null || r.app.thread == null) return;
-        SystemServer.log("scheduleTransaction " + what + " to " + r.name() + " in " + r.app);
+    private boolean schedule(ActivityRecord r, ClientTransaction t, String what) {
+        ProcessRecord app = r.app;
+        if (app == null || app.thread == null) return false;
+        SystemServer.log("scheduleTransaction " + what + " to " + r.name() + " in " + app);
         try {
-            r.app.thread.scheduleTransaction(t);
+            app.thread.scheduleTransaction(t);
+            return true;
         } catch (RemoteException e) {
-            SystemServer.log("scheduleTransaction to " + r.app + " failed: " + e);
+            SystemServer.log("scheduleTransaction to " + app + " failed: " + e);
+            return false;
         }
     }
 
@@ -6085,6 +6120,7 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
             if (r.state == State.STOPPING) {
                 if (r.app != null && !r.app.dead) recordUsage(r, ActivityUsageHistory.State.STOPPED);
                 r.state = State.STOPPED;
+                updateIdle();
             }
             destroy = r.finishing;
             notifyAll();
