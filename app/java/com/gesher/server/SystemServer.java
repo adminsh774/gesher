@@ -82,16 +82,28 @@ public final class SystemServer {
     /**
      * The package for the staged microG addon slot {@code name}: the staged addon, or a
      * valid microG-signed installed update at least as new (both as system addons), or
-     * null when an installed package of that name has another signer. Such a package is
-     * an ordinary installed app (Google's own Play Store, say): it keeps its name, data
-     * and lack of privileges, the staged addon is not published, and nothing else of
-     * the device changes. A different signer never takes the addon's trust.
+     * null when an installed package of that name is verifiably signed by another
+     * signer. Such a package is an ordinary installed app (Google's own Play Store, say):
+     * it keeps its name, data and lack of privileges, the staged addon is not published,
+     * and nothing else of the device changes. (AOSP's scan instead deletes a user app
+     * whose signer differs from a new system package's, with its data; this optional
+     * addon does not justify that.) Any other verification failure, such as changed
+     * content of a microG update, still fails startup: it is not a different signer.
      */
     static ApkPackage selectStagedAddon(List<ApkPackage> installed, String name, ApkPackage staged) {
-        ApkPackage selected = staged;
+        List<ApkPackage> updates = new ArrayList<>();
         for (ApkPackage current : installed) {
             if (!name.equals(current.packageName)) continue;
-            if (!GmsSignatureSpoofing.verifyAddonApk(name, current.apkPath)) return null;
+            if (GmsSignatureSpoofing.verifyAddonApk(name, current.apkPath)) {
+                updates.add(current);
+            } else if (current.hasVerifiedSigningIdentity() && !current.hasVerifiedMicrogSigner()) {
+                return null;
+            } else {
+                throw new SecurityException("Untrusted installed microG addon override: " + name);
+            }
+        }
+        ApkPackage selected = staged;
+        for (ApkPackage current : updates) {
             // Even when selecting the bundled fallback, the old committed
             // manifest is the authority for any legacy storage migration.
             current.setSystemAddon(true);

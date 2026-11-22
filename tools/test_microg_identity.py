@@ -42,7 +42,7 @@ def main() -> None:
                         "-storetype", "PKCS12", "-storepass", "fixture-only", "-alias", "fixture",
                         "-keyalg", "RSA", "-keysize", "2048", "-validity", "30",
                         "-dname", "CN=Gesher disposable signing test", "-noprompt"],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                       check=True, stdout=subprocess.DEVNULL)
         cleaner = work / "cleaner/sun/misc"; cleaner.mkdir(parents=True)
         for source in (args.core_classes / "sun/misc").glob("Cleaner*.class"):
             shutil.copy2(source, cleaner / source.name)
