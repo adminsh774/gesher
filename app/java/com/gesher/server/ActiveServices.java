@@ -589,6 +589,7 @@ final class ActiveServices {
         java.util.Map<Integer, AppOpsService.UidState> visible = mAtm.appOpsUidStates();
         mNotifications.withChannelLifecycle(() -> setServiceForegroundLocked(className, token,
                 id, notification, flags, foregroundServiceType, visible));
+        notifySensorStateChanged();
         mPm.appOps().requestUidStateRefresh();
     }
 
@@ -678,6 +679,26 @@ final class ActiveServices {
             states.put(pkg.uid(), new AppOpsService.UidState(Math.min(previous.state(),
                     android.app.AppOpsManager.UID_STATE_FOREGROUND_SERVICE), capabilities));
         }
+    }
+
+    private SensorAccessService mSensorAccess;
+    void setSensorAccess(SensorAccessService access) {
+        mSensorAccess = access;
+        notifySensorStateChanged();
+    }
+
+    /** Only this controller's monitor is held; policy queues Binder delivery later. */
+    private synchronized void notifySensorStateChanged() {
+        if (mSensorAccess == null) return;
+        java.util.Set<Integer> foreground = new java.util.HashSet<>();
+        for (ServiceRecord service : mServices.values()) {
+            if (service.foregroundId == 0 || service.app == null || service.app.dead
+                    || service.app.exiting || !service.app.ready) continue;
+            ApkPackage pkg = mPm.get(service.info.packageName);
+            if (pkg != null && pkg == service.app.packageCode && !mPm.isRemovalPending(pkg.packageName))
+                foreground.add(pkg.uid());
+        }
+        mSensorAccess.foregroundServicesChanged(foreground);
     }
 
     synchronized boolean hasForegroundServiceNotification(String pkg, String channelId) {
@@ -947,6 +968,7 @@ final class ActiveServices {
         }
         // Removing the service also removes its foreground capabilities even if
         // another service or an activity keeps the process alive.
+        notifySensorStateChanged();
         mPm.appOps().requestUidStateRefresh();
         synchronized (this) { clearStartGrants(r, Integer.MAX_VALUE); }
         if (r.foregroundId != 0) mNotifications.cancel(r.info.packageName, null, r.foregroundId);
@@ -1112,6 +1134,7 @@ final class ActiveServices {
                     mNotifications.cancel(r.info.packageName, null, r.foregroundId);
                     r.foregroundId = 0;
                     r.foregroundType = 0;
+                    notifySensorStateChanged();
                     mPm.appOps().requestUidStateRefresh();
                     r.foregroundChannelId = null;
                 }

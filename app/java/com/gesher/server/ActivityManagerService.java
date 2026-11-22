@@ -57,6 +57,7 @@ public final class ActivityManagerService extends IActivityManager.Default {
     private final ContentProviders mProviders;
     private ApplicationSharedMemory mSharedMemory;  // created on the first bind
     private final PendingIntents mPendingIntents;
+    private final SensorAccessService mSensorAccess;
 
     ActivityManagerService(ActivityTaskManagerService atm, PackageManagerService pm,
             NotificationManagerService notifications) {
@@ -69,6 +70,8 @@ public final class ActivityManagerService extends IActivityManager.Default {
         mBroadcasts = new BroadcastController(atm, pm);
         mProviders = new ContentProviders(pm, atm);
         mPendingIntents = new PendingIntents(this, pm);
+        mSensorAccess = new SensorAccessService(pm, atm);
+        mServices.setSensorAccess(mSensorAccess);
         atm.setActivityManager(this);
         pm.appOps().attach(mCallers, this::appOpsUidStates);
         pm.setEnabledStateListener(this::cleanupDisabledPackageComponents,
@@ -86,6 +89,7 @@ public final class ActivityManagerService extends IActivityManager.Default {
     }
 
     CallerIdentity callers() { return mCallers; }
+    SensorAccessService sensorAccess() { return mSensorAccess; }
 
     SettingsProvider settingsProvider() { return mProviders.settingsProvider(); }
     private java.util.Map<Integer, AppOpsService.UidState> appOpsUidStates() {

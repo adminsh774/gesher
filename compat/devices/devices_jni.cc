@@ -176,11 +176,13 @@ const JNINativeMethod gWindowsCameraMethods[] = {
 }  // namespace
 
 int register_gesher_sensors(JNIEnv* env);  // sensors_jni.cc
+int register_gesher_sensor_access(JNIEnv* env);  // sensor_access_jni.cc
 int register_gesher_camera_metadata(JNIEnv* env);  // camera_metadata_jni.cc
 int register_gesher_camera_frames(JNIEnv* env);  // camera_frames.cc
 int register_gesher_bluetooth(JNIEnv* env);  // bluetooth_jni.cc
 
 int register_gesher_devices(JNIEnv* env) {
+  register_gesher_sensor_access(env);
   register_gesher_sensors(env);
   register_gesher_camera_metadata(env);
   register_gesher_camera_frames(env);

@@ -3397,7 +3397,10 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
      * Guarded by this.
      */
     private void updateIdle() {
-        if (mAm != null) mPm.appOps().requestUidStateRefresh();
+        if (mAm != null) {
+            mAm.sensorAccess().activityStatesChanged(appOpsUidStates());
+            mPm.appOps().requestUidStateRefresh();
+        }
         if (hasActivityLocked() || !mIntentChoosers.isEmpty() || !mDocumentPickers.isEmpty()
                 || !mBluetoothActivities.isEmpty()) {
             mIdleSince = 0;
@@ -4814,7 +4817,10 @@ public final class ActivityTaskManagerService extends IActivityTaskManager.Defau
      * resumed (multi-resume).
      */
     private void updateTopResumed() {
-        if (mAm != null) mPm.appOps().requestUidStateRefresh();
+        if (mAm != null) {
+            mAm.sensorAccess().activityStatesChanged(appOpsUidStates());
+            mPm.appOps().requestUidStateRefresh();
+        }
         ActivityRecord lose = null;
         ActivityRecord gain = null;
         int displayRotation;

@@ -111,6 +111,7 @@ public final class Services {
         ClipboardService clipboard = new ClipboardService(atm, pm);
         Created created = new Created(pm, atm, am, clipboard, services);
         sLast = created;
+        services.put(com.gesher.sensors.NativeSensorAccess.SERVICE, am.sensorAccess());
         services.put("uri_grants", StandIn.of(android.app.IUriGrantsManager.class,
                 new UriGrantsManagerService(pm, atm, am)).asBinder());
         services.put("package", StandIn.of(IPackageManager.class, pm).asBinder());

@@ -14,6 +14,8 @@ target_sources(framework_runtime PRIVATE
   ${CMAKE_SOURCE_DIR}/compat/devices/camera_mf.cc
   ${CMAKE_SOURCE_DIR}/compat/devices/devices_jni.cc
   ${CMAKE_SOURCE_DIR}/compat/devices/location_win.cc
+  ${CMAKE_SOURCE_DIR}/compat/devices/sensor_access.cc
+  ${CMAKE_SOURCE_DIR}/compat/devices/sensor_access_jni.cc
   ${CMAKE_SOURCE_DIR}/compat/devices/sensors.cc
   ${CMAKE_SOURCE_DIR}/compat/devices/sensors_jni.cc
   ${CMAKE_SOURCE_DIR}/compat/devices/winrt.cc)
