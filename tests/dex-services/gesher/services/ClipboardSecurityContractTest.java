@@ -208,6 +208,10 @@ public final class ClipboardSecurityContractTest {
         h.remove(h.privileged, listener);
     }
     @SuppressWarnings("unchecked") private static void callbackPolicyAndRetirement(ClipboardFixture h) throws Exception {
+        Collection<?> observers = (Collection<?>)get(h.pm, "mPackageChanges");
+        check(observers.size() == h.packageChangeObserversBeforeClipboard.size() + 1
+                && observers.containsAll(h.packageChangeObserversBeforeClipboard),
+                "Clipboard adds its own observer without replacing other services' subscriptions");
         Listener owner = new Listener(), peer = new Listener(), privileged = new Listener();
         h.nativeState.foreground = new long[]{PID, CREATED};
         h.add(h.owner, owner); h.add(h.peer, peer); h.add(h.privileged, privileged);
@@ -237,8 +241,9 @@ public final class ClipboardSecurityContractTest {
         h.service.close();
         check(h.listeners().getRegisteredCallbackCount() == 0 && peer.token.deaths.isEmpty()
                 && h.nativeState.listeners.isEmpty(), "Service close releases callback and native subscriptions");
-        check(((Collection<?>)get(h.pm, "mPackageChanges")).size() == 1,
-                "Closed clipboard releases its package-change subscription, leaving AppOps");
+        check(List.copyOf((Collection<?>)get(h.pm, "mPackageChanges"))
+                        .equals(h.packageChangeObserversBeforeClipboard),
+                "Closed clipboard releases its observer and preserves every preexisting service subscription");
     }
     public static int run(boolean binder) throws Exception {
         checks = 0;

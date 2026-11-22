@@ -258,6 +258,10 @@ public final class JobSchedulerConstraintContractTest {
             Object notifications = make(notifType, new Class<?>[]{pmType, amType, java.util.function.ToIntBiFunction.class},
                     pm, am, (java.util.function.ToIntBiFunction<Object, Boolean>) (n, u) -> 0);
             set(am, "mServices", make(type("ActiveServices"), new Class<?>[]{atmType, pmType, notifType}, atm, pm, notifications));
+            Class<?> sensorType = type("SensorAccessService");
+            Object sensors = make(sensorType, new Class<?>[]{pmType, atmType}, pm, atm);
+            set(am, "mSensorAccess", sensors);
+            invoke(get(am, "mServices"), "setSensorAccess", new Class<?>[]{sensorType}, sensors);
             invoke(atm, "setActivityManager", new Class<?>[]{amType}, am);
 
             Class<?> processType = type("ActivityTaskManagerService$ProcessRecord");
@@ -378,6 +382,7 @@ public final class JobSchedulerConstraintContractTest {
         public void close() throws Exception {
             invoke(scheduler, "cancelAllInNamespace", new Class<?>[]{String.class}, NAMESPACE);
             ((java.util.concurrent.ScheduledThreadPoolExecutor) get(scheduler, "mTimeouts")).shutdownNow();
+            ((java.util.concurrent.ExecutorService) get(get(am, "mSensorAccess"), "notifications")).shutdownNow();
             ((List<?>) field(type("DeviceWork"), "sSources").get(null)).remove(scheduler);
             field(type("NotificationManagerService"), "sLast").set(null, null);
         }

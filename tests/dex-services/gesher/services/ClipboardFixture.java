@@ -151,6 +151,7 @@ public final class ClipboardFixture implements AutoCloseable {
     final AppOpsService ops;
     final NativeState nativeState;
     final ClipboardService service;
+    final List<?> packageChangeObserversBeforeClipboard;
     final IClipboard api;
     final File settingsFile;
 
@@ -203,6 +204,7 @@ public final class ClipboardFixture implements AutoCloseable {
         settingsFile = File.createTempFile("clipboard-settings-", ".bin"); settingsFile.delete();
         settings = make(type("SettingsProvider"), new Class<?>[]{PackageManagerService.class, atm.getClass(), File.class}, pm, atm, settingsFile);
         nativeState = realHost ? null : new NativeState();
+        packageChangeObserversBeforeClipboard = List.copyOf((Collection<?>)get(pm, "mPackageChanges"));
         service = realHost ? (ClipboardService)make(ClipboardService.class,
                 new Class<?>[]{atm.getClass(), PackageManagerService.class}, atm, pm)
                 : (ClipboardService)make(ClipboardService.class,
@@ -253,6 +255,8 @@ public final class ClipboardFixture implements AutoCloseable {
     RemoteCallbackList<?> listeners() throws Exception { return (RemoteCallbackList<?>)get(service, "mListeners"); }
     @Override public void close() throws Exception {
         service.close();
+        ((java.util.concurrent.ExecutorService)get(get(get(atm, "mAm"), "mSensorAccess"),
+                "notifications")).shutdownNow();
         field(type("SettingsProvider"), "sInstance").set(null, previousSettings);
         settingsFile.delete();
     }

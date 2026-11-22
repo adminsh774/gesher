@@ -166,6 +166,12 @@ public final class PendingIntentContractTest {
             ((java.util.Set<String>)get(catalog, "mProtectedBroadcasts")).add(ACTION + ".PROTECTED");
             set(am, "mServices", make(type("ActiveServices"), new Class<?>[]{atmType, pmType,
                     type("NotificationManagerService")}, atm, pm, null));
+            // Mirror AMS construction before attaching it to ATM: lifecycle
+            // cleanup now notifies the real sensor policy even in this fixture.
+            Class<?> sensorType = type("SensorAccessService");
+            Object sensors = make(sensorType, new Class<?>[]{pmType, atmType}, pm, atm);
+            set(am, "mSensorAccess", sensors);
+            invoke(get(am, "mServices"), "setSensorAccess", new Class<?>[]{sensorType}, sensors);
             Object providers = UNSAFE.allocateInstance(type("ContentProviders"));
             for (String map : new String[]{"mPublished", "mPublishedBy", "mPublishedCode", "mClients", "mConnections", "mInstalling"}) set(providers, map, new LinkedHashMap<>());
             set(providers, "mRequests", new java.util.HashSet<>());
@@ -244,6 +250,7 @@ public final class PendingIntentContractTest {
             ((ExecutorService)get(broadcasts, "mTimeouts")).shutdownNow();
             ((ExecutorService)get(get(am, "mServices"), "mRestarts")).shutdownNow();
             ((ExecutorService)get(pm, "mPackageEventExecutor")).shutdownNow();
+            ((ExecutorService)get(get(am, "mSensorAccess"), "notifications")).shutdownNow();
             try { ((ExecutorService)get(pending, "mCancelCallbacks")).shutdownNow(); }
             catch (NoSuchFieldException baseline) { }
         }
@@ -521,6 +528,10 @@ public final class PendingIntentContractTest {
             h.receiver(0, null); Receiver finished = new Receiver();
             IIntentSender token = h.create(21, new Intent(ACTION), null, MUTABLE);
             h.send(token, 42, null, null, finished);
+            // These process records intentionally lack admitted packageCode.
+            // Wiring the real dependency must not grant them native access.
+            h.asOwner(() -> rejects(SecurityException.class, () -> invoke(get(h.am, "mSensorAccess"),
+                    "openSubscription", new Class<?>[]{IBinder.class}, new Binder())));
             invoke(h.atm, "processDied", new Class<?>[]{h.processType}, h.ownerProcess);
             check(finished.calls.get() == 1 && finished.code == 42, "Receiver death lost PendingIntent completion");
         }

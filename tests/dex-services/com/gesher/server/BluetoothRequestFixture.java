@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.function.BooleanSupplier;
 import java.util.function.IntConsumer;
@@ -452,12 +453,13 @@ public final class BluetoothRequestFixture {
         check(operations == h.radio.reads + h.radio.confirms + h.radio.switches, "unhandled intent reached backend");
     }
     /** Result/lifetime integration, using real ActivityRecord and pending ResultInfo objects. */
-    private static final class ResultRoute {
+    private static final class ResultRoute implements AutoCloseable {
         final Harness h = new Harness();
         final ApkPackage owner = h.modern("fixture.bt.results");
         final Object atm = construct(ActivityTaskManagerService.class, new Class<?>[]{PackageManagerService.class}, h.pm);
         final Class<?> processType = type("ActivityTaskManagerService$ProcessRecord");
         final Class<?> recordType = type("ActivityTaskManagerService$ActivityRecord");
+        final Object sensors;
         int nextPid = 97501, nextTask = 1;
         ResultRoute() throws Exception {
             set(atm, "mBluetoothRequests", h.requests);
@@ -466,7 +468,15 @@ public final class BluetoothRequestFixture {
             Object providers = UNSAFE.allocateInstance(type("ContentProviders"));
             Object am = UNSAFE.allocateInstance(ActivityManagerService.class);
             set(am, "mProviders", providers); set(am, "mAtm", atm); set(am, "mPm", h.pm);
+            // Native UI lifetime changes notify the same policy dependency that
+            // the real AMS constructor creates before attaching to ATM.
+            sensors = construct(type("SensorAccessService"),
+                    new Class<?>[]{PackageManagerService.class, ActivityTaskManagerService.class}, h.pm, atm);
+            set(am, "mSensorAccess", sensors);
             set(atm, "mAm", am);
+        }
+        @Override public void close() throws Exception {
+            ((ExecutorService)get(sensors, "notifications")).shutdownNow();
         }
         @SuppressWarnings({"unchecked", "rawtypes"}) Object record(Object parent, String who, int code) throws Exception {
             Object process = UNSAFE.allocateInstance(processType);
@@ -508,60 +518,64 @@ public final class BluetoothRequestFixture {
         }
     }
     private static void resultRoutes() throws Exception {
-        ResultRoute normal = new ResultRoute(); Object source = normal.record(null, null, -1);
-        check(normal.request(source, new Intent(ENABLE), 42) == ActivityManager.START_SUCCESS, "result launch rejected");
-        check(normal.results(source).isEmpty() && (int) get(source, "nativeUiCount") == 1,
-                "result published before queued work or activity was not covered");
-        normal.h.queue.next(); normal.released(source);
-        List<ResultInfo> results = normal.results(source);
-        check(results.size() == 1 && results.get(0).mResultCode == Activity.RESULT_OK
-                && results.get(0).mRequestCode == 42 && "request-who".equals(results.get(0).mResultWho),
-                "normal result lost status or routing fields");
-        check(results.get(0).mCallerToken != null, "server result has no caller attribution token");
-        Object snapshot = invoke(get(source, "callerState"), "get", new Class<?>[]{IBinder.class}, results.get(0).mCallerToken);
-        check("android".equals(get(snapshot, "packageName")), "worker result attributed to application instead of server");
+        try (ResultRoute normal = new ResultRoute(); ResultRoute replaced = new ResultRoute();
+                ResultRoute detached = new ResultRoute(); ResultRoute forward = new ResultRoute()) {
+            Object source = normal.record(null, null, -1);
+            check(normal.request(source, new Intent(ENABLE), 42) == ActivityManager.START_SUCCESS, "result launch rejected");
+            check(normal.results(source).isEmpty() && (int) get(source, "nativeUiCount") == 1,
+                    "result published before queued work or activity was not covered");
+            normal.h.queue.next(); normal.released(source);
+            List<ResultInfo> results = normal.results(source);
+            check(results.size() == 1 && results.get(0).mResultCode == Activity.RESULT_OK
+                    && results.get(0).mRequestCode == 42 && "request-who".equals(results.get(0).mResultWho),
+                    "normal result lost status or routing fields");
+            check(results.get(0).mCallerToken != null, "server result has no caller attribution token");
+            Object snapshot = invoke(get(source, "callerState"), "get", new Class<?>[]{IBinder.class}, results.get(0).mCallerToken);
+            check("android".equals(get(snapshot, "packageName")), "worker result attributed to application instead of server");
 
-        ResultRoute replaced = new ResultRoute(); source = replaced.record(null, null, -1);
-        replaced.request(source, new Intent(ENABLE), 7);
-        Object other = replaced.record(null, null, -1); set(source, "app", get(other, "app"));
-        replaced.h.queue.next(); replaced.released(source);
-        check(replaced.results(source).isEmpty() && replaced.h.radio.reads == 0,
-                "old activity request was redirected to replacement process");
+            source = replaced.record(null, null, -1);
+            replaced.request(source, new Intent(ENABLE), 7);
+            Object other = replaced.record(null, null, -1); set(source, "app", get(other, "app"));
+            replaced.h.queue.next(); replaced.released(source);
+            check(replaced.results(source).isEmpty() && replaced.h.radio.reads == 0,
+                    "old activity request was redirected to replacement process");
 
-        ResultRoute detached = new ResultRoute(); source = detached.record(null, null, -1);
-        detached.request(source, new Intent(ENABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), 8);
-        check(detached.results(source).size() == 1
-                && detached.results(source).get(0).mResultCode == Activity.RESULT_CANCELED,
-                "NEW_TASK did not detach result immediately");
-        set(source, "finishing", true); set(get(source, "app"), "dead", true);
-        detached.h.queue.next(); detached.released(source);
-        check(detached.h.radio.switches == 1 && detached.h.radio.on && detached.results(source).size() == 1,
-                "finishing detached source canceled accepted work or received a second result");
+            source = detached.record(null, null, -1);
+            detached.request(source, new Intent(ENABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), 8);
+            check(detached.results(source).size() == 1
+                    && detached.results(source).get(0).mResultCode == Activity.RESULT_CANCELED,
+                    "NEW_TASK did not detach result immediately");
+            set(source, "finishing", true); set(get(source, "app"), "dead", true);
+            detached.h.queue.next(); detached.released(source);
+            check(detached.h.radio.switches == 1 && detached.h.radio.on && detached.results(source).size() == 1,
+                    "finishing detached source canceled accepted work or received a second result");
 
-        ResultRoute forward = new ResultRoute(); Object recipient = forward.record(null, null, -1);
-        source = forward.record(recipient, "forwarded-who", 73);
-        Intent forwarded = new Intent(ENABLE).addFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT);
-        check(forward.request(source, forwarded, 4) == ActivityManager.START_FORWARD_AND_REQUEST_CONFLICT,
-                "forward+new result did not report conflict");
-        check(get(source, "resultTo") == recipient && forward.h.queue.work.isEmpty(),
-                "conflicting start consumed saved result or queued work");
-        check(forward.request(source, forwarded, -1) == ActivityManager.START_SUCCESS, "forwarded result request rejected");
-        check(get(source, "resultTo") == null, "forwarded route was not consumed exactly once");
-        set(source, "finishing", true); set(get(source, "app"), "dead", true); set(source, "app", null);
-        forward.h.queue.next(); forward.released(source);
-        results = forward.results(recipient);
-        check(forward.h.radio.switches == 1 && results.size() == 1 && results.get(0).mResultCode == Activity.RESULT_OK
-                && results.get(0).mRequestCode == 73 && "forwarded-who".equals(results.get(0).mResultWho),
-                "trampoline death lost saved recipient's forwarded result");
+            Object recipient = forward.record(null, null, -1);
+            source = forward.record(recipient, "forwarded-who", 73);
+            Intent forwarded = new Intent(ENABLE).addFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT);
+            check(forward.request(source, forwarded, 4) == ActivityManager.START_FORWARD_AND_REQUEST_CONFLICT,
+                    "forward+new result did not report conflict");
+            check(get(source, "resultTo") == recipient && forward.h.queue.work.isEmpty(),
+                    "conflicting start consumed saved result or queued work");
+            check(forward.request(source, forwarded, -1) == ActivityManager.START_SUCCESS, "forwarded result request rejected");
+            check(get(source, "resultTo") == null, "forwarded route was not consumed exactly once");
+            set(source, "finishing", true); set(get(source, "app"), "dead", true); set(source, "app", null);
+            forward.h.queue.next(); forward.released(source);
+            results = forward.results(recipient);
+            check(forward.h.radio.switches == 1 && results.size() == 1 && results.get(0).mResultCode == Activity.RESULT_OK
+                    && results.get(0).mRequestCode == 73 && "forwarded-who".equals(results.get(0).mResultWho),
+                    "trampoline death lost saved recipient's forwarded result");
+        }
     }
 
     /** The real starter must retain the admitted APK's identity in standalone mode. */
-    private static final class StandaloneRoute {
+    private static final class StandaloneRoute implements AutoCloseable {
         final Harness h = new Harness();
         final ApkPackage owner = h.modern("fixture.bt.standalone");
         final Object atm = construct(ActivityTaskManagerService.class,
                 new Class<?>[]{PackageManagerService.class}, h.pm);
         final Object process;
+        final Object sensors;
         final IApplicationThread thread = appThread();
         final Method starter;
 
@@ -577,6 +591,9 @@ public final class BluetoothRequestFixture {
             Object am = UNSAFE.allocateInstance(ActivityManagerService.class);
             set(am, "mAtm", atm); set(am, "mPm", h.pm);
             set(am, "mCallers", new CallerIdentity(h.pm, (ActivityTaskManagerService) atm));
+            sensors = construct(type("SensorAccessService"),
+                    new Class<?>[]{PackageManagerService.class, ActivityTaskManagerService.class}, h.pm, atm);
+            set(am, "mSensorAccess", sensors);
             set(atm, "mAm", am);
             Class<?> processType = type("ActivityTaskManagerService$ProcessRecord");
             process = UNSAFE.allocateInstance(processType);
@@ -592,6 +609,9 @@ public final class BluetoothRequestFixture {
                 if (method.getName().equals("start") && method.getParameterCount() == 8) selected = method;
             if (selected == null) throw new AssertionError("Activity starter unavailable");
             starter = selected; starter.setAccessible(true);
+        }
+        @Override public void close() throws Exception {
+            ((ExecutorService)get(sensors, "notifications")).shutdownNow();
         }
 
         int launch(String action, String claimed, IApplicationThread caller) throws Exception {
@@ -615,59 +635,59 @@ public final class BluetoothRequestFixture {
     }
 
     @SuppressWarnings("unchecked") private static void standaloneIdentity() throws Exception {
-        StandaloneRoute denied = new StandaloneRoute();
-        denied.h.grant(denied.owner, CONNECT, false); denied.h.grant(denied.owner, ADVERTISE, false);
-        for (String action : List.of(ENABLE, DISABLE, DISCOVERABLE))
-            expect(SecurityException.class, () -> denied.launch(action, denied.owner.packageName, denied.thread),
-                    "standalone caller did not retain its permission requirements");
-        denied.untouched();
+        try (StandaloneRoute denied = new StandaloneRoute(); StandaloneRoute allowed = new StandaloneRoute();
+                StandaloneRoute identity = new StandaloneRoute(); StandaloneRoute published = new StandaloneRoute()) {
+            denied.h.grant(denied.owner, CONNECT, false); denied.h.grant(denied.owner, ADVERTISE, false);
+            for (String action : List.of(ENABLE, DISABLE, DISCOVERABLE))
+                expect(SecurityException.class, () -> denied.launch(action, denied.owner.packageName, denied.thread),
+                        "standalone caller did not retain its permission requirements");
+            denied.untouched();
 
-        StandaloneRoute allowed = new StandaloneRoute();
-        check(allowed.launch(ENABLE, allowed.owner.packageName, allowed.thread) == ActivityManager.START_SUCCESS,
-                "granted standalone caller was rejected");
-        allowed.h.queue.next();
-        check(allowed.h.radio.on && allowed.h.radio.switches == 1, "granted standalone operation was lost");
+            check(allowed.launch(ENABLE, allowed.owner.packageName, allowed.thread) == ActivityManager.START_SUCCESS,
+                    "granted standalone caller was rejected");
+            allowed.h.queue.next();
+            check(allowed.h.radio.on && allowed.h.radio.switches == 1, "granted standalone operation was lost");
 
-        StandaloneRoute identity = new StandaloneRoute();
-        expect(SecurityException.class, () -> identity.launch(ENABLE, "android", identity.thread),
-                "standalone package claim replaced its admitted owner");
-        expect(SecurityException.class, () -> identity.launch(ENABLE, identity.owner.packageName,
-                StandaloneRoute.appThread()), "standalone caller thread did not match its admission");
-        expect(SecurityException.class, () -> identity.launch(ENABLE, identity.owner.packageName, null),
-                "standalone launch without an admitted thread was accepted");
-        identity.untouched();
+            expect(SecurityException.class, () -> identity.launch(ENABLE, "android", identity.thread),
+                    "standalone package claim replaced its admitted owner");
+            expect(SecurityException.class, () -> identity.launch(ENABLE, identity.owner.packageName,
+                    StandaloneRoute.appThread()), "standalone caller thread did not match its admission");
+            expect(SecurityException.class, () -> identity.launch(ENABLE, identity.owner.packageName, null),
+                    "standalone launch without an admitted thread was accepted");
+            identity.untouched();
 
-        for (String state : List.of("absent", "exiting", "dead", "unready", "replaced", "removing", "disabled")) {
-            StandaloneRoute retired = new StandaloneRoute();
-            switch (state) {
-                case "absent" -> ((List<?>) get(retired.atm, "mProcesses")).clear();
-                case "exiting" -> set(retired.process, "exiting", true);
-                case "dead" -> set(retired.process, "dead", true);
-                case "unready" -> set(retired.process, "ready", false);
-                case "replaced" -> retired.h.packages.put(retired.owner.packageName,
-                        code(retired.owner.packageName, retired.owner.uid(), 36, CONNECT));
-                case "removing" -> retired.h.removing.put(retired.owner.packageName, retired.owner);
-                case "disabled" -> ((PackageImpl) retired.owner.parsed).setEnabled(false);
+            for (String state : List.of("absent", "exiting", "dead", "unready", "replaced", "removing", "disabled")) {
+                try (StandaloneRoute retired = new StandaloneRoute()) {
+                    switch (state) {
+                        case "absent" -> ((List<?>) get(retired.atm, "mProcesses")).clear();
+                        case "exiting" -> set(retired.process, "exiting", true);
+                        case "dead" -> set(retired.process, "dead", true);
+                        case "unready" -> set(retired.process, "ready", false);
+                        case "replaced" -> retired.h.packages.put(retired.owner.packageName,
+                                code(retired.owner.packageName, retired.owner.uid(), 36, CONNECT));
+                        case "removing" -> retired.h.removing.put(retired.owner.packageName, retired.owner);
+                        case "disabled" -> ((PackageImpl) retired.owner.parsed).setEnabled(false);
+                    }
+                    expect(SecurityException.class, () -> retired.launch(ENABLE, retired.owner.packageName, retired.thread),
+                            "standalone admission was no longer current: " + state);
+                    retired.untouched();
+                }
             }
-            expect(SecurityException.class, () -> retired.launch(ENABLE, retired.owner.packageName, retired.thread),
-                    "standalone admission was no longer current: " + state);
-            retired.untouched();
-        }
 
-        StandaloneRoute published = new StandaloneRoute();
-        published.h.grant(published.owner, CONNECT, false);
-        ThreadLocal<String> creator = (ThreadLocal<String>) get(published.atm, "mVerifiedCreator");
-        try {
-            creator.set(published.owner.packageName);
-            expect(SecurityException.class, () -> published.launch(ENABLE, "android", null),
-                    "verified application creator lost its permission requirements");
-            published.untouched();
-            creator.set("android");
-            check(published.launch(ENABLE, "android", null) == ActivityManager.START_SUCCESS,
-                    "verified system creator was changed to the local application's identity");
-            published.h.queue.next();
-            check(published.h.radio.on, "verified system request did not complete");
-        } finally { creator.remove(); }
+            published.h.grant(published.owner, CONNECT, false);
+            ThreadLocal<String> creator = (ThreadLocal<String>) get(published.atm, "mVerifiedCreator");
+            try {
+                creator.set(published.owner.packageName);
+                expect(SecurityException.class, () -> published.launch(ENABLE, "android", null),
+                        "verified application creator lost its permission requirements");
+                published.untouched();
+                creator.set("android");
+                check(published.launch(ENABLE, "android", null) == ActivityManager.START_SUCCESS,
+                        "verified system creator was changed to the local application's identity");
+                published.h.queue.next();
+                check(published.h.radio.on, "verified system request did not complete");
+            } finally { creator.remove(); }
+        }
     }
 
     public static int run() throws Exception {

@@ -197,6 +197,10 @@ public final class SchedulerWorkContractTest {
             notifications = make(notificationType, new Class<?>[]{pmType, amType, ToIntBiFunction.class}, pm, am, toast);
             services = make(type("ActiveServices"), new Class<?>[]{atmType, pmType, notificationType}, atm, pm, notifications);
             set(am, "mServices", services);
+            Class<?> sensorType = type("SensorAccessService");
+            Object sensors = make(sensorType, new Class<?>[]{pmType, atmType}, pm, atm);
+            set(am, "mSensorAccess", sensors);
+            invoke(services, "setSensorAccess", new Class<?>[]{sensorType}, sensors);
             broadcasts = make(type("BroadcastController"), new Class<?>[]{atmType, pmType}, atm, pm);
             set(am, "mBroadcasts", broadcasts);
             set(am, "mPendingIntents", make(type("PendingIntents"), new Class<?>[]{amType, pmType}, am, pm));
@@ -278,6 +282,7 @@ public final class SchedulerWorkContractTest {
             ((java.util.concurrent.ExecutorService) get(broadcasts, "mTimeouts")).shutdownNow();
             ((java.util.concurrent.ExecutorService) get(services, "mRestarts")).shutdownNow();
             ((java.util.concurrent.ExecutorService) get(pm, "mPackageEventExecutor")).shutdownNow();
+            ((java.util.concurrent.ExecutorService) get(get(am, "mSensorAccess"), "notifications")).shutdownNow();
             ((java.util.concurrent.ExecutorService) get(get(am, "mPendingIntents"), "mCancelCallbacks")).shutdownNow();
         }
     }
