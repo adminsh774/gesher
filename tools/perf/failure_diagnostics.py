@@ -28,6 +28,16 @@ def _names(directory):
                       if re.fullmatch(r'[0-9]{5}-[A-Za-z0-9_-]{1,100}', entry.name))[:4]
 
 
+def _windows_root_child(parent, canonical):
+    # Handle normalization can expand an 8.3 component (RUNNER~1 -> runneradmin).
+    # The opened object must still be an immediate child of the checked parent;
+    # a normalized path in another parent/volume is never an acceptable alias.
+    actual_parent, separator, name = canonical.rpartition('\\')
+    if not separator or name in ('', '.', '..') or actual_parent.casefold() != parent.casefold():
+        raise OSError('Directory location changed')
+    return canonical
+
+
 class _PosixDirectory:
     flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
 
@@ -142,11 +152,10 @@ class _WindowsDirectory:
             handle, canonical = opened(path.anchor, True)
             cleanup.callback(k.CloseHandle, handle)
             for part in path.parts[1:]:
-                wanted = canonical + '\\' + part
-                handle, canonical = opened(wanted, True)
+                parent = canonical
+                handle, canonical = opened(parent + '\\' + part, True)
                 cleanup.callback(k.CloseHandle, handle)
-                if canonical.casefold() != wanted.casefold():
-                    raise OSError('Directory location changed')
+                canonical = _windows_root_child(parent, canonical)
             return cls(api, handle, canonical, cleanup)
         except BaseException:
             cleanup.close()

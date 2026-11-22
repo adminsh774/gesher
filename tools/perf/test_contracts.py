@@ -227,6 +227,46 @@ class StatisticsTests(unittest.TestCase):
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_windows_root_normalization_keeps_the_exact_canonical_parent(self):
+        parent = r'\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Users'
+        requested, normalized = parent + r'\RUNNER~1', parent + r'\runneradmin'
+        self.assertNotEqual(requested.casefold(), normalized.casefold())  # Former guard rejected this alias.
+        self.assertEqual(failure_diagnostics._windows_root_child(parent, normalized), normalized)
+        for outside in [parent, parent + '\\', parent + r'\..', parent + r'\subdirectory\runneradmin',
+                        parent + r'-other\runneradmin', normalized.replace('01234567', '87654321', 1),
+                        r'C:\Users\runneradmin']:
+            with self.subTest(outside=outside), self.assertRaisesRegex(OSError, 'location changed'):
+                failure_diagnostics._windows_root_child(parent, outside)
+
+    @unittest.skipUnless(os.name == 'nt', 'Actual Windows short-name normalization')
+    def test_windows_short_root_alias_reads_owned_data_and_rejects_links(self):
+        import ctypes as c
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder); output = parent / 'diagnostic owned long root'; output.mkdir()
+            (output / 'summary.json').write_text('OWNED_SHORT_ROOT_POSITIVE')
+            outside = parent / 'outside.txt'; outside.write_text('OUTSIDE_SHORT_ROOT_SENTINEL')
+            (output / 'runs.json').symlink_to(outside)
+            k = c.WinDLL('kernel32', use_last_error=True)
+            values = []
+            for name in ('GetShortPathNameW', 'GetLongPathNameW'):
+                call = getattr(k, name)
+                call.argtypes, call.restype = [c.c_wchar_p, c.c_wchar_p, c.c_uint32], c.c_uint32
+                buffer = c.create_unicode_buffer(32768)
+                count = call(str(output), buffer, len(buffer))
+                self.assertTrue(0 < count < len(buffer), f'{name}: {c.get_last_error()}')
+                values.append(buffer.value)
+            short, long = values
+            if short.casefold() == long.casefold():
+                self.skipTest('This volume has no 8.3 alias for the owned test path')
+            with failure_diagnostics._WindowsDirectory.root(Path(short)) as held:
+                self.assertEqual(held.read('summary.json'), 'OWNED_SHORT_ROOT_POSITIVE')
+                with self.assertRaisesRegex(OSError, 'Unsafe evidence'):
+                    held.read('runs.json')
+            details = runner_failure_diagnostics(Path(short))
+            self.assertIn('OWNED_SHORT_ROOT_POSITIVE', details)
+            self.assertNotIn('OUTSIDE_SHORT_ROOT_SENTINEL', details)
+            print('DIAGNOSTIC_SHORT_ROOT alias_observed=true owned_read=true unsafe_link_rejected=true', flush=True)
+
     def test_file_directory_and_root_links_do_not_expose_sibling_content(self):
         with tempfile.TemporaryDirectory() as folder:
             parent = Path(folder); output = parent / 'output'; attempt = output / '00000-fixture'
@@ -342,12 +382,21 @@ class DiagnosticsTests(unittest.TestCase):
         with patch.object(benchmark, 'run', return_value=2), patch.object(
                 failure_diagnostics.subprocess, 'run', side_effect=AssertionError('unexpected worker')):
             RunnerTests().assert_run_code(None, None, 2)
+            RunnerTests().assert_attempt_status({'status': 'passed'}, 'passed', None)
 
 
 class RunnerTests(unittest.TestCase):
     def assert_run_code(self, plan, output, expected):
         actual = benchmark.run(plan, output)
         self.assertEqual(actual, expected, runner_failure_diagnostics(output) if actual != expected else None)
+
+    def assert_attempt_status(self, row, expected, output, *, require_problem=False):
+        try:
+            self.assertEqual(row['status'], expected)
+            if require_problem:
+                self.assertTrue(row['problems'])
+        except self.failureException as error:
+            raise self.failureException(f'{error}\n{runner_failure_diagnostics(output)}') from error
 
     def plan(self, root, mode='success'):
         fixture = HERE / 'fixture_workload.py'
@@ -378,9 +427,8 @@ class RunnerTests(unittest.TestCase):
                 root = Path(folder); out = root / 'out'
                 self.assert_run_code(self.plan(root, mode), out, 1)
                 rows = contract.read_json(out / 'runs.json')['attempts']
-                self.assertEqual(rows[0]['status'], 'passed')
-                self.assertEqual(rows[1]['status'], 'failed')
-                self.assertTrue(rows[1]['problems'])
+                self.assert_attempt_status(rows[0], 'passed', out)
+                self.assert_attempt_status(rows[1], 'failed', out, require_problem=True)
 
     def test_timeout_preserves_raw_denominator(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -389,7 +437,7 @@ class RunnerTests(unittest.TestCase):
             contract.write_json(plan, value)
             self.assert_run_code(plan, root / 'out', 1)
             rows = contract.read_json(root / 'out/runs.json')['attempts']
-            self.assertEqual(rows[1]['status'], 'timed_out')
+            self.assert_attempt_status(rows[1], 'timed_out', root / 'out')
             self.assertTrue((root / 'out' / rows[1]['directory'] / 'stdout.log').exists())
 
     def test_unexpected_return_preserves_real_failure_evidence_after_cleanup(self):
@@ -404,6 +452,25 @@ class RunnerTests(unittest.TestCase):
             self.assertIn('"status": "failed"', details)
             self.assertIn('attempt.json', details)
             self.assertIn('isolated fixture candidate', details)
+        self.assertFalse(out.exists())
+        self.assertIn('Workload exited with code 17', str(failure.exception))
+
+    def test_expected_failure_code_still_preserves_unexpected_baseline_evidence(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); out = root / 'out'; plan = self.plan(root, 'exit')
+            value = contract.read_json(plan)
+            # Force the existing exit-17 child behavior for both attempts. The
+            # aggregate failure is expected, but the failed baseline is not.
+            value['workload']['command'][3] = 'candidate'
+            contract.write_json(plan, value)
+            self.assert_run_code(plan, out, 1)
+            rows = contract.read_json(out / 'runs.json')['attempts']
+            self.assertEqual([row['status'] for row in rows], ['failed', 'failed'])
+            with self.assertRaises(AssertionError) as failure:
+                self.assert_attempt_status(rows[0], 'passed', out)
+            self.assertIn("'failed' != 'passed'", str(failure.exception))
+            self.assertIn('Workload exited with code 17', str(failure.exception))
+            self.assertIn('isolated fixture candidate', str(failure.exception))
         self.assertFalse(out.exists())
         self.assertIn('Workload exited with code 17', str(failure.exception))
 
