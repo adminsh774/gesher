@@ -78,10 +78,13 @@ function Set-AppSeparateWindows([string] $pkg, [bool] $separate) {
 }
 
 # A proxy setting as ProxySetting.parse saves it: 'direct', 'windows' or host:port (an
-# http:// prefix and a trailing slash dropped); $null when it is not one.
+# http:// prefix and a trailing slash dropped); $null when it is not one. The port is read
+# as Integer.parseInt reads it (a sign, then decimal digits of any script) so that every
+# setting the runtime accepts is shown and saved unchanged.
 function ConvertTo-ProxyValue([string] $value) {
     if ($null -eq $value) { return $null }
-    $v = $value.Trim()
+    # String.trim: every character up to U+0020.
+    $v = $value.Trim([char[]](0..32))
     $lower = $v.ToLowerInvariant()
     if ($lower -in 'direct', 'none', 'off') { return 'direct' }
     if ($lower -in 'windows', 'default') { return 'windows' }
@@ -90,24 +93,114 @@ function ConvertTo-ProxyValue([string] $value) {
     $colon = $v.LastIndexOf(':')
     if ($colon -le 0 -or $colon -eq $v.Length - 1) { return $null }
     $hostName = $v.Substring(0, $colon)
-    if ($hostName -cnotmatch '^(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\])$') { return $null }
-    $port = 0
-    if (-not [int]::TryParse($v.Substring($colon + 1), [Globalization.NumberStyles]::None,
-            [Globalization.CultureInfo]::InvariantCulture, [ref] $port)) { return $null }
+    if ($hostName -cnotmatch '\A(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\])\z') { return $null }
+    $digits = $v.Substring($colon + 1)
+    $start = 0; $negative = $false
+    if ($digits[0] -eq [char]'+' -or $digits[0] -eq [char]'-') { $negative = $digits[0] -eq [char]'-'; $start = 1 }
+    if ($start -ge $digits.Length) { return $null }
+    [long] $port = 0
+    for ($i = $start; $i -lt $digits.Length; $i++) {
+        if (-not [char]::IsDigit($digits[$i])) { return $null }
+        $port = $port * 10 + [long][char]::GetNumericValue($digits[$i])
+        if ($port -gt 2147483648) { return $null }   # Integer.parseInt overflows
+    }
+    if ($negative) { $port = -$port }
     if ($port -lt 1 -or $port -gt 65535) { return $null }
     return $v
 }
 
-# The saved settings: key 'proxy' (every app) or 'proxy.<package>' -> 'direct', 'windows' or host:port.
+# proxy.properties as java.util.Properties.load reads it (ISO 8859-1, logical lines with
+# '\' continuations, '#'/'!' comments, key/value escapes): its natural lines and, for each
+# key/value line, the decoded key and value and the natural lines it spans.
+function Read-ProxyProperties {
+    $result = @{ Lines = [System.Collections.Generic.List[string]]::new(); Entries = [System.Collections.Generic.List[object]]::new() }
+    if (-not (Test-Path -LiteralPath $script:ProxyFile)) { return $result }
+    $text = [IO.File]::ReadAllText($script:ProxyFile, [Text.Encoding]::GetEncoding(28591))
+    foreach ($line in [regex]::Split($text, '\r\n|\r|\n')) { $result.Lines.Add($line) }
+    if ($text.Length -gt 0 -and $text[$text.Length - 1] -in [char]"`n", [char]"`r") { $result.Lines.RemoveAt($result.Lines.Count - 1) }
+    $blank = [char[]]@(' ', "`t", "`f")
+    $i = 0
+    while ($i -lt $result.Lines.Count) {
+        $first = $i
+        $logical = $result.Lines[$i].TrimStart($blank)
+        $i++
+        if ($logical.Length -eq 0 -or $logical[0] -in [char]'#', [char]'!') { continue }
+        # A line ending in an odd number of backslashes continues on the next natural line.
+        while (([regex]::Match($logical, '\\*\z').Length % 2) -eq 1) {
+            $logical = $logical.Substring(0, $logical.Length - 1)
+            if ($i -ge $result.Lines.Count) { break }
+            $logical += $result.Lines[$i].TrimStart($blank)
+            $i++
+        }
+        $keyEnd = 0; $escaped = $false
+        while ($keyEnd -lt $logical.Length) {
+            $c = $logical[$keyEnd]
+            if (-not $escaped -and ($c -in [char]'=', [char]':', [char]' ', [char]"`t", [char]"`f")) { break }
+            $escaped = (-not $escaped) -and $c -eq [char]'\'
+            $keyEnd++
+        }
+        $valueStart = $keyEnd
+        while ($valueStart -lt $logical.Length -and $logical[$valueStart] -in $blank) { $valueStart++ }
+        if ($valueStart -lt $logical.Length -and $logical[$valueStart] -in [char]'=', [char]':') { $valueStart++ }
+        while ($valueStart -lt $logical.Length -and $logical[$valueStart] -in $blank) { $valueStart++ }
+        $result.Entries.Add([pscustomobject]@{
+            Key = ConvertFrom-PropertiesEscapes $logical.Substring(0, $keyEnd)
+            Value = ConvertFrom-PropertiesEscapes $logical.Substring($valueStart)
+            First = $first; Count = $i - $first
+        })
+    }
+    return $result
+}
+
+function ConvertFrom-PropertiesEscapes([string] $text) {
+    return [regex]::Replace($text, '\\(u[0-9A-Fa-f]{4}|.)', {
+        param($m)
+        $e = $m.Groups[1].Value
+        switch -CaseSensitive ($e) {
+            't' { return "`t" }
+            'n' { return "`n" }
+            'r' { return "`r" }
+            'f' { return "`f" }
+            default {
+                if ($e.Length -eq 5) { return [string][char][Convert]::ToInt32($e.Substring(1), 16) }
+                return $e
+            }
+        }
+    })
+}
+
+# A value as java.util.Properties.store writes it.
+function ConvertTo-PropertiesValue([string] $text) {
+    $out = [Text.StringBuilder]::new()
+    for ($i = 0; $i -lt $text.Length; $i++) {
+        $c = $text[$i]
+        switch -CaseSensitive ([string]$c) {
+            '\' { [void]$out.Append('\\'); continue }
+            "`t" { [void]$out.Append('\t'); continue }
+            "`n" { [void]$out.Append('\n'); continue }
+            "`r" { [void]$out.Append('\r'); continue }
+            "`f" { [void]$out.Append('\f'); continue }
+            default {
+                if ($c -eq [char]' ' -and $i -eq 0) { [void]$out.Append('\ ') }
+                elseif ($c -in [char]'=', [char]':', [char]'#', [char]'!') { [void]$out.Append('\').Append($c) }
+                elseif ([int]$c -lt 0x20 -or [int]$c -gt 0x7E) { [void]$out.Append(('\u{0:X4}' -f [int]$c)) }
+                else { [void]$out.Append($c) }
+            }
+        }
+    }
+    return $out.ToString()
+}
+
+# The saved settings: key 'proxy' (every app) or 'proxy.<package>' -> 'direct', 'windows' or
+# host:port. As with Properties, the last line of a key wins; then ProxySetting.parse.
 function Get-ProxySettings {
     $settings = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
-    if (-not (Test-Path -LiteralPath $script:ProxyFile)) { return ,$settings }
-    foreach ($line in Get-Content -LiteralPath $script:ProxyFile -Encoding UTF8) {
-        if ($line -match '^\s*(?:[#!]|$)') { continue }
-        if ($line -notmatch '^\s*(proxy(?:\.[A-Za-z0-9_.]+)?)\s*[=:\s]\s*(.*?)\s*$') { continue }
-        $key = $Matches[1]
-        # java.util.Properties escapes ':' and '=' in values (store writes host\:port).
-        $value = ConvertTo-ProxyValue ($Matches[2] -replace '\\(.)', '$1')
+    $raw = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in (Read-ProxyProperties).Entries) {
+        if ($entry.Key -ceq 'proxy' -or $entry.Key.StartsWith('proxy.', [StringComparison]::Ordinal)) { $raw[$entry.Key] = $entry.Value }
+    }
+    foreach ($key in $raw.Keys) {
+        $value = ConvertTo-ProxyValue $raw[$key]
         if ($value) { $settings[$key] = $value }
     }
     return ,$settings
@@ -124,19 +217,20 @@ function Set-ProxySetting([string] $pkg, [string] $value) {
     } else { $value = $null }
     $key = if ($pkg) { "proxy.$pkg" } else { 'proxy' }
     if (-not $pkg -and $value -eq 'windows') { $value = $null }
+    $file = Read-ProxyProperties
+    $drop = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($entry in $file.Entries) {
+        if ($entry.Key -ceq $key) { for ($n = 0; $n -lt $entry.Count; $n++) { [void]$drop.Add($entry.First + $n) } }
+    }
     $lines = [System.Collections.Generic.List[string]]::new()
-    if (Test-Path -LiteralPath $script:ProxyFile) {
-        foreach ($line in Get-Content -LiteralPath $script:ProxyFile -Encoding UTF8) {
-            if ($line -cmatch ('^\s*' + [regex]::Escape($key) + '\s*[=:\s]')) { continue }
-            $lines.Add($line)
-        }
-    } else {
+    if (-not (Test-Path -LiteralPath $script:ProxyFile)) {
         $lines.Add('#Gesher''s proxy: gesher-app proxy [PACKAGE] host:port|direct|windows')
     }
-    if ($value) { $lines.Add($key + '=' + ($value -replace '([\\:=#!])', '\$1')) }
+    for ($n = 0; $n -lt $file.Lines.Count; $n++) { if (-not $drop.Contains($n)) { $lines.Add($file.Lines[$n]) } }
+    if ($value) { $lines.Add($key + '=' + (ConvertTo-PropertiesValue $value)) }
     $directory = Split-Path -Parent $script:ProxyFile
     if (-not (Test-Path -LiteralPath $directory)) { [void](New-Item -ItemType Directory -Path $directory) }
-    [IO.File]::WriteAllLines($script:ProxyFile, $lines, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllLines($script:ProxyFile, $lines, [Text.Encoding]::GetEncoding(28591))
 }
 
 # A saved setting as the panel shows it.
@@ -235,6 +329,7 @@ function Get-StateStamp {
         Get-FileStamp (Join-Path $root 'microg.enabled')
         Get-FileStamp (Join-Path $root 'system/priv-app/com.google.android.gms/base.apk')
         Get-FileStamp $script:AppWindowsFile
+        Get-FileStamp $script:ProxyFile
     ) -join '|')
 }
 

@@ -279,7 +279,13 @@ processes of packages without it; gesher-app applies it in its own process
   `$GESHER_PROXY` when it starts it, with `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` for HTTP
   clients that read those (Dart's HttpClient: Flutter apps); `WindowsProxy` then takes it
   instead of Windows' settings (an HTTP proxy server, with localhost, 127.0.0.1 and [::1] left out) and does not
-  follow Windows' changes. A running app keeps its proxy until its process ends.
+  follow Windows' changes. A running app keeps its proxy until its process ends: reopening
+  its window or an Activity can reuse that process, so a changed setting needs the app
+  closed completely (or the device stopped) and started again, as the control panel says.
+  It covers HTTP clients that use the system proxy or those variables. WebView pages are
+  not given it: without the app's own `ProxyController` override (androidx.webkit, ADR
+  0058) the process's WebView2 environment gets no proxy arguments and uses Windows'
+  settings.
 - **CONNECTIVITY_ACTION**: the connectivity service keeps it sticky (made at the first
   sticky query, as BatteryService's battery broadcast) and sends it when the default
   network (its netId or kind) changes: EXTRA_NETWORK_INFO, EXTRA_NETWORK_TYPE,

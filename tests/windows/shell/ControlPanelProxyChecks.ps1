@@ -16,8 +16,10 @@ $source = [IO.File]::ReadAllText([IO.Path]::GetFullPath($PanelPath))
 $tokens = $null; $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in 'ConvertTo-ProxyValue', 'Get-ProxySettings', 'Set-ProxySetting', 'Get-ProxyDisplayText',
-        'Initialize-ProxyEditor', 'Read-ProxyEditor') {
+foreach ($name in 'ConvertTo-ProxyValue', 'Read-ProxyProperties', 'ConvertFrom-PropertiesEscapes',
+        'ConvertTo-PropertiesValue', 'Get-ProxySettings', 'Set-ProxySetting', 'Get-ProxyDisplayText',
+        'Initialize-ProxyEditor', 'Read-ProxyEditor', 'Get-FileStamp', 'Get-StateStamp', 'Update-AppsView',
+        'Refresh-Dashboard', 'Invoke-LiveRefreshTick') {
     $definitions = @($ast.FindAll({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -37,9 +39,14 @@ foreach ($case in @(
         @('127.0.0.1:8080', '127.0.0.1:8080'), @(' http://proxy.example.com:3128/ ', 'proxy.example.com:3128'),
         @('[::1]:8888', '[::1]:8888'), @('DIRECT', 'direct'), @('none', 'direct'), @('off', 'direct'),
         @('windows', 'windows'), @('Default', 'windows'),
+        # Integer.parseInt: a '+' sign, leading zeros and decimal digits of any script.
+        @('proxy.example.com:+80', 'proxy.example.com:+80'), @('host:0080', 'host:0080'),
+        @("host:$([char]0xFF18)$([char]0xFF10)", "host:$([char]0xFF18)$([char]0xFF10)"),
+        @("$([char]1)host:80$([char]31)", 'host:80'),
         @('proxy.example.com', $null), @(':8080', $null), @('host:', $null), @('host:0', $null),
-        @('host:65536', $null), @('host:+80', $null), @('ho st:80', $null), @('https://host:80', $null),
-        @('', $null))) {
+        @('host:65536', $null), @('host:-80', $null), @('host:+', $null), @('host:++80', $null),
+        @('host:99999999999999999999', $null), @('host:8 0', $null), @("ho`nst:80", $null),
+        @("host`n:80", $null), @('ho st:80', $null), @('https://host:80', $null), @('', $null))) {
     $actual = ConvertTo-ProxyValue $case[0]
     Assert-Proxy ($actual -ceq $case[1]) "ConvertTo-ProxyValue '$($case[0])' gave '$actual', expected '$($case[1])'"
 }
@@ -100,6 +107,78 @@ try {
     Set-ProxySetting 'com.example.new' '127.0.0.1:9000'
     Assert-Proxy ((Get-Content -LiteralPath $script:ProxyFile)[0].StartsWith('#')) 'A new file has no comment'
     Assert-Proxy ((Get-ProxySettings)['proxy.com.example.new'] -ceq '127.0.0.1:9000') 'Package proxy in a new file does not round-trip'
+
+    # Lines as java.util.Properties.load reads them: separators, continuations, escapes,
+    # the last line of a key winning (also when it is invalid), ISO 8859-1.
+    [IO.File]::WriteAllLines($script:ProxyFile, [string[]]@(
+        '! another comment',
+        '  proxy.com.a = 10.0.0.2\:81',
+        'proxy.com.b:direct',
+        "proxy.com.c`t1.2.3.4\:82",
+        'proxy.com.d=10.0.0.3\:\',
+        '    83',
+        'proxy.com.e=10.0.0.4\u003a84',
+        'proxy.com.f=10.0.0.5\:85',
+        'proxy.com.f=nonsense',
+        'proxy.com.g=host\:\uff18\uff10',
+        'proxy\u002ecom.h=direct',
+        'unrelated=a\',
+        '  proxy.com.z=1.1.1.1\:1'), [Text.Encoding]::GetEncoding(28591))
+    $settings = Get-ProxySettings
+    Assert-Proxy ($settings['proxy.com.a'] -ceq '10.0.0.2:81') 'Spaces around = were not read'
+    Assert-Proxy ($settings['proxy.com.b'] -ceq 'direct') 'The : separator was not read'
+    Assert-Proxy ($settings['proxy.com.c'] -ceq '1.2.3.4:82') 'The whitespace separator was not read'
+    Assert-Proxy ($settings['proxy.com.d'] -ceq '10.0.0.3:83') 'A continued line was not read'
+    Assert-Proxy ($settings['proxy.com.e'] -ceq '10.0.0.4:84') 'A \u escape was not read'
+    Assert-Proxy (-not $settings.ContainsKey('proxy.com.f')) 'An earlier line of a key won over its last one'
+    Assert-Proxy ($settings['proxy.com.g'] -ceq "host:$([char]0xFF18)$([char]0xFF10)") 'A non-ASCII escaped port was not read'
+    Assert-Proxy ($settings['proxy.com.h'] -ceq 'direct') 'An escaped key was not read'
+    Assert-Proxy (-not $settings.ContainsKey('proxy.com.z')) 'A continuation line was read as a key'
+    Set-ProxySetting 'com.d' 'direct'
+    Set-ProxySetting 'com.g' "host:$([char]0xFF19)0"
+    $lines = [IO.File]::ReadAllLines($script:ProxyFile, [Text.Encoding]::GetEncoding(28591))
+    Assert-Proxy (@($lines | Where-Object { $_ -like '*83*' }).Count -eq 0) 'A continued line of a replaced key was left behind'
+    Assert-Proxy ($lines -ccontains 'proxy.com.g=host\:\uFF190') 'A non-ASCII value is not written as Properties.store does'
+    Assert-Proxy ($lines -ccontains 'unrelated=a\' -and $lines -ccontains '  proxy.com.z=1.1.1.1\:1') 'Another key''s continuation was changed'
+    $settings = Get-ProxySettings
+    Assert-Proxy ($settings['proxy.com.d'] -ceq 'direct' -and $settings['proxy.com.a'] -ceq '10.0.0.2:81' -and
+        $settings['proxy.com.g'] -ceq "host:$([char]0xFF19)0") 'Saving changed or lost settings'
+    Assert-Proxy ((ConvertTo-PropertiesValue ' a=b:c#d!e\f') -ceq '\ a\=b\:c\#d\!e\\f') 'Properties.store escapes are not written'
+
+    # Live refresh: a CLI change to an app's setting is shown while the panel stays open,
+    # within the production debounce, with no other file changed.
+    $root = $scratch
+    $icoFile = Join-Path $scratch 'none.ico'
+    $script:ViewState = @{ Device = $null; Microg = $null; Store = $null; AppsSignature = $null; AppFiles = @(); Icons = @{} }
+    $script:LiveState = @{ Stamp = $null; AppsStamp = $null; PendingSince = $null; Tick = 0 }
+    $script:LiveRefreshDebounceMs = 400
+    $script:LiveRefreshSlowEvery = 4
+    $script:IsBusy = $false
+    $appsList = [System.Windows.Controls.ListBox]::new()
+    function Get-AppFilesStamp { 'apps' }
+    function Get-DeviceStatus { $true }
+    function Update-DeviceView($running) { }
+    function Get-MicrogStatus { $false }
+    function Update-MicrogView($enabled) { }
+    function Update-StoreView($installed) { }
+    function Get-SeparateWindowApps { ,[System.Collections.Generic.HashSet[string]]::new() }
+    function Get-InstalledApps { @([pscustomobject]@{ Package = 'com.d'; Label = 'D'; IconPath = $null }) }
+    function Shown-Proxy { @($appsList.ItemsSource)[0].ProxyText }
+    Refresh-Dashboard
+    Assert-Proxy ((Shown-Proxy) -ceq (Get-GesherText 'cp_proxy_app_value' @((Get-GesherText 'cp_proxy_mode_direct')))) 'The app''s proxy is not shown'
+    # As ProxySetting.save (gesher-app proxy com.d 10.9.9.9:3128) writes it.
+    [IO.File]::WriteAllLines($script:ProxyFile, [string[]]@('#Gesher''s proxy', 'proxy.com.d=10.9.9.9\:3128'),
+        [Text.Encoding]::GetEncoding(28591))
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    while ((Shown-Proxy) -cne 'Proxy: 10.9.9.9:3128' -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 500   # the production timer interval
+        Invoke-LiveRefreshTick
+    }
+    Assert-Proxy ((Shown-Proxy) -ceq 'Proxy: 10.9.9.9:3128') 'An external proxy change was not shown while the panel stayed open'
+    [IO.File]::WriteAllLines($script:ProxyFile, [string[]]@('#Gesher''s proxy'), [Text.Encoding]::GetEncoding(28591))
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    while ((Shown-Proxy) -cne '' -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 500; Invoke-LiveRefreshTick }
+    Assert-Proxy ((Shown-Proxy) -ceq '') 'An externally removed proxy is still shown'
 
     # The editor on real WPF controls.
     $combo = [System.Windows.Controls.ComboBox]::new()
