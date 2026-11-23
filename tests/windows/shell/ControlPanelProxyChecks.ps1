@@ -146,6 +146,38 @@ try {
         $settings['proxy.com.g'] -ceq "host:$([char]0xFF19)0") 'Saving changed or lost settings'
     Assert-Proxy ((ConvertTo-PropertiesValue ' a=b:c#d!e\f') -ceq '\ a\=b\:c\#d\!e\\f') 'Properties.store escapes are not written'
 
+    # A UTF-8 byte order mark is part of the first key for Properties.load(InputStream),
+    # so that line is not a setting; saving keeps the bytes of every other line.
+    $savedFile = [IO.File]::ReadAllBytes($script:ProxyFile)
+    $bom = [byte[]](0xEF, 0xBB, 0xBF)
+    [IO.File]::WriteAllBytes($script:ProxyFile, $bom + [Text.Encoding]::GetEncoding(28591).GetBytes(
+        "proxy=direct`n#caf$([char]0xE9) comment`nproxy.com.k=direct`n"))
+    $settings = Get-ProxySettings
+    Assert-Proxy (-not $settings.ContainsKey('proxy')) 'A key after a byte order mark was read as every app''s setting'
+    Assert-Proxy ($settings['proxy.com.k'] -ceq 'direct') 'A setting after the byte order mark line was not read'
+    Set-ProxySetting 'com.k' $null
+    $bytes = [IO.File]::ReadAllBytes($script:ProxyFile)
+    Assert-Proxy ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) 'Saving dropped the byte order mark (it would make its line a setting)'
+    Assert-Proxy ([Array]::IndexOf($bytes, [byte]0xE9) -ge 0) 'Saving changed an ISO 8859-1 character of another line'
+    Assert-Proxy (-not (Get-ProxySettings).ContainsKey('proxy')) 'Saving made the byte order mark line a setting'
+
+    # A last line that continues (odd backslashes) must not swallow a new setting.
+    [IO.File]::WriteAllLines($script:ProxyFile, [string[]]@('unrelated=a\'), [Text.Encoding]::GetEncoding(28591))
+    Set-ProxySetting '' 'direct'
+    Assert-Proxy ((Get-ProxySettings)['proxy'] -ceq 'direct') 'A new setting was read as a continuation of the line before it'
+    [IO.File]::WriteAllLines($script:ProxyFile, [string[]]@('unrelated=a\\'), [Text.Encoding]::GetEncoding(28591))
+    Set-ProxySetting '' 'direct'
+    Assert-Proxy (@([IO.File]::ReadAllLines($script:ProxyFile)).Count -eq 2) 'An even number of backslashes does not continue the line'
+
+    # Ordinal comparison, as String.equals: a soft hyphen is not ignored.
+    Assert-Proxy ($null -eq (ConvertTo-ProxyValue "dir$([char]0xAD)ect")) 'A soft hyphen in direct was ignored'
+    Assert-Proxy ($null -eq (ConvertTo-ProxyValue "windows$([char]0xAD)")) 'A soft hyphen in windows was ignored'
+    # A package name must not end in a line break ('$' matches before one).
+    $threw = $false
+    try { Set-ProxySetting "com.a`n" 'direct' } catch { $threw = $true }
+    Assert-Proxy $threw 'A package ending in a line break was accepted'
+    [IO.File]::WriteAllBytes($script:ProxyFile, $savedFile)
+
     # Live refresh: a CLI change to an app's setting is shown while the panel stays open and
     # visible, with no other file changed: through the production metadata monitor's real
     # file notification, and through the recovery stamp when no notification arrives.

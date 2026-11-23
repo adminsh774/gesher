@@ -61,7 +61,7 @@ function Get-SeparateWindowApps {
 
 # Saves whether an app's tasks are windows of their own (from its next start).
 function Set-AppSeparateWindows([string] $pkg, [bool] $separate) {
-    if ($pkg -notmatch '^[A-Za-z0-9_.]+$') { return }
+    if ($pkg -cnotmatch '\A[A-Za-z0-9_.]+\z') { return }
     $lines = [System.Collections.Generic.List[string]]::new()
     if (Test-Path -LiteralPath $script:AppWindowsFile) {
         foreach ($line in Get-Content -LiteralPath $script:AppWindowsFile) {
@@ -86,10 +86,11 @@ function ConvertTo-ProxyValue([string] $value) {
     # String.trim: every character up to U+0020.
     $v = $value.Trim([char[]](0..32))
     $lower = $v.ToLowerInvariant()
-    if ($lower -in 'direct', 'none', 'off') { return 'direct' }
-    if ($lower -in 'windows', 'default') { return 'windows' }
-    if ($lower.StartsWith('http://')) { $v = $v.Substring(7) }
-    if ($v.EndsWith('/')) { $v = $v.Substring(0, $v.Length - 1) }
+    # Ordinal, as String.equals: -in and -eq would ignore characters such as a soft hyphen.
+    if ([Array]::IndexOf([string[]]@('direct', 'none', 'off'), $lower) -ge 0) { return 'direct' }
+    if ([Array]::IndexOf([string[]]@('windows', 'default'), $lower) -ge 0) { return 'windows' }
+    if ($lower.StartsWith('http://', [StringComparison]::Ordinal)) { $v = $v.Substring(7) }
+    if ($v.EndsWith('/', [StringComparison]::Ordinal)) { $v = $v.Substring(0, $v.Length - 1) }
     $colon = $v.LastIndexOf(':')
     if ($colon -le 0 -or $colon -eq $v.Length - 1) { return $null }
     $hostName = $v.Substring(0, $colon)
@@ -115,7 +116,9 @@ function ConvertTo-ProxyValue([string] $value) {
 function Read-ProxyProperties {
     $result = @{ Lines = [System.Collections.Generic.List[string]]::new(); Entries = [System.Collections.Generic.List[object]]::new() }
     if (-not (Test-Path -LiteralPath $script:ProxyFile)) { return $result }
-    $text = [IO.File]::ReadAllText($script:ProxyFile, [Text.Encoding]::GetEncoding(28591))
+    # Every byte as one ISO 8859-1 character, as Properties.load(InputStream): ReadAllText
+    # would drop a UTF-8 byte order mark that Java reads as part of the first key.
+    $text = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($script:ProxyFile))
     foreach ($line in [regex]::Split($text, '\r\n|\r|\n')) { $result.Lines.Add($line) }
     if ($text.Length -gt 0 -and $text[$text.Length - 1] -in [char]"`n", [char]"`r") { $result.Lines.RemoveAt($result.Lines.Count - 1) }
     $blank = [char[]]@(' ', "`t", "`f")
@@ -210,7 +213,7 @@ function Get-ProxySettings {
 # 'windows' for every app removes the setting; $value $null removes a package's own setting
 # (it uses every app's again). App processes started from now on use it.
 function Set-ProxySetting([string] $pkg, [string] $value) {
-    if ($pkg -and $pkg -notmatch '^[A-Za-z0-9_.]+$') { throw "Invalid package: $pkg" }
+    if ($pkg -and $pkg -cnotmatch '\A[A-Za-z0-9_.]+\z') { throw "Invalid package: $pkg" }
     if ($null -ne $value -and $value -ne '') {
         $value = ConvertTo-ProxyValue $value
         if (-not $value) { throw 'Invalid proxy setting' }
@@ -227,7 +230,11 @@ function Set-ProxySetting([string] $pkg, [string] $value) {
         $lines.Add('#Gesher''s proxy: gesher-app proxy [PACKAGE] host:port|direct|windows')
     }
     for ($n = 0; $n -lt $file.Lines.Count; $n++) { if (-not $drop.Contains($n)) { $lines.Add($file.Lines[$n]) } }
-    if ($value) { $lines.Add($key + '=' + (ConvertTo-PropertiesValue $value)) }
+    if ($value) {
+        # A last line ending in an odd number of backslashes would continue into the new one.
+        if ($lines.Count -gt 0 -and ([regex]::Match($lines[$lines.Count - 1], '\\*\z').Length % 2) -eq 1) { $lines.Add('') }
+        $lines.Add($key + '=' + (ConvertTo-PropertiesValue $value))
+    }
     $directory = Split-Path -Parent $script:ProxyFile
     if (-not (Test-Path -LiteralPath $directory)) { [void](New-Item -ItemType Directory -Path $directory) }
     [IO.File]::WriteAllLines($script:ProxyFile, $lines, [Text.Encoding]::GetEncoding(28591))
