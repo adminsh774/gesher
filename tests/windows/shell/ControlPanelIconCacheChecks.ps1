@@ -14,14 +14,14 @@ $source = if ($SourceRef) { (& git -C $repo show "${SourceRef}:tools/package/ges
 $tokens = $null; $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($name in 'Get-FileStamp', 'Get-AppFilesStamp', 'Get-PanelAppIcon', 'Update-AppsView', 'Get-SeparateWindowApps', 'ConvertTo-ProxyValue', 'Get-ProxySettings', 'Get-ProxyDisplayText') {
+foreach ($name in 'Get-FileStamp', 'Get-AppFilesStamp', 'Get-PanelAppIcon', 'Update-AppsView', 'Get-SeparateWindowApps', 'ConvertTo-ProxyValue', 'Read-ProxyProperties', 'ConvertFrom-PropertiesEscapes', 'Get-ProxySettings', 'Get-ProxyDisplayText') {
     $definitions = @($ast.FindAll({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }, $false))
     if ($definitions.Count -eq 0 -and $SourceRef -and $name -eq 'Get-PanelAppIcon') { continue }
     if ($definitions.Count -eq 0 -and $SourceRef -and $name -eq 'Get-SeparateWindowApps') { continue }
-    if ($definitions.Count -eq 0 -and $SourceRef -and $name -in 'ConvertTo-ProxyValue', 'Get-ProxySettings', 'Get-ProxyDisplayText') { continue }
+    if ($definitions.Count -eq 0 -and $SourceRef -and $name -in 'ConvertTo-ProxyValue', 'Read-ProxyProperties', 'ConvertFrom-PropertiesEscapes', 'Get-ProxySettings', 'Get-ProxyDisplayText') { continue }
     if ($definitions.Count -ne 1) { throw "Expected one production function: $name" }
     $definition = $definitions[0].Extent.Text
     if ($name -eq 'Get-FileStamp') { $definition = $definition.Replace('function Get-FileStamp(', 'function Get-UncountedFileStamp(') }
