@@ -149,6 +149,9 @@ try {
     # A UTF-8 byte order mark is part of the first key for Properties.load(InputStream),
     # so that line is not a setting; saving keeps the bytes of every other line.
     $savedFile = [IO.File]::ReadAllBytes($script:ProxyFile)
+    function Write-ProxyLines([string[]] $lines) {
+        [IO.File]::WriteAllLines($script:ProxyFile, $lines, [Text.Encoding]::GetEncoding(28591))
+    }
     $bom = [byte[]](0xEF, 0xBB, 0xBF)
     [IO.File]::WriteAllBytes($script:ProxyFile, $bom + [Text.Encoding]::GetEncoding(28591).GetBytes(
         "proxy=direct`n#caf$([char]0xE9) comment`nproxy.com.k=direct`n"))
@@ -176,6 +179,19 @@ try {
     $threw = $false
     try { Set-ProxySetting "com.a`n" 'direct' } catch { $threw = $true }
     Assert-Proxy $threw 'A package ending in a line break was accepted'
+
+    # A \u escape without four hex digits: Properties.load throws, so ProxySetting.load has
+    # no settings and ProxySetting.save does not replace the file (it would lose the others).
+    $malformed = [string[]]@('proxy.com.ok=direct', 'other=\u12', '#comment \u1')
+    Write-ProxyLines $malformed
+    Assert-Proxy ((Get-ProxySettings).Count -eq 0) 'A file with a malformed \u escape must have no settings, as ProxySetting.load'
+    $threw = $false
+    try { Set-ProxySetting 'com.ok' $null } catch { $threw = $true }
+    Assert-Proxy $threw 'A file with a malformed \u escape must not be replaced'
+    Assert-Proxy ((@([IO.File]::ReadAllLines($script:ProxyFile)) -join "`n") -ceq ($malformed -join "`n")) 'A malformed file was changed'
+    # An escaped backslash before u, and \u in a comment, are not \u escapes.
+    Write-ProxyLines @('proxy.com.ok=direct', 'other=a\\u12', '#comment \u1')
+    Assert-Proxy ((Get-ProxySettings)['proxy.com.ok'] -ceq 'direct') 'An escaped backslash before u was read as a \u escape'
     [IO.File]::WriteAllBytes($script:ProxyFile, $savedFile)
 
     # Live refresh: a CLI change to an app's setting is shown while the panel stays open and

@@ -114,7 +114,7 @@ function ConvertTo-ProxyValue([string] $value) {
 # '\' continuations, '#'/'!' comments, key/value escapes): its natural lines and, for each
 # key/value line, the decoded key and value and the natural lines it spans.
 function Read-ProxyProperties {
-    $result = @{ Lines = [System.Collections.Generic.List[string]]::new(); Entries = [System.Collections.Generic.List[object]]::new() }
+    $result = @{ Lines = [System.Collections.Generic.List[string]]::new(); Entries = [System.Collections.Generic.List[object]]::new(); Malformed = $false }
     if (-not (Test-Path -LiteralPath $script:ProxyFile)) { return $result }
     # Every byte as one ISO 8859-1 character, as Properties.load(InputStream): ReadAllText
     # would drop a UTF-8 byte order mark that Java reads as part of the first key.
@@ -146,6 +146,11 @@ function Read-ProxyProperties {
         while ($valueStart -lt $logical.Length -and $logical[$valueStart] -in $blank) { $valueStart++ }
         if ($valueStart -lt $logical.Length -and $logical[$valueStart] -in [char]'=', [char]':') { $valueStart++ }
         while ($valueStart -lt $logical.Length -and $logical[$valueStart] -in $blank) { $valueStart++ }
+        # Properties.load throws on a \u escape without four hex digits (IllegalArgumentException):
+        # ProxySetting.load then has no settings at all, and save does not replace the file.
+        foreach ($escape in [regex]::Matches($logical, '\\(u[0-9A-Fa-f]{4}|.)')) {
+            if ($escape.Groups[1].Value -ceq 'u') { $result.Malformed = $true }
+        }
         $result.Entries.Add([pscustomobject]@{
             Key = ConvertFrom-PropertiesEscapes $logical.Substring(0, $keyEnd)
             Value = ConvertFrom-PropertiesEscapes $logical.Substring($valueStart)
@@ -195,11 +200,14 @@ function ConvertTo-PropertiesValue([string] $text) {
 }
 
 # The saved settings: key 'proxy' (every app) or 'proxy.<package>' -> 'direct', 'windows' or
-# host:port. As with Properties, the last line of a key wins; then ProxySetting.parse.
+# host:port. As with Properties, the last line of a key wins; then ProxySetting.parse. None
+# when the file is not in Properties form, as ProxySetting.load.
 function Get-ProxySettings {
     $settings = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     $raw = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
-    foreach ($entry in (Read-ProxyProperties).Entries) {
+    $file = Read-ProxyProperties
+    if ($file.Malformed) { return ,$settings }
+    foreach ($entry in $file.Entries) {
         if ($entry.Key -ceq 'proxy' -or $entry.Key.StartsWith('proxy.', [StringComparison]::Ordinal)) { $raw[$entry.Key] = $entry.Value }
     }
     foreach ($key in $raw.Keys) {
@@ -221,6 +229,8 @@ function Set-ProxySetting([string] $pkg, [string] $value) {
     $key = if ($pkg) { "proxy.$pkg" } else { 'proxy' }
     if (-not $pkg -and $value -eq 'windows') { $value = $null }
     $file = Read-ProxyProperties
+    # As ProxySetting.save: a file Properties.load cannot read is not replaced.
+    if ($file.Malformed) { throw "${script:ProxyFile}: Malformed \uxxxx encoding." }
     $drop = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($entry in $file.Entries) {
         if ($entry.Key -ceq $key) { for ($n = 0; $n -lt $entry.Count; $n++) { [void]$drop.Add($entry.First + $n) } }
