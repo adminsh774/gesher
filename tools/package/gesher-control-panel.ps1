@@ -357,6 +357,7 @@ function Update-PanelMetadataWatch {
         (Join-Path $root 'microg.enabled')
         (Join-Path $root 'system/priv-app/com.google.android.gms/base.apk')
         $script:AppWindowsFile
+        $script:ProxyFile
     ) + @($script:ViewState.AppFiles)
     $script:MetadataMonitor.SetFiles($root, [string[]]$paths)
 }

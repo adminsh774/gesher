@@ -18,7 +18,8 @@ $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 foreach ($name in 'ConvertTo-ProxyValue', 'Read-ProxyProperties', 'ConvertFrom-PropertiesEscapes',
         'ConvertTo-PropertiesValue', 'Get-ProxySettings', 'Set-ProxySetting', 'Get-ProxyDisplayText',
-        'Initialize-ProxyEditor', 'Read-ProxyEditor', 'Get-FileStamp', 'Get-StateStamp', 'Update-AppsView',
+        'Initialize-ProxyEditor', 'Read-ProxyEditor', 'Get-FileStamp', 'Get-StateStamp', 'Get-AppFilesStamp',
+        'Update-AppsView', 'Test-PanelMetadataVisible', 'Request-PanelMetadataRefresh', 'Update-PanelMetadataWatch',
         'Refresh-Dashboard', 'Invoke-LiveRefreshTick') {
     $definitions = @($ast.FindAll({
         param($node)
@@ -145,40 +146,67 @@ try {
         $settings['proxy.com.g'] -ceq "host:$([char]0xFF19)0") 'Saving changed or lost settings'
     Assert-Proxy ((ConvertTo-PropertiesValue ' a=b:c#d!e\f') -ceq '\ a\=b\:c\#d\!e\\f') 'Properties.store escapes are not written'
 
-    # Live refresh: a CLI change to an app's setting is shown while the panel stays open,
-    # within the production debounce, with no other file changed.
+    # Live refresh: a CLI change to an app's setting is shown while the panel stays open and
+    # visible, with no other file changed: through the production metadata monitor's real
+    # file notification, and through the recovery stamp when no notification arrives.
     $root = $scratch
     $icoFile = Join-Path $scratch 'none.ico'
+    $script:AppWindowsFile = Join-Path $scratch 'data/system/app-windows.properties'
+    $window = @{ IsVisible = $true; WindowState = 'Normal' }
     $script:ViewState = @{ Device = $null; Microg = $null; Store = $null; AppsSignature = $null; AppFiles = @(); Icons = @{} }
-    $script:LiveState = @{ Stamp = $null; AppsStamp = $null; PendingSince = $null; Tick = 0 }
-    $script:LiveRefreshDebounceMs = 400
-    $script:LiveRefreshSlowEvery = 4
+    $script:LiveState = @{ Stamp = $null; AppsStamp = $null; PendingSince = $null; PendingFirst = $null; Tick = 0; WasVisible = $true; RecoveryAt = $null }
+    $script:LiveRefreshDebounceMs = 400; $script:LiveRefreshMaximumDelayMs = 2000; $script:LiveRefreshRecoveryMs = 5000
     $script:IsBusy = $false
     $appsList = [System.Windows.Controls.ListBox]::new()
-    function Get-AppFilesStamp { 'apps' }
-    function Get-DeviceStatus { $true }
     function Update-DeviceView($running) { }
+    function Get-DeviceStatus { $false }
     function Get-MicrogStatus { $false }
     function Update-MicrogView($enabled) { }
     function Update-StoreView($installed) { }
     function Get-SeparateWindowApps { ,[System.Collections.Generic.HashSet[string]]::new() }
-    function Get-InstalledApps { @([pscustomobject]@{ Package = 'com.d'; Label = 'D'; IconPath = $null }) }
+    function Get-InstalledApps { @([pscustomobject]@{ Package = 'com.d'; Label = 'D'; IconPath = $null; Launchable = $true }) }
     function Shown-Proxy { @($appsList.ItemsSource)[0].ProxyText }
-    Refresh-Dashboard
-    Assert-Proxy ((Shown-Proxy) -ceq (Get-GesherText 'cp_proxy_app_value' @((Get-GesherText 'cp_proxy_mode_direct')))) 'The app''s proxy is not shown'
-    # As ProxySetting.save (gesher-app proxy com.d 10.9.9.9:3128) writes it.
-    [IO.File]::WriteAllLines($script:ProxyFile, [string[]]@('#Gesher''s proxy', 'proxy.com.d=10.9.9.9\:3128'),
-        [Text.Encoding]::GetEncoding(28591))
-    $deadline = [DateTime]::UtcNow.AddSeconds(3)
-    while ((Shown-Proxy) -cne 'Proxy: 10.9.9.9:3128' -and [DateTime]::UtcNow -lt $deadline) {
-        Start-Sleep -Milliseconds 500   # the production timer interval
-        Invoke-LiveRefreshTick
+    function Write-ProxyFile([string[]] $lines) {
+        [IO.File]::WriteAllLines($script:ProxyFile, $lines, [Text.Encoding]::GetEncoding(28591))
     }
-    Assert-Proxy ((Shown-Proxy) -ceq 'Proxy: 10.9.9.9:3128') 'An external proxy change was not shown while the panel stayed open'
-    [IO.File]::WriteAllLines($script:ProxyFile, [string[]]@('#Gesher''s proxy'), [Text.Encoding]::GetEncoding(28591))
-    $deadline = [DateTime]::UtcNow.AddSeconds(3)
-    while ((Shown-Proxy) -cne '' -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 500; Invoke-LiveRefreshTick }
-    Assert-Proxy ((Shown-Proxy) -ceq '') 'An externally removed proxy is still shown'
+    # Runs the WPF dispatcher (monitor notifications) and the production 500 ms heartbeat tick.
+    function Wait-Shown([string] $text, [int] $seconds) {
+        $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
+        while ((Shown-Proxy) -cne $text -and [DateTime]::UtcNow -lt $deadline) {
+            $frame = [System.Windows.Threading.DispatcherFrame]::new()
+            $timer = [System.Windows.Threading.DispatcherTimer]::new()
+            $timer.Interval = [TimeSpan]::FromMilliseconds(500)
+            $timer.Add_Tick({ $frame.Continue = $false })
+            $timer.Start(); [System.Windows.Threading.Dispatcher]::PushFrame($frame); $timer.Stop()
+            Invoke-LiveRefreshTick
+        }
+        return (Shown-Proxy) -ceq $text
+    }
+
+    . (Join-Path $repo 'tools/package/gesher-panel-native.ps1')
+    $context = [System.Windows.Threading.DispatcherSynchronizationContext]::new(
+        [System.Windows.Threading.Dispatcher]::CurrentDispatcher, [System.Windows.Threading.DispatcherPriority]::Background)
+    $script:MetadataMonitor = [Gesher.PanelChangeMonitor]::new($context)
+    try {
+        # As Initialize-PanelMetadata wires it.
+        $script:MetadataMonitor.add_Changed({ try { Request-PanelMetadataRefresh } catch { } })
+        Refresh-Dashboard
+        Assert-Proxy ((Shown-Proxy) -ceq (Get-GesherText 'cp_proxy_app_value' @((Get-GesherText 'cp_proxy_mode_direct')))) 'The app''s proxy is not shown'
+        $script:LiveState.RecoveryAt = [DateTime]::UtcNow.AddMinutes(10)   # only the notification can refresh
+        $generation = $script:MetadataMonitor.Generation
+        # As ProxySetting.save (gesher-app proxy com.d 10.9.9.9:3128) writes it.
+        Write-ProxyFile @('#Gesher''s proxy', 'proxy.com.d=10.9.9.9\:3128')
+        Assert-Proxy (Wait-Shown 'Proxy: 10.9.9.9:3128' 3) 'An external proxy change was not shown from its file notification'
+        Assert-Proxy ($script:MetadataMonitor.Generation -gt $generation) 'proxy.properties is not watched by the metadata monitor'
+    } finally { $script:MetadataMonitor.Dispose(); $script:MetadataMonitor = $null }
+
+    # No notifications (a missed event): the recovery stamp, within LiveRefreshRecoveryMs.
+    $script:LiveState.RecoveryAt = [DateTime]::UtcNow.AddMilliseconds($script:LiveRefreshRecoveryMs)
+    Write-ProxyFile @('#Gesher''s proxy')
+    Assert-Proxy (Wait-Shown '' 8) 'A missed proxy removal was not recovered while the panel stayed open'
+    $before = Get-StateStamp
+    Write-ProxyFile @('#Gesher''s proxy', 'proxy.com.d=direct')
+    Assert-Proxy ($before -ne (Get-StateStamp)) 'proxy.properties is absent from the recovery stamp'
 
     # The editor on real WPF controls.
     $combo = [System.Windows.Controls.ComboBox]::new()
