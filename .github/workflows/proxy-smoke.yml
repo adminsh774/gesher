@@ -1,0 +1,32 @@
+name: proxy-smoke
+on: push
+jobs:
+  smoke:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the PR's CI build (gesher-runtime/gesher run 45081240587) and native-libs (run 45174932806)
+        shell: pwsh
+        run: |
+          foreach ($a in 'windows-x64', 'framework', 'boot-image', 'webview') {
+            gh run download 45081240587 --repo gesher-runtime/gesher -n $a -D "ci/$a"
+            if ($LASTEXITCODE) { exit 1 }
+          }
+          gh run download 45174932806 --repo gesher-runtime/gesher -n native-libs -D ci/native-libs
+          if ($LASTEXITCODE) { exit 1 }
+          New-Item -ItemType Directory dist | Out-Null
+          foreach ($a in 'windows-x64', 'framework', 'native-libs', 'boot-image', 'webview') { Copy-Item -Recurse -Force "ci/$a/*" dist }
+          Get-FileHash dist/dalvikvm.exe, dist/gesher-app.jar, dist/framework.jar, dist/web3app.apk, dist/web3_network.so | Format-Table -AutoSize | Out-String -Width 200
+      - name: Gesher's own proxy on the device (CLI, --proxy, control panel)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File .github/proxy-smoke/run.ps1 -Dir dist -Repo $PWD -Work "${{ runner.temp }}/work" | Tee-Object -FilePath proxy-smoke.log
+          if (-not (Select-String -Path proxy-smoke.log -Pattern 'LOCAL RESULT: failed=0' -Quiet)) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: proxy-smoke-log
+          path: proxy-smoke.log
