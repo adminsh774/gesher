@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 
 from github_read import get_json
@@ -111,8 +112,16 @@ def read_public(endpoint):
         'User-Agent': 'Gesher-CI',
         'X-GitHub-Api-Version': '2022-11-28',
     })
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        # The upstream repo is gone, so its release feed 404s: treat that as
+        # an empty catalog and fall back to 0.0.0.<run number> instead of
+        # failing the installer build.
+        if exc.code == 404:
+            return []
+        raise
 
 
 if __name__ == '__main__':
