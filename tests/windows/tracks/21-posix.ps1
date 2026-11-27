@@ -236,13 +236,14 @@ Remove-Item -Recurse -Force $watchDir -ErrorAction SilentlyContinue
 # limitation says the APK must sit on Gesher's drive. Install surfacegl.apk
 # from TEMP's drive through the Launcher, then uninstall it again so the
 # package registry is left as it was. The Launcher class lives in
-# framework.jar, so this runs on $bcpFramework, not the core-only $bcp.
+# gesher-app.jar, so this runs on $bcpApp (run-tests.ps1), not the core-only
+# $bcp or $bcpFramework.
 if ($tempDrive -ine $here) {
   if (Test-Path "$Dir/surfacegl.apk") {
     $otherApk = Join-Path ([IO.Path]::GetTempPath()) "gesher-surfacegl-$PID.apk"
     Copy-Item "$Dir/surfacegl.apk" $otherApk
     $mntApk = "/mnt/$($tempDrive.ToLower())" + (($otherApk.Substring(2)) -replace '\\', '/')
-    $dvmPosix = @("-Xbootclasspath:$bcpFramework", "-Ximage:$(NoDrive "$root/system")/framework/boot.art", '-Xint', '-Xusejit:false')
+    $dvmPosix = @("-Xbootclasspath:$bcpApp", "-Ximage:$(NoDrive "$root/system")/framework/boot.art", '-Xint', '-Xusejit:false')
     Check "gesher-app: install surfacegl.apk from another drive ($mntApk)" {
       & "$Dir/dalvikvm.exe" @($dvmPosix + 'com.gesher.app.Launcher', 'install', $mntApk)
     } @('gesher-app: installed com.gesher.surfacegl')
