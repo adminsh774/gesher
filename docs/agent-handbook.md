@@ -4,7 +4,7 @@ A handbook for any AI agent or team that takes over maintenance of this project.
 
 **Source of truth:** this file lives in the repository at `docs/agent-handbook.md`. The Google Doc of the same name is a mirror of it. Do not edit the Google Doc directly: a sync job rewrites it from this file whenever the repository changes, and direct edits to the Doc are overwritten on the next sync. Change the repository file, and the Doc follows.
 
-**Last updated:** 27 November 2026. Repository head at the time of writing: `655e4f9` ("Fork improvements: run the Windows test shards, automate releases from tags, version from this fork's releases").
+**Last updated:** 27 November 2026. Repository head at the time of writing: `225a4f7` ("test: fix the cross-drive repro to run the Launcher on the framework bootclasspath").
 
 **Scope:** this handbook covers the project only. It contains no personal information about any person and nothing unrelated to the project.
 
@@ -113,7 +113,7 @@ Also built in `out/`: `dex2oat.exe`, `oatdump.exe`, `profman.exe`, `dexdump.exe`
 
 ### 4.5 Watchers
 
-- CI runs are watched by a scheduled job that polls the public GitHub API every 30 minutes, stays silent while a run is in progress, reports once on completion (conclusion, failed jobs, package-job result, installer artifact), and removes itself. The watcher for the current run is `gesher-run9-installer-watch`.
+- CI runs are watched by a scheduled job that polls the public GitHub API every 30 minutes, stays silent while a run is in progress, reports once on completion (conclusion, failed jobs, package-job result, installer artifact), and removes itself. A watcher is created per run (for example `gesher-run15-repro-watch` for the cross-drive reproduction runs).
 - The run watcher is the only polling mechanism. Do not poll the API in a loop from a chat turn.
 - A watcher that finds its run cancelled (superseded by a later push) reports that in one short message and removes itself.
 
@@ -173,6 +173,8 @@ The owner asked for all six improvements from the list below, in the new version
 
 Why the shards were decoupled rather than ungating native2: the native2 job's DNS step is fork-aware, but its validation requires a manual `workflow_dispatch` event and a repository whose API `fork` flag is true with the upstream as its source. This repository has `fork: false` and no source, so the DNS step would fail validation in any CI run and take the shards down with it. Decoupling (skip the native2-dependent tracks when the artifact is absent) was the correct call; ungating was investigated and rejected with evidence.
 
+Follow-ups committed 27 November 2026: the ten track guards in `e92f28cf` and the tripwire count update in `36dbc36b` (both described in 6.3). Run 13 (head `e92f28c`) failed only on `artifact-preflight` — the counts were still 14 — and run 14 (head `36dbc36b`) completed success, the first fully green run since the fork improvements.
+
 ### 5.4 References deliberately left alone
 
 The code review of 26 November 2026 found 41 `uses: gesher-runtime/gesher` references. The 19 live ones were fixed (5.1). The rest were left:
@@ -196,10 +198,14 @@ Run numbers are GitHub's per-workflow sequence for the `ci` workflow. A push to 
 | 6 | `29347d0` | Failure | The `package` job succeeded and the installer was built. Six unrelated jobs failed: compile-selected-minimum, linux-reference, native2, test (windows-2022), test (windows-2025), ci-required |
 | 7 | `29347d0` | Failure | A second run on the same head, 17:38 UTC. The reason for the second run is not recorded in the maintainer's notes |
 | 8 | `d80f879` | **Success** | First fully successful CI run on the fork. The gates skipped as designed; the package job succeeded; the `gesher-setup` artifact exists (106,656,633 bytes) |
-| 9 | `d791a4c` | In progress at the time of writing | First of four runs triggered by the four fork-improvement commits; superseded intermediate state |
+| 9 | `d791a4c` | Failure | First of four runs triggered by the four fork-improvement commits; superseded intermediate state |
 | 10 | `8cf72d6` | Cancelled | Superseded by the next push |
 | 11 | `00f5281` | Cancelled | Superseded by the next push |
 | 12 | `655e4f9` | Completed, conclusion `failure` | The head run: all seven fork-improvement files in place. Failed jobs: `artifact-preflight` (the manifest count in `test_artifact_batch.py`), `test-native` on both Windows versions (ten downstream tracks starved of the native2 artifact — see 5.3), `test` on both versions (the aggregator), and `ci-required`. The gates skipped as designed; build, framework/runner-route, and framework/host-tools succeeded. **The `package` job succeeded** and the `gesher-setup` artifact exists: 106,655,626 bytes, not expired (installer `gesher-setup-0.0.0.12.exe` by the fallback version rule). This run produced no release: publication requires a successful run |
+| 13 | `e92f28c` | Failure | The ten track guards landed; test-native passed on both versions. Only `artifact-preflight` failed (the manifest counts were still 14) and the aggregate gate with it |
+| 14 | `36dbc36b` | **Success** | First fully green run since the fork improvements. All 79 jobs success or skipped; the `package` job succeeded and the `gesher-setup` artifact exists |
+| 15 | `0aa9455` | Failure | The cross-drive reproduction (9.3) landed and failed exactly as designed: test-native on both versions, the test aggregator, and ci-required. The `package` job succeeded |
+| 16 | `225a4f7` | Failure | The corrected reproduction (Launcher on the framework bootclasspath) still fails test-native on both versions; the `package` job succeeded. The failure output is the diagnosis for the cross-drive install path and had not been read at the time of writing |
 
 ### 5.6 Releases
 
@@ -218,7 +224,7 @@ The owner asked for all six, in the new version:
 | 3 | Real version numbers (builds come out `0.0.0.<run>` because the version script read the dead upstream feed) | Done in the fork-side changes (5.3); proven by the v0.2.1 release |
 | 4 | Input support (app windows display but do not take mouse or keyboard input) | Already implemented on main; see section 9. Remaining work is gap closure and verification |
 | 5 | Installer without admin rights | Already per-user; see section 9. Remaining work is verification on a non-admin account |
-| 6 | APK on any drive (the APK must sit on Gesher's drive or it errors) | Genuinely open; see section 9. The reproduction is drafted and sequenced after the v0.2.1 release |
+| 6 | APK on any drive (the APK must sit on Gesher's drive or it errors) | Genuinely open; see section 9. The reproduction is applied (0aa94555) and corrected (225a4f78); runs 15 and 16 both failed on the new check, and the failure output is the diagnosis |
 
 ## 6. CI in depth
 
@@ -245,8 +251,8 @@ Do not try to ungate these three jobs. The investigation is recorded in section 
 `test-shards` runs the Windows test tracks in shards. Tracks are assigned to shards by `tests/windows/test-shards.json` via `tests/windows/helpers/Get-TestTrackPlan.ps1`; every track file must be assigned exactly once or the helper throws.
 
 - The shard job assembles its artifacts from `tools/ci/test_shard_artifacts.json` (13 artifacts after the native2 entry was removed).
-- The manifest is also load-tested by `tools/ci/test_artifact_batch.py`, which reads the real `test_shard_artifacts.json` and hardcodes its size (13 artifacts, 19 API requests, 102 inventory items). The hardcoded counts are a deliberate tripwire: changing the manifest without updating the counts fails `artifact-preflight`. The native2 removal required updating seven 14s to 13, one 103 to 102, and the 20-request test name to 19. Any future manifest change must update these counts in the same commit.
-- **Decoupling a track is not done by skipping the track alone.** Run 12 proved this: skipping `44-native2.ps1` starved ten downstream tracks in the native shard, because 44 defines the shared symbols they consume — `$n2`, `$n2Dir`, `N2Run`, `$abis`, `$dvmN2`, `$arm64FpcrEvidence`, `$n2WideEvidence` — and the runner only pre-loads function definitions from the shard manifest's helpers, not variables. The ten tracks (46, 66, 68, 69, 72, 75, 82, 85, 89, 90) each guard themselves now: whole-track SKIP-and-return where the track needs the artifact, and for 69, 75, and 85 a flag that skips only the evidence loop so their independent `A64Run` checks still run. `84-ci-processes` was deliberately left alone: its `N2Run` section runs the locally compiled `process84.exe` fixture, and the desktop shard declares `N2Run` as a helper, so it passes on a fork already. Rule: any track that uses a symbol defined by another track must guard itself against that track's absence; never assume the producer ran.
+- The manifest is also load-tested by `tools/ci/test_artifact_batch.py`, which reads the real `test_shard_artifacts.json` and hardcodes its size (13 artifacts, 19 API requests, 102 inventory items; commit `36dbc36b`). The hardcoded counts are a deliberate tripwire: changing the manifest without updating the counts fails `artifact-preflight`. The native2 removal required updating seven 14s to 13, one 103 to 102, and the 20-request test name to 19. Any future manifest change must update these counts in the same commit.
+- **Decoupling a track is not done by skipping the track alone.** Run 12 proved this: skipping `44-native2.ps1` starved ten downstream tracks in the native shard, because 44 defines the shared symbols they consume — `$n2`, `$n2Dir`, `N2Run`, `$abis`, `$dvmN2`, `$arm64FpcrEvidence`, `$n2WideEvidence` — and the runner only pre-loads function definitions from the shard manifest's helpers, not variables. The ten tracks (46, 66, 68, 69, 72, 75, 82, 85, 89, 90) each guard themselves now (commit `e92f28cf`; verified by run 13, where test-native passed on both versions): whole-track SKIP-and-return where the track needs the artifact, and for 69, 75, and 85 a flag that skips only the evidence loop so their independent `A64Run` checks still run. `84-ci-processes` was deliberately left alone: its `N2Run` section runs the locally compiled `process84.exe` fixture, and the desktop shard declares `N2Run` as a helper, so it passes on a fork already. Rule: any track that uses a symbol defined by another track must guard itself against that track's absence; never assume the producer ran.
 - `supplier-correlation` produces no artifact the shards consume, so removing it from the shards' needs loses an attestation, not coverage.
 - The native2 artifact **was** consumed: `tests/windows/tracks/44-native2.ps1` failed the shard if `$Dir/native2/native2-test.dex` was missing, and `tests/windows/tracks/92-net-dns-wire.ps1` failed via `Resolve-Path` if `$Dir/native2` was absent. Both tracks now print `SKIP <name>: <reason>` and return without incrementing `$failed` when the artifact is absent. That is the established skip convention in this harness: a track that throws fails the whole shard, so a skip must return cleanly.
 - Tracks 21-posix, 44-native2, and 92-net-dns-wire all run in the `native` shard.
@@ -343,20 +349,20 @@ The reported error, "close failed: EINVAL", is libcore's `Os.close` `ErrnoExcept
 2. APK parse and verify on the source path before the copy (`ApkPackage.verifySignatures` / `parseCodeDirectory` opening the APK through libziparchive or mmap on a `/mnt/<drive>` path).
 3. The direct `Launcher` to `Installer.copy` path (least likely: it contains no close that should return `EINVAL` cross-drive).
 
-**Reproduction plan (drafted, not yet applied):** extend `tests/windows/tracks/21-posix.ps1` inside its existing cross-drive block (`if ($tempDrive -ine $here)` — `TEMP` is on another drive on GitHub runners) with a check that copies `$Dir/surfacegl.apk` (package `com.gesher.surfacegl`) to `TEMP`'s drive, installs it through `dalvikvm ... com.gesher.app.Launcher install <mnt-path>`, expects the substring `gesher-app: installed com.gesher.surfacegl`, then uninstalls it (expect `gesher-app: uninstalled com.gesher.surfacegl`), shuts the device down, and removes the temporary copy. No new track file and no `test-shards.json` change is needed. The success line format is confirmed in `tests/windows/tracks/50-services.ps1:721` and the cleanup pattern in `tests/windows/tracks/38-media.ps1:336-344`.
+**Reproduction (applied 27 November 2026):** `tests/windows/tracks/21-posix.ps1` was extended inside its existing cross-drive block (`if ($tempDrive -ine $here)` — `TEMP` is on another drive on GitHub runners) with a check that copies `$Dir/surfacegl.apk` (package `com.gesher.surfacegl`) to `TEMP`'s drive, installs it through `dalvikvm ... com.gesher.app.Launcher install <mnt-path>`, expects the substring `gesher-app: installed com.gesher.surfacegl`, then uninstalls it (expect `gesher-app: uninstalled com.gesher.surfacegl`), shuts the device down, and removes the temporary copy (commit `0aa94555`). No new track file and no `test-shards.json` change was needed. The success line format is confirmed in `tests/windows/tracks/50-services.ps1:721` and the cleanup pattern in `tests/windows/tracks/38-media.ps1:336-344`. The first version ran the Launcher on the core-only bootclasspath, which cannot load the Launcher class (it lives in `framework.jar`); commit `225a4f78` moved the check to run on `$bcpFramework` and to the end of the track, outside the `.dex` block.
 
-**Sequencing:** apply the reproduction as its own commit **after** run 12 and the v0.2.1 release. If it reproduces the bug it fails the native shard, and publication requires a successful CI run, so it must not ride with the release changes. If the reproduction passes, the limitation is already gone for the install path: delete the `docs/installer.md` line, keep the check as the regression test, and examine the PackageInstaller session path separately. If it fails with "close failed: EINVAL", pin the failing close (parse path first, then session path), fix that step only, delete the docs line, and keep the check as the regression test.
+**Sequencing (what actually happened):** the reproduction was applied as its own commits (`0aa94555`, `225a4f78`) before the v0.2.1 release, on the owner's direction to automate the cross-drive work. Run 15 failed on the new check exactly as designed, and run 16 failed on the corrected check too — both runs' `package` jobs succeeded, so the installer kept building while the native shard failed. The failure output is the diagnosis and had not been read at the time of writing. Until the underlying failure is fixed, no release can publish from a head that carries this check, because publication requires a successful CI run. If the reproduction passes, the limitation is already gone for the install path: delete the `docs/installer.md` line, keep the check as the regression test, and examine the PackageInstaller session path separately. If it fails with "close failed: EINVAL", pin the failing close (parse path first, then session path), fix that step only, delete the docs line, and keep the check as the regression test.
 
 ## 10. Open items
 
 | Item | Status | Next step |
 |---|---|---|
-| v0.2.1 release | Run 12 failed (artifact-preflight + native shard); fixes prepared locally (test counts, ten track guards) | Push the fixes, wait for a green run, then push tag `v0.2.1`; verify the automatic publication; send the owner the release link |
-| Cross-drive APK fix | Reproduction drafted (9.3) | Apply after the v0.2.1 release, as its own commit |
+| v0.2.1 release | Run 14 green at `36dbc36b` (fixes committed in `e92f28cf`, `36dbc36b`). Runs 15 and 16 failed on the cross-drive repro check, so the head is not releasable until that failure is resolved | Resolve the cross-drive repro failure (read run 16's output), wait for a green run, then push tag `v0.2.1`; verify the automatic publication; send the owner the release link |
+| Cross-drive APK fix | Reproduction applied and corrected (`0aa94555`, `225a4f78`); runs 15 and 16 both failed on the check (9.3) | Read run 16's failure output and pin the failing close; fix that step only |
 | Input verification | Owner asked to click and type inside an app window in the 0.0.0.6 install | Await the owner's result; if it passes, input needs no code |
 | Non-admin installer verification | Not covered by CI (runners are admin) | Verify once on a genuinely non-admin Windows account; do not block a release on it |
 | Input gap closure | Documented gaps in 9.1 | Optional follow-up after verification: pointer capture, drag, Windows clipboard, `InputQueue` first |
-| Six unrelated CI jobs from run 6 | Superseded by the gate scoping | The gates now skip; run 12 shows whether the shards and the aggregate gate pass on the fork |
+| Six unrelated CI jobs from run 6 | Closed — run 14 was fully green (all 79 jobs success or skipped) | None |
 
 ## 11. Standing prohibitions
 
@@ -378,7 +384,11 @@ These are not preferences. Each one cost a failed run, a wrong delivery, or a co
 
 Append one entry per repository change that affects this handbook. Newest first. The sync job (section 13) appends here automatically when it detects new commits.
 
-- **27 November 2026 — `655e4f9`.** Fork improvements committed: test shards decoupled from native2 and supplier-correlation, releases automated from tags, versions repointed to this fork's releases. Handbook created at this head.
+- **27 November 2026 — `225a4f78`.** Cross-drive reproduction corrected: the Launcher check runs on the framework bootclasspath (`$bcpFramework`). Run 16 failed on the check; the package job succeeded.
+- **27 November 2026 — `0aa94555`.** Cross-drive reproduction applied to `21-posix.ps1`: install `surfacegl.apk` from TEMP's drive through the Launcher, then uninstall it. Run 15 failed on the new check as designed.
+- **27 November 2026 — `36dbc36b`.** Shard-manifest tripwire counts updated to 13 artifacts (19 API requests, 102 inventory items). Run 14: first fully green run since the fork improvements.
+- **27 November 2026 — `e92f28cf`.** Ten native2-dependent tracks guard themselves against a missing native2 artifact. Run 13: test-native passed; only `artifact-preflight` failed (counts still 14).
+- **27 November 2026 — `655e4f9`.** Fork improvements committed: test shards decoupled from native2 and supplier-correlation, releases automated from tags, versions repointed to this fork's releases. Handbook created at this head (commit `8f3c66cc`).
 - **27 November 2026 — `d80f879b`.** Updater pointed at this fork's releases (script, three fixtures, docs line); README "About CI" section added. Run 8: first fully successful CI run on the fork.
 - **26 November 2026 — `29347d07`.** Installer version script survives a missing upstream release feed (404 returns an empty catalogue). Run 6: package job succeeded, installer `gesher-setup-0.0.0.6.exe` built, release v0.0.0.6 published manually.
 - **26 November 2026 — `4dc00ce8`, `eed9e1dc`, `5ad36ad1`.** Local workflow and action references replace the missing upstream references; checkout step added before the local runner-route action.
