@@ -41,6 +41,10 @@ def zip_bytes(entries):
 
 class ArtifactBatch(unittest.TestCase):
     MANIFEST = 'tools/ci/test_shard_artifacts.json'
+    # The counts below track the manifest size: 13 artifacts. The native2
+    # entry was removed when the test shards were decoupled from the native2
+    # job (fork improvements, 27 November 2026). Update the numbers if the
+    # manifest changes; the hardcoded counts are the tripwire.
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -162,28 +166,28 @@ class ArtifactBatch(unittest.TestCase):
         self.assertFalse(list(self.destination.parent.glob('core-stage-*')))
         self.assertNotIn('CI_ARTIFACT_RECEIPT ', self.logs.getvalue())
 
-    def test_complete_real_batch_has_20_api_requests_and_only_publishes_verified_members(self):
+    def test_complete_real_batch_has_19_api_requests_and_only_publishes_verified_members(self):
         self.execute()
         # One run + one 100-row job page + one artifact page, twice.
         self.assertEqual(len(self.json_reads), 6)
-        self.assertEqual(len(self.redirects), 14)
-        self.assertEqual(len(self.storage_reads), 14)
-        self.assertEqual(len(self.json_reads) + len(self.redirects), 20)
+        self.assertEqual(len(self.redirects), 13)
+        self.assertEqual(len(self.storage_reads), 13)
+        self.assertEqual(len(self.json_reads) + len(self.redirects), 19)
         for spec in self.specs:
             path = self.destination / 'artifacts' / spec['destination'] / 'actual' / (spec['destination'] + '.txt')
             self.assertEqual(path.read_text(), spec['name'])
         self.assertFalse(list(self.destination.parent.glob('core-stage-*')))
-        self.assertEqual(self.logs.getvalue().count('CI_ARTIFACT_RECEIPT '), 14)
+        self.assertEqual(self.logs.getvalue().count('CI_ARTIFACT_RECEIPT '), 13)
 
     def test_paginated_inventory_can_grow_with_an_unrelated_artifact(self):
         self.items += [dict(id=2000 + i, name='unrelated-' + str(i)) for i in range(89)]
         self.final_items = copy.deepcopy(self.items) + [dict(id=4000, name='later-unrelated')]
         self.execute()
-        self.assertEqual(len(self.items), 103)
+        self.assertEqual(len(self.items), 102)
         self.assertEqual(len(self.json_reads), 8)
-        self.assertEqual(len(self.redirects), 14)
+        self.assertEqual(len(self.redirects), 13)
         self.assertEqual(sum('/artifacts?per_page=100&page=2' in p for p in self.json_reads), 2)
-        self.assertEqual(len(list((self.destination / 'artifacts').iterdir())), 14)
+        self.assertEqual(len(list((self.destination / 'artifacts').iterdir())), 13)
 
     def test_failed_or_wrong_source_producer_never_downloads(self):
         for key, value in (('conclusion', 'failure'), ('run_attempt', 1), ('head_sha', 'c'*40)):
@@ -214,7 +218,7 @@ class ArtifactBatch(unittest.TestCase):
         self.final_run = dict(self.run, run_attempt=3)
         with self.assertRaisesRegex(RuntimeError, 'Current run/source/attempt/repository'):
             self.execute()
-        self.assertEqual(len(self.downloads), 14)
+        self.assertEqual(len(self.downloads), 13)
         self.unpublished()
 
     def test_selected_producer_or_artifact_change_after_download_is_rejected(self):
@@ -326,7 +330,7 @@ class ArtifactBatch(unittest.TestCase):
         self.committed_manifest = json.dumps(self.specs, indent=2).encode() + b'\n'
         self.manifest.write_bytes(self.committed_manifest.replace(b'\n', b'\r\n'))
         self.execute()
-        self.assertEqual(len(self.redirects), 14)
+        self.assertEqual(len(self.redirects), 13)
         self.assertTrue((self.destination / 'artifacts').is_dir())
 
 
