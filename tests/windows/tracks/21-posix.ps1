@@ -129,6 +129,28 @@ if ($tempDrive -ine $here) {
     & "$Dir/dalvikvm.exe" "-Xbootclasspath:$bcp" "-Ximage:$(NoDrive "$root/system")/framework/boot.art" `
       -Xint '-Xusejit:false' -cp "$(NoDrive "$Dir/libcore-tests.dex"):$mnt" gesher.Hello
   } @('Hello from ART on Windows')
+  # An APK install from another drive (docs/installer.md): the same-drive
+  # limitation says the APK must sit on Gesher's drive. Install surfacegl.apk
+  # from TEMP's drive through the Launcher, then uninstall it again so the
+  # package registry is left as it was.
+  if (Test-Path "$Dir/surfacegl.apk") {
+    $otherApk = Join-Path ([IO.Path]::GetTempPath()) "gesher-surfacegl-$PID.apk"
+    Copy-Item "$Dir/surfacegl.apk" $otherApk
+    $mntApk = "/mnt/$($tempDrive.ToLower())" + (($otherApk.Substring(2)) -replace '\\', '/')
+    $dvmPosix = @("-Xbootclasspath:$bcp", "-Ximage:$(NoDrive "$root/system")/framework/boot.art", '-Xint', '-Xusejit:false')
+    Check "gesher-app: install surfacegl.apk from another drive ($mntApk)" {
+      & "$Dir/dalvikvm.exe" @($dvmPosix + 'com.gesher.app.Launcher', 'install', $mntApk)
+    } @('gesher-app: installed com.gesher.surfacegl')
+    $cleanup = & "$Dir/dalvikvm.exe" @($dvmPosix + 'com.gesher.app.Launcher', 'uninstall', 'com.gesher.surfacegl') 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $cleanup -notmatch 'gesher-app: uninstalled com\.gesher\.surfacegl') {
+      Write-Host "INFO  posix: cross-drive surfacegl.apk cleanup failed (exit $LASTEXITCODE)"
+      $failed++
+    }
+    $null = & "$Dir/dalvikvm.exe" @($dvmPosix + 'com.gesher.app.Launcher', 'shutdown') 2>&1 | Out-String
+    Remove-Item $otherApk -ErrorAction SilentlyContinue
+  } else {
+    Write-Host 'INFO  posix: surfacegl.apk not in dist, cross-drive install not checked'
+  }
   Remove-Item $otherDex -ErrorAction SilentlyContinue
 } else {
   Write-Host "INFO  no second drive: the class path on another drive is not checked"
