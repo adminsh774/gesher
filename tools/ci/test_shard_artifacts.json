@@ -63,10 +63,5 @@
     "name": "surfaces",
     "producer": "surfaces / apps",
     "destination": "surfaces"
-  },
-  {
-    "name": "native2",
-    "producer": "native2 / native2",
-    "destination": "native2"
   }
 ]

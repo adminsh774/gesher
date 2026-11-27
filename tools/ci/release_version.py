@@ -9,8 +9,8 @@ import urllib.request
 from github_read import get_json
 
 
-REPOSITORY = 'gesher-runtime/gesher'
-REPOSITORY_ID = 1426153186
+REPOSITORY = 'adminsh774/gesher'
+REPOSITORY_ID = 1473148972
 API = f'repos/{REPOSITORY}'
 DIGEST = re.compile(r'sha256:[0-9a-fA-F]{64}')
 MAX_INSTALLER_SIZE = 2147483648
@@ -105,8 +105,8 @@ def build_version(environ, read):
 
 
 def read_public(endpoint):
-    # A token in a standalone fork belongs to that fork. Its public baseline
-    # is still the upstream release feed used by installed Gesher clients.
+    # The release feed is this fork's own: installed Gesher clients check
+    # this repository's releases for updates.
     request = urllib.request.Request(f'https://api.github.com/{endpoint}', headers={
         'Accept': 'application/vnd.github+json',
         'User-Agent': 'Gesher-CI',
@@ -116,9 +116,9 @@ def read_public(endpoint):
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
-        # The upstream repo is gone, so its release feed 404s: treat that as
-        # an empty catalog and fall back to 0.0.0.<run number> instead of
-        # failing the installer build.
+        # A missing release feed (404) means no published releases exist yet:
+        # treat it as an empty catalog and fall back to 0.0.0.<run number>
+        # instead of failing the installer build.
         if exc.code == 404:
             return []
         raise
