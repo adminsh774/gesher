@@ -47,7 +47,7 @@ updates or update individual DLLs independently.
 
 The updater reads the public
 [`releases/latest` endpoint](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
-for **`gesher-runtime/gesher`**. It accepts only stable, non-draft releases and
+for **`adminsh774/gesher`**. It accepts only stable, non-draft releases and
 compares numeric versions. A release tag may be `v0.2.0` or `0.2.0` (exactly
 three components); the matching asset must be exactly `gesher-setup-0.2.0.exe`.
 
