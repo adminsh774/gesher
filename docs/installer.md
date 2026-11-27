@@ -145,7 +145,7 @@ started through the device's system server, in a window of the app's process
 [0026](decisions/0026-services-persistent-device.md)). The first launch starts
 the device (binderd, servicemanager, the system server) in the background; it
 outlives the console and serves later launches until `gesher-app shutdown` or
-10 minutes without an app. The APK must be on the same drive as Gesher.
+10 minutes without an app.
 
 ## Installed apps in the Start menu
 
