@@ -4,7 +4,7 @@ A handbook for any AI agent or team that takes over maintenance of this project.
 
 **Source of truth:** this file lives in the repository at `docs/agent-handbook.md`. The Google Doc of the same name is a mirror of it. Do not edit the Google Doc directly: a sync job rewrites it from this file whenever the repository changes, and direct edits to the Doc are overwritten on the next sync. Change the repository file, and the Doc follows.
 
-**Last updated:** 27 November 2026. Repository head at the time of writing: `2e46754` ("test: run the cross-drive repro on the gesher-app bootclasspath").
+**Last updated:** 27 November 2026. Repository head at the time of writing: `5f0d688` ("docs: drop the same-drive APK limitation from the installer guide").
 
 **Scope:** this handbook covers the project only. It contains no personal information about any person and nothing unrelated to the project.
 
@@ -38,7 +38,7 @@ That matters because several CI mechanisms in this codebase detect forks by the 
 
 **Base commit:** the fork's earliest commit is `6a17b1b5` (23 November 2026), which already contains the full upstream tree plus one fork commit, `6a17b1b5` ("ci: authenticate isolated fork DNS diagnostics (#281)"). The fork is 318 commits ahead of the base of the only other known downstream copy (see section 5, the zh-cn port).
 
-**Tags:** the repository carries an upstream tag `v0.2.0` at commit `7fb7c03d` (22 November 2026). Never reuse that tag for a new release. The next release tag is `v0.2.1` (see section 7).
+**Tags:** the repository carries an upstream tag `v0.2.0` at commit `7fb7c03d` (22 November 2026). Never reuse that tag for a new release. Tag `v0.2.1` was pushed 27 November 2026 at commit `5f0d6887`; its publication is pending (see section 7 and the open items).
 
 ## 3. Repository layout
 
@@ -206,7 +206,7 @@ Run numbers are GitHub's per-workflow sequence for the `ci` workflow. A push to 
 | 14 | `36dbc36b` | **Success** | First fully green run since the fork improvements. All 79 jobs success or skipped; the `package` job succeeded and the `gesher-setup` artifact exists |
 | 15 | `0aa9455` | Failure | The cross-drive reproduction (9.3) landed and failed exactly as designed: test-native on both versions, the test aggregator, and ci-required. The `package` job succeeded |
 | 16 | `225a4f7` | Failure | The corrected reproduction (Launcher on the framework bootclasspath) still fails test-native on both versions; the `package` job succeeded. The failure output is the diagnosis for the cross-drive install path and had not been read at the time of writing |
-| 17 | `2e46754` | Failure | The bootclasspath corrected again: the Launcher class lives in `gesher-app.jar`, so the check runs on `$bcpApp`, not `$bcpFramework` (9.3). test-native passed on both Windows versions, so the cross-drive check passed for the first time. The run failed on test-media (windows-2025) instead — the `Run tests` step failed and the specific failing track inside the media shard was not identified at the time of writing; both test aggregators and ci-required failed with it. The `package` job succeeded |
+| 17 | `2e46754` | **Success** (attempt 2) | The bootclasspath corrected again: the Launcher class lives in `gesher-app.jar`, so the check runs on `$bcpApp`, not `$bcpFramework` (9.3). test-native passed on both Windows versions, so the cross-drive check passed for the first time. Attempt 1 failed on test-media (windows-2025) — the `Run tests` step failed and the specific failing track inside the media shard was not identified at the time of writing; both test aggregators and ci-required failed with it. Attempt 2 (re-run of the failed jobs) completed success: all 80 check runs on the head are success or skipped, including test-media (windows-2025). The `package` job succeeded |
 
 ### 5.6 Releases
 
@@ -333,9 +333,9 @@ There is no privileged operation in the install script to remove (see section 8)
 
 Remaining work: verify once on a genuinely non-admin Windows account (install, `.apk` association, Start menu entries, update path, no UAC prompt). CI's package job runs on typically-admin runners, so this is not currently covered; a non-admin CI check would be new. Retire any "Run as administrator" guidance for this fork's installer. Do not block a release on this check.
 
-### 9.3 APK on any drive — genuinely open
+### 9.3 APK on any drive — install path resolved, session path still open
 
-`docs/installer.md` states: "The APK must be on the same drive as Gesher." The code and the other docs disagree with that line:
+`docs/installer.md` stated "The APK must be on the same drive as Gesher." until commit `5f0d6887` (27 November 2026) deleted the line, after the reproduction check passed in run 17. The code and the other docs disagreed with what that line claimed:
 
 - ADR 0045 (`docs/decisions/0045-posix-paths-tz-procfs.md`) defines another drive as `/mnt/<drive>` in every path call, and `docs/posix.md` says "the same-drive checks for the `.dex`/`.apk` are gone" from the launchers.
 - Path conversion (`ConvertTo-GesherAndroidPath`, `tools/package/gesher-runtime-files.ps1:240-263`) maps `D:\foo.apk` to `/mnt/d/foo.apk`. The APK is passed with `-KeepLongPath` as `UserPath $apkFull` (`tools/package/gesher-app.ps1:286, 291, 298`).
@@ -352,14 +352,14 @@ The reported error, "close failed: EINVAL", is libcore's `Os.close` `ErrnoExcept
 
 **Reproduction (applied 27 November 2026):** `tests/windows/tracks/21-posix.ps1` was extended inside its existing cross-drive block (`if ($tempDrive -ine $here)` — `TEMP` is on another drive on GitHub runners) with a check that copies `$Dir/surfacegl.apk` (package `com.gesher.surfacegl`) to `TEMP`'s drive, installs it through `dalvikvm ... com.gesher.app.Launcher install <mnt-path>`, expects the substring `gesher-app: installed com.gesher.surfacegl`, then uninstalls it (expect `gesher-app: uninstalled com.gesher.surfacegl`), shuts the device down, and removes the temporary copy (commit `0aa94555`). No new track file and no `test-shards.json` change was needed. The success line format is confirmed in `tests/windows/tracks/50-services.ps1:721` and the cleanup pattern in `tests/windows/tracks/38-media.ps1:336-344`. The first version ran the Launcher on the core-only bootclasspath, which cannot load the Launcher class (it lives in `framework.jar`); commit `225a4f78` moved the check to run on `$bcpFramework` and to the end of the track, outside the `.dex` block. That correction was itself wrong: commit `2e46754f` corrected it again — the Launcher class lives in `gesher-app.jar`, not `framework.jar`, so the check runs on `$bcpApp` (defined in `run-tests.ps1`), not `$bcpFramework` or the core-only `$bcp`.
 
-**Sequencing (what actually happened):** the reproduction was applied as its own commits (`0aa94555`, `225a4f78`, `2e46754f`) before the v0.2.1 release, on the owner's direction to automate the cross-drive work. Run 15 failed on the new check exactly as designed, and run 16 failed on the corrected check too — both runs' `package` jobs succeeded, so the installer kept building while the native shard failed. Run 17 (head `2e46754f`, the `$bcpApp` correction) failed on test-media (windows-2025), not on the reproduction: test-native passed on both versions, so the cross-drive check passed for the first time, and the `package` job succeeded. The reproduction passing means the limitation is already gone for the install path (see the rule below): delete the `docs/installer.md` line, keep the check as the regression test, and examine the PackageInstaller session path separately. Until a run is fully green, no release can publish from the head, because publication requires a successful CI run. If it fails with "close failed: EINVAL", pin the failing close (parse path first, then session path), fix that step only, delete the docs line, and keep the check as the regression test.
+**Sequencing (what actually happened):** the reproduction was applied as its own commits (`0aa94555`, `225a4f78`, `2e46754f`) before the v0.2.1 release, on the owner's direction to automate the cross-drive work. Run 15 failed on the new check exactly as designed, and run 16 failed on the corrected check too — both runs' `package` jobs succeeded, so the installer kept building while the native shard failed. Run 17 (head `2e46754f`, the `$bcpApp` correction) failed on test-media (windows-2025) on attempt 1, not on the reproduction: test-native passed on both versions, so the cross-drive check passed for the first time, and the `package` job succeeded. Attempt 2 completed success, so run 17 is green. The reproduction passing meant the limitation was already gone for the install path: commit `5f0d6887` (27 November 2026) deleted the `docs/installer.md` line. Keep the check as the regression test, and examine the PackageInstaller session path separately. If a future run fails with "close failed: EINVAL", pin the failing close (parse path first, then session path), fix that step only, and keep the check as the regression test.
 
 ## 10. Open items
 
 | Item | Status | Next step |
 |---|---|---|
-| v0.2.1 release | Run 14 green at `36dbc36b` (fixes committed in `e92f28cf`, `36dbc36b`). Runs 15 and 16 failed on the cross-drive repro check; run 17's repro check passed (test-native green on both versions) but run 17 failed on test-media (windows-2025), so the head is still not releasable | Resolve the test-media (windows-2025) failure, wait for a green run, then push tag `v0.2.1`; verify the automatic publication; send the owner the release link. Separately, delete the `docs/installer.md` cross-drive limitation line (9.3) now that the reproduction passes |
-| Cross-drive APK fix | Reproduction check passed in run 17 (test-native green on both versions); runs 15 and 16 failed on the check (9.3) | Delete the `docs/installer.md` limitation line, keep the check as the regression test, examine the PackageInstaller session path separately |
+| v0.2.1 release | Run 17 attempt 2 completed success at `2e46754` (re-run of the failed test-media job); the head is green and releasable. Tag `v0.2.1` is pushed at `5f0d6887` (27 November 2026); as of this writing no ci run for the tag and no published release yet — the tag push should trigger a ci run whose success publishes the release automatically (7) | Verify the tag-triggered ci run and the automatic publication; send the owner the release link |
+| Cross-drive APK fix | Closed for the install path: the reproduction check passed in run 17 (test-native green on both versions) and the `docs/installer.md` limitation line was deleted in `5f0d6887` (9.3). The PackageInstaller session path (Aurora Store installs) is still unexamined | Keep the 21-posix check as the regression test; examine the PackageInstaller session path separately |
 | Input verification | Owner asked to click and type inside an app window in the 0.0.0.6 install | Await the owner's result; if it passes, input needs no code |
 | Non-admin installer verification | Not covered by CI (runners are admin) | Verify once on a genuinely non-admin Windows account; do not block a release on it |
 | Input gap closure | Documented gaps in 9.1 | Optional follow-up after verification: pointer capture, drag, Windows clipboard, `InputQueue` first |
@@ -385,7 +385,9 @@ These are not preferences. Each one cost a failed run, a wrong delivery, or a co
 
 Append one entry per repository change that affects this handbook. Newest first. The sync job (section 13) appends here automatically when it detects new commits.
 
-- **27 November 2026 — `2e46754f`.** Cross-drive reproduction corrected again: the Launcher class lives in `gesher-app.jar`, so the check runs on `$bcpApp` (run-tests.ps1), not `$bcpFramework`. Run 17 failed on test-media (windows-2025); test-native passed on both versions, so the cross-drive check passed for the first time.
+- **27 November 2026 — `5f0d6887`.** Cross-drive limitation line deleted from `docs/installer.md` ("The APK must be on the same drive as Gesher." is gone). The install path is resolved; the PackageInstaller session path is still open (9.3). Tag `v0.2.1` pushed at this head; no published release yet at the time of writing.
+- **27 November 2026 — run 17, attempt 2.** Re-run of the failed jobs completed success: all 80 check runs on head `2e46754` are success or skipped, including test-media (windows-2025). The head is green and releasable.
+- **27 November 2026 — `2e46754f`.** Cross-drive reproduction corrected again: the Launcher class lives in `gesher-app.jar`, so the check runs on `$bcpApp` (run-tests.ps1), not `$bcpFramework`. Run 17 attempt 1 failed on test-media (windows-2025); test-native passed on both versions, so the cross-drive check passed for the first time. Attempt 2 completed success (see entry above).
 - **27 November 2026 — `225a4f78`.** Cross-drive reproduction corrected: the Launcher check runs on the framework bootclasspath (`$bcpFramework`). Run 16 failed on the check; the package job succeeded.
 - **27 November 2026 — `0aa94555`.** Cross-drive reproduction applied to `21-posix.ps1`: install `surfacegl.apk` from TEMP's drive through the Launcher, then uninstall it. Run 15 failed on the new check as designed.
 - **27 November 2026 — `36dbc36b`.** Shard-manifest tripwire counts updated to 13 artifacts (19 API requests, 102 inventory items). Run 14: first fully green run since the fork improvements.
