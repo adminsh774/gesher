@@ -138,9 +138,14 @@ to main. Three jobs are provenance gates for the canonical repository
 `gesher-runtime/gesher` under the maintainer's account, which a fork cannot
 satisfy. Those jobs are scoped to the canonical repository with
 `if: github.repository == 'gesher-runtime/gesher'`, so on this fork they report
-skipped instead of failed, and the jobs that consume their artifacts
-(`supplier-correlation`, `windows`, the Windows test shards) skip with them.
-The installer (`package` job) and the other product build jobs are unaffected.
+skipped instead of failed. The Windows test shards run anyway: they no longer
+need the gates (`supplier-correlation` attests coherence but produces no
+artifact the shards consume, and the `native2` artifact is unavailable on a
+fork, so the native2 and DNS-wire tracks skip when it is absent). The
+installer (`package` job) and the other product build jobs are unaffected.
+Releases publish automatically from a push to a `v*` branch or tag (see
+`publish-release.yml`), and installer versions build on this fork's own
+published releases (see `tools/ci/release_version.py`).
 
 ## Updates
 
