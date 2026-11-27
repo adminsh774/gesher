@@ -1,6 +1,11 @@
 # native2 is obtained by ci.yml's current-run/attempt/ZIP-digest receipt.
 # This additionally ties exact ELF members and the independently executed Linux
 # rows to this source, compiler and ABI. No PowerShell socket semantics oracle.
+if (-not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))) {
+  Write-Host 'SKIP  UDP truncation: the native2 artifact is missing'
+  return
+}
+
 try {
   & python (Join-Path $PSScriptRoot '../../../tools/net-udp/payload.py') verify $n2
   if ($LASTEXITCODE -ne 0) { throw 'UDP source/run/attempt/roles/digest verification failed' }

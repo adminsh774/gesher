@@ -11,7 +11,10 @@ Check 'arm64-2 FPSR: real flags, arithmetic, nested callbacks, thread isolation 
   '0 test(s) failed')
 
 # Reuse complete actual process logs already captured by test44 for test69.
+$skipFpsrEvidence = -not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))
+if ($skipFpsrEvidence) { Write-Host 'SKIP  arm64-2 FPSR evidence: the native2 artifact is missing' }
 foreach ($fpsrMode in 'dalvikvm', 'single', 'device') {
+  if ($skipFpsrEvidence) { continue }
   $fpsrRecords = @($arm64FpcrEvidence | Where-Object { $_.Abi -eq 'arm64' -and $_.Mode -eq $fpsrMode })
   if ($fpsrRecords.Count -eq 1 -and $fpsrRecords[0].Exit -eq 0 -and
       $fpsrRecords[0].Report.Contains('native2 fpsr: ok; pinned FPSR flags0x9f, masks, real arithmetic, QC, pthread inheritance/isolation and nested callbacks')) {

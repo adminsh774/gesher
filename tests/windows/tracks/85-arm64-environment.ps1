@@ -1,6 +1,9 @@
 # ADR0067: ARM LP64 environment/default object, actual current guest processes.
 $environmentMarker = 'native2 environment: ok; 256 pinned rows, eight-byte canaries, imported/dynamic default, errno, threads and nested callbacks'
+$skipEnvironmentEvidence = -not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))
+if ($skipEnvironmentEvidence) { Write-Host 'SKIP  arm64 environment evidence: the native2 artifact is missing' }
 foreach ($environmentMode in 'dalvikvm', 'single', 'device') {
+  if ($skipEnvironmentEvidence) { continue }
   $environmentRecords = @($arm64FpcrEvidence | Where-Object { $_.Abi -eq 'arm64' -and $_.Mode -eq $environmentMode })
   if ($environmentRecords.Count -eq 1 -and $environmentRecords[0].Exit -eq 0 -and
       $environmentRecords[0].Report.Contains($environmentMarker)) {

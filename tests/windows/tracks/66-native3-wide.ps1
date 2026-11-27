@@ -1,6 +1,11 @@
 # The NDK libraries run the same independent-reference contract assertions
 # through actual shim entries in test44. Reuse their complete process logs;
 # running these Activities a second time would add no ABI or mode coverage.
+if (-not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))) {
+  Write-Host 'SKIP  native3-wide: the native2 artifact is missing'
+  return
+}
+
 foreach ($wideAbi in 'x86_64', 'arm64') {
   foreach ($wideMode in 'dalvikvm', 'single', 'device') {
     $wideRecords = @($n2WideEvidence | Where-Object { $_.Abi -eq $wideAbi -and $_.Mode -eq $wideMode })

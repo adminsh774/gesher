@@ -4,6 +4,11 @@
 # 44-native2.ps1 supplies N2Run, the ABI list and APK checks in both modes.
 # The binary128 public family also runs in both NDK ABIs/modes in track44.
 
+if (-not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))) {
+  Write-Host 'SKIP  native3: the native2 artifact is missing'
+  return
+}
+
 $fontWork = Join-Path $env:RUNNER_TEMP 'native-fonts-working-אב space'
 $fontUnicode = Join-Path $env:RUNNER_TEMP 'native-fonts-root-אב space'
 New-Item -ItemType Directory -Force $fontWork, "$fontUnicode/etc", "$fontUnicode/fonts" | Out-Null

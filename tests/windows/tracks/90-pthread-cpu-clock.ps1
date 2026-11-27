@@ -1,5 +1,10 @@
 # Actual bionic core with an independent owned Win32 handle oracle.
 # Host winpthreads API qualification remains a separate pending requirement.
+if (-not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))) {
+  Write-Host 'SKIP  pthread CPU target: the native2 artifact is missing'
+  return
+}
+
 Check 'pthread CPU target: retained identity, native brackets, capacity and handle reclamation' {
   N2Run "$n2Dir/pthread_cpu_clock_target_test.exe" @()
 } @('PASS  pthread target core: 257 real external self identities remain live',

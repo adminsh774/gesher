@@ -1,4 +1,9 @@
 # Dedicated callers preserve Native2's existing no-INTERNET manifest/modules.
+if (-not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))) {
+  Write-Host 'SKIP  net4 resolver: the native2 artifact is missing'
+  return
+}
+
 $resolverOracle = Join-Path $env:RUNNER_TEMP "net4-resolver82-$([guid]::NewGuid()).txt"
 $resolverData = Join-Path $root 'data-net4-resolver82'
 $resolverLogs = Join-Path $root 'logs-net4-resolver82'

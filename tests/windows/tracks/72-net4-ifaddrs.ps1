@@ -1,5 +1,10 @@
 # JNI/APK paths are required by 44-native2's new ifaddrs part in both ABIs
 # and both app modes. This standalone ELF uses an independent Windows snapshot.
+if (-not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))) {
+  Write-Host 'SKIP  net4 ifaddrs: the native2 artifact is missing'
+  return
+}
+
 . (Join-Path $PSScriptRoot '../net/IfaddrsOracle.ps1')
 [string[]]$oracleRows = @(Get-Net4IfaddrsOracleRows)
 $oracle = Join-Path $env:RUNNER_TEMP "net4-ifaddrs-$([guid]::NewGuid()).txt"

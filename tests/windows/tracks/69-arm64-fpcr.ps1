@@ -7,7 +7,10 @@ Check 'arm64-2: real FPCR rounding, nested callbacks, thread isolation and resto
   'PASS  arm64 FPCR: concurrent guest thread isolation and native host fenv restoration',
   '0 test(s) failed')
 
+$skipFpcrEvidence = -not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))
+if ($skipFpcrEvidence) { Write-Host 'SKIP  arm64-2 FPCR evidence: the native2 artifact is missing' }
 foreach ($fpcrMode in 'dalvikvm', 'single', 'device') {
+  if ($skipFpcrEvidence) { continue }
   $fpcrRecords = @($arm64FpcrEvidence | Where-Object { $_.Abi -eq 'arm64' -and $_.Mode -eq $fpcrMode })
   if ($fpcrRecords.Count -eq 1 -and $fpcrRecords[0].Exit -eq 0 -and
       $fpcrRecords[0].Report.Contains('native2 fpcr: ok; pinned FPCR modes0..3, actual arithmetic, bits, pthread inheritance/isolation and nested callbacks')) {

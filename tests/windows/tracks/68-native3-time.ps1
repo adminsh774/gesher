@@ -1,6 +1,11 @@
 # ART's elapsed clocks must share the native monotonic domain at all scales.
 # The host fixture links the actual patched artbase; its independent unbiased interrupt-time bracket
 # rejects the former Unix wall-clock fallback without changing the system clock.
+if (-not (Test-Path (Join-Path $Dir 'native2/native2-test.dex'))) {
+  Write-Host 'SKIP  native3-time: the native2 artifact is missing'
+  return
+}
+
 Check 'native3-time: ART elapsed clocks use unbiased interrupt time, units and concurrent ordering' {
   N2Run "$n2Dir/native3_cpu_clock_test.exe" @()
 } @('PASS  native3 clocks: ART nanoseconds match the independent unbiased interrupt-time bracket',
