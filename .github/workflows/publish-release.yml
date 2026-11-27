@@ -9,9 +9,12 @@ permissions: {}
 
 jobs:
   publish:
+    # This fork publishes its own releases: the gate names this repository
+    # instead of the canonical one, so a successful ci run from a push to a
+    # v* branch or tag publishes here.
     if: >-
-      github.repository == 'gesher-runtime/gesher' &&
-      github.workflow_ref == 'gesher-runtime/gesher/.github/workflows/publish-release.yml@refs/heads/main' &&
+      github.repository == 'adminsh774/gesher' &&
+      github.workflow_ref == 'adminsh774/gesher/.github/workflows/publish-release.yml@refs/heads/main' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_repository.id == github.event.repository.id &&
