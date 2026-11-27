@@ -130,6 +130,18 @@ Outputs include:
 Tests: `tests/build-test-apps.sh out/test-apps` (needs a JDK), then
 `tests/windows/run-tests.ps1` on Windows.
 
+## About CI
+
+The `ci` workflow runs the full build, packaging and test matrix on every push
+to main. Three jobs are provenance gates for the canonical repository
+(`compile`, `linux-reference`, `native2`): they assert the workflow runs in
+`gesher-runtime/gesher` under the maintainer's account, which a fork cannot
+satisfy. Those jobs are scoped to the canonical repository with
+`if: github.repository == 'gesher-runtime/gesher'`, so on this fork they report
+skipped instead of failed, and the jobs that consume their artifacts
+(`supplier-correlation`, `windows`, the Windows test shards) skip with them.
+The installer (`package` job) and the other product build jobs are unaffected.
+
 ## Updates
 
 The Gesher Control Center checks GitHub Releases for stable updates and can
