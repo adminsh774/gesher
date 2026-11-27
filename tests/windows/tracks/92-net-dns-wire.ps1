@@ -1,5 +1,12 @@
 # Both scopes use the exact current native2 ZIP receipt and production host/DLL.
 # A fork diagnostic manifest cannot satisfy the separate canonical schema.
+# The binaries come from the native2 artifact, which is scoped to the
+# canonical repository; on a fork the directory is absent and this track
+# skips instead of failing the shard.
+if (-not (Test-Path (Join-Path $Dir 'native2'))) {
+  Write-Host 'SKIP  DNS name wire contract: the native2 artifact is missing'
+  return
+}
 try {
   $dnsNative = (Resolve-Path (Join-Path $Dir 'native2')).Path
   $dnsHost = Join-Path (Resolve-Path $Dir).Path 'gesher-exec.exe'

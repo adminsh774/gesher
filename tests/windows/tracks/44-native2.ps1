@@ -3,12 +3,12 @@
 # own tests, and the file-system leftovers, for x86_64 and arm64-v8a.
 # Dot-sourced by run-tests.ps1, so Check, NoDrive, $Dir, $root, $bcp and
 # $failed are in scope. The programs come from .github/workflows/native2.yml
-# (the "native2" artifact, in $Dir/native2).
+# (the "native2" artifact, in $Dir/native2). On a fork the artifact is absent
+# (the native2 job is scoped to the canonical repository) and this track skips.
 
 $n2 = Join-Path $Dir 'native2'
 if (-not (Test-Path "$n2/native2-test.dex")) {
-  Write-Host "FAIL  native2: the native2 artifact is missing ($n2)"
-  $failed++
+  Write-Host "SKIP  native2: the native2 artifact is missing ($n2)"
   return
 }
 $n2 = (Resolve-Path $n2).Path
